@@ -1,0 +1,22 @@
+{
+  "name": "koishi-plugin-sudoku-bot",
+  "description": "生成数独题目发推题目，统计玩家答题情况，奖励积分",
+  "version": "0.0.1",
+  "main": "lib/index.js",
+  "typings": "lib/index.d.ts",
+  "files": [
+    "lib",
+    "dist"
+  ],
+  "license": "MIT",
+  "scripts": {},
+  "keywords": [
+    "chatbot",
+    "koishi",
+    "plugin"
+  ],
+  "devDependencies": {},
+  "peerDependencies": {
+    "koishi": "^4.18.7"
+  }
+}
