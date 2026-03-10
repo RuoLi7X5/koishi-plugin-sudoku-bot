@@ -55,10 +55,22 @@ mybot1/
 
 ## 📋 依赖要求
 
-- Koishi: ^4.18.7
-- canvas: ^3.2.1（用于生成数独图片）
+- Koishi: ^4.17.0
+- **@koishijs/plugin-canvas**（必需，用于生成数独图片）⭐
 - sudoku: ^0.0.3（用于生成数独题目）
 - database 服务（必需）
+
+### ⚠️ 重要：Canvas 依赖安装
+
+本插件需要 Koishi Canvas 服务来渲染数独图片。
+
+**快速安装**：
+1. 在 Koishi 控制台「插件市场」搜索 `canvas`
+2. 安装 `@koishijs/plugin-canvas`
+3. 启用 canvas 插件
+4. 重启 Koishi
+
+详细说明请查看：[CANVAS_SETUP.md](./CANVAS_SETUP.md)
 
 ## 🔧 开发
 
@@ -66,7 +78,7 @@ mybot1/
 
 ```bash
 cd external/sudoku-bot
-npm run build
+npx tsc
 ```
 
 ### 类型检查
@@ -77,7 +89,12 @@ npx tsc --noEmit
 
 ## 📝 版本
 
-当前版本：v0.0.2
+当前版本：v0.0.4
+
+**更新日志**：
+- v0.0.4：改用 Koishi Canvas 服务，解决原生 canvas 编译问题
+- v0.0.3：配置优化，文档完善
+- v0.0.2：核心功能实现
 
 ## 📄 许可证
 
