@@ -2,6 +2,15 @@
 
 数独答题游戏插件，支持积分系统、成就系统、排行榜等丰富功能。
 
+## ⚠️ 重要提示
+
+**安装前必读**：
+1. ✅ 必须先安装 `@koishijs/plugin-canvas`（[详细说明](#canvas-依赖)）
+2. ✅ 必须启用数据库插件（如 `database-sqlite`）
+3. ✅ 插件加载顺序：canvas → database → sudoku-bot
+
+**快速开始**：查看 [INSTALL_GUIDE.md](./INSTALL_GUIDE.md)
+
 ## 📦 安装与配置
 
 ### 安装方式
@@ -55,22 +64,34 @@ mybot1/
 
 ## 📋 依赖要求
 
-- Koishi: ^4.17.0
-- **@koishijs/plugin-canvas**（必需，用于生成数独图片）⭐
-- sudoku: ^0.0.3（用于生成数独题目）
-- database 服务（必需）
+### 核心依赖
 
-### ⚠️ 重要：Canvas 依赖安装
+| 依赖 | 版本 | 说明 | 安装方式 |
+|------|------|------|----------|
+| Koishi | ^4.17.0 | Koishi 核心 | - |
+| **@koishijs/plugin-canvas** | latest | Canvas 服务（必需）⭐ | `npm install @koishijs/plugin-canvas` |
+| puppeteer | latest | Canvas 后端（推荐） | `npm install puppeteer` |
+| sudoku | ^0.0.3 | 数独生成器 | 自动安装 |
+| database 服务 | - | 数据存储（必需） | 启用任一数据库插件 |
 
-本插件需要 Koishi Canvas 服务来渲染数独图片。
+### ⚠️ Canvas 依赖
+
+本插件**必须依赖** Koishi Canvas 服务才能渲染数独图片。
 
 **快速安装**：
-1. 在 Koishi 控制台「插件市场」搜索 `canvas`
-2. 安装 `@koishijs/plugin-canvas`
-3. 启用 canvas 插件
-4. 重启 Koishi
+```bash
+# 方法 1：通过 Koishi 控制台
+# 进入「插件市场」搜索 canvas 并安装
 
-详细说明请查看：[CANVAS_SETUP.md](./CANVAS_SETUP.md)
+# 方法 2：命令行
+npm install @koishijs/plugin-canvas
+npm install puppeteer
+```
+
+**详细说明**：
+- [INSTALL_GUIDE.md](./INSTALL_GUIDE.md) - 完整安装步骤
+- [CANVAS_SETUP.md](./CANVAS_SETUP.md) - Canvas 配置详解
+- [CANVAS_FIX.md](./CANVAS_FIX.md) - 快速修复指南
 
 ## 🔧 开发
 
@@ -89,9 +110,10 @@ npx tsc --noEmit
 
 ## 📝 版本
 
-当前版本：v0.0.4
+当前版本：v0.0.5
 
 **更新日志**：
+- v0.0.5：**修复依赖版本错误**（sudoku: ^0.0.3）
 - v0.0.4：改用 Koishi Canvas 服务，解决原生 canvas 编译问题
 - v0.0.3：配置优化，文档完善
 - v0.0.2：核心功能实现
