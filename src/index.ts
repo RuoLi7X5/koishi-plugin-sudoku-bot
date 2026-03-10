@@ -13,6 +13,8 @@ export interface Config {
   commandExchange: string;
   commandRank: string;
   commandProgress: string;
+  commandMyTitles: string;
+  commandWear: string;
   timeout: number;
   rounds: number;
   baseScore: number;
@@ -35,6 +37,12 @@ export const Config: Schema<Config> = Schema.object({
   commandProgress: Schema.string()
     .default("游戏进度")
     .description("查看当前游戏进度命令"),
+  commandMyTitles: Schema.string()
+    .default("个人头衔")
+    .description("查看个人头衔收藏命令"),
+  commandWear: Schema.string()
+    .default("佩戴")
+    .description("佩戴/卸下头衔命令"),
   timeout: Schema.number().default(30).description("每题超时（秒）"),
   rounds: Schema.number().default(8).description("每轮题目数量"),
   baseScore: Schema.number().default(10).description("答对基础分"),
@@ -65,6 +73,7 @@ export function apply(ctx: Context, config: Config) {
       gamesStarted: "integer",
       perfectRounds: "integer",
       mvpCount: "integer",
+      equippedTitle: "string",
     },
     {
       primary: "id",
@@ -111,6 +120,19 @@ export function apply(ctx: Context, config: Config) {
     if (!session) return "无法获取会话信息";
     return game.showProgress(session);
   });
+
+  ctx.command(config.commandMyTitles).action(({ session }) => {
+    if (!session) return "无法获取会话信息";
+    return game.showPersonalTitles(session);
+  });
+
+  ctx
+    .command(config.commandWear, "<title:string>")
+    .action(({ session }, title) => {
+      if (!session) return "无法获取会话信息";
+      if (!title) return "请输入要佩戴的头衔名，或输入「取下」卸下当前头衔。";
+      return game.wearTitle(session, title);
+    });
 
   // 监听消息（抢答）
   ctx.middleware(async (session, next) => {

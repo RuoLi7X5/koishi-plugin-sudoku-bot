@@ -15,6 +15,7 @@ interface UserData {
   gamesStarted: number;
   perfectRounds: number;
   mvpCount: number;
+  equippedTitle: string;
 }
 
 declare module "koishi" {
@@ -59,6 +60,18 @@ const ACHIEVEMENTS: Record<
   correct_1000: { name: "???", desc: "????1000?", reward: 800 },
 };
 
+// ????????????????????????????
+const TITLE_RARITY_ORDER: string[] = [
+  "????",
+  "????",
+  "????",
+  "????",
+  "????",
+  "????",
+  "????",
+  "????",
+];
+
 export class UserService {
   private ctx: Context;
 
@@ -84,6 +97,7 @@ export class UserService {
       gamesStarted: 0,
       perfectRounds: 0,
       mvpCount: 0,
+      equippedTitle: "",
     };
     await this.ctx.database.create("sudoku_user", newUser);
     return newUser;
@@ -214,6 +228,83 @@ export class UserService {
       user.titles.push({ name: t.name, expire: t.expire });
       await this.ctx.database.set("sudoku_user", { userId: t.userId }, user);
     }
+  }
+
+  /** ?????????????????? "[???]"????????????? */
+  getDisplayTitle(user: UserData): string {
+    const now = Date.now();
+    const validTitles = user.titles.filter((t) => t.expire > now);
+    if (!validTitles.length) return "";
+
+    // ???????????
+    if (user.equippedTitle) {
+      const equipped = validTitles.find((t) => t.name === user.equippedTitle);
+      if (equipped) return `[${equipped.name}]`;
+    }
+
+    // ????????????????
+    for (const name of TITLE_RARITY_ORDER) {
+      if (validTitles.some((t) => t.name === name)) return `[${name}]`;
+    }
+
+    return `[${validTitles[0].name}]`;
+  }
+
+  /** ??????????? */
+  async wearTitle(
+    userId: string,
+    titleName: string,
+  ): Promise<"success" | "not_found" | "expired"> {
+    const user = await this.getUser(userId);
+    const now = Date.now();
+    const title = user.titles.find((t) => t.name === titleName);
+    if (!title) return "not_found";
+    if (title.expire <= now) return "expired";
+    user.equippedTitle = titleName;
+    await this.ctx.database.set("sudoku_user", { userId }, user);
+    return "success";
+  }
+
+  /** ???? */
+  async removeEquippedTitle(userId: string): Promise<void> {
+    const user = await this.getUser(userId);
+    user.equippedTitle = "";
+    await this.ctx.database.set("sudoku_user", { userId }, user);
+  }
+
+  /** ??????????????? */
+  async getPersonalTitlesInfo(
+    userId: string,
+  ): Promise<{
+    equipped: string;
+    valid: { name: string; daysLeft: number }[];
+    expired: string[];
+  }> {
+    const user = await this.getUser(userId);
+    const now = Date.now();
+    const valid = user.titles
+      .filter((t) => t.expire > now)
+      .sort((a, b) => {
+        const ri = (n: string) => {
+          const idx = TITLE_RARITY_ORDER.indexOf(n);
+          return idx === -1 ? 999 : idx;
+        };
+        return ri(a.name) - ri(b.name);
+      })
+      .map((t) => ({
+        name: t.name,
+        daysLeft: Math.ceil((t.expire - now) / (1000 * 60 * 60 * 24)),
+      }));
+    const expired = user.titles
+      .filter((t) => t.expire <= now)
+      .map((t) => t.name);
+    const equippedIsValid =
+      user.equippedTitle && valid.some((t) => t.name === user.equippedTitle);
+    return {
+      equipped: equippedIsValid ? user.equippedTitle : "",
+      valid,
+      expired,
+    };
   }
 
   async exchangeTitle(userId: string, titleName: string): Promise<boolean> {

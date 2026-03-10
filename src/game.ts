@@ -205,12 +205,14 @@ export class SudokuGame {
       } catch {
         // 忽略错误
       }
+      const titlePrefix = this.userService.getDisplayTitle(u);
+      const nameDisplay = titlePrefix ? `${titlePrefix}${nickname}` : nickname;
       if (type === "rate") {
         lines.push(
-          `${i + 1}. ${nickname}：${(u.rate * 100).toFixed(1)}% (答对${u.totalCorrect}，答错${u.totalWrong})`,
+          `${i + 1}. ${nameDisplay}：${(u.rate * 100).toFixed(1)}% (答对${u.totalCorrect}，答错${u.totalWrong})`,
         );
       } else {
-        lines.push(`${i + 1}. ${nickname}：${u[selected.field]}`);
+        lines.push(`${i + 1}. ${nameDisplay}：${u[selected.field]}`);
       }
     }
 
@@ -264,6 +266,60 @@ export class SudokuGame {
       await session.send(`兑换成功！你现在拥有头衔“${titleName}”。`);
     } else {
       await session.send("兑换失败，可能积分不足或头衔不存在。");
+    }
+  }
+
+  async showPersonalTitles(session: Session) {
+    if (!session.userId) {
+      await session.send("无法获取用户信息。");
+      return;
+    }
+    const info = await this.userService.getPersonalTitlesInfo(session.userId);
+    const lines: string[] = [
+      `【${session.username || session.userId} 的头衔收藏】`,
+    ];
+
+    if (info.valid.length === 0) {
+      lines.push("暂无有效头衔。");
+    } else {
+      lines.push(`有效头衔（${info.valid.length} 枚）：`);
+      for (const t of info.valid) {
+        const wearing = t.name === info.equipped ? " ◀ 佩戴中" : "";
+        lines.push(`  [${t.name}]（剩余 ${t.daysLeft} 天）${wearing}`);
+      }
+    }
+
+    if (info.expired.length > 0) {
+      lines.push(`已过期头衔：${info.expired.map((n) => `[${n}]`).join(" ")}`);
+    }
+
+    if (info.valid.length > 0) {
+      lines.push("");
+      lines.push("使用「佩戴 头衔名」切换佩戴 / 「佩戴 取下」卸下头衔");
+    }
+
+    await session.send(lines.join("\n"));
+  }
+
+  async wearTitle(session: Session, titleName: string) {
+    if (!session.userId) {
+      await session.send("无法获取用户信息。");
+      return;
+    }
+
+    if (titleName === "取下") {
+      await this.userService.removeEquippedTitle(session.userId);
+      await session.send("已卸下头衔，将自动展示最稀有的有效头衔（如有）。");
+      return;
+    }
+
+    const result = await this.userService.wearTitle(session.userId, titleName);
+    if (result === "success") {
+      await session.send(`已佩戴头衔 [${titleName}]，现在你的头衔将展示在所有人面前！`);
+    } else if (result === "expired") {
+      await session.send(`头衔「${titleName}」已过期，无法佩戴。`);
+    } else {
+      await session.send(`未找到头衔「${titleName}」，请检查头衔名称是否正确。`);
     }
   }
 
@@ -339,8 +395,11 @@ export class SudokuGame {
       this.config.baseScore +
       (participant.streak - 1) * this.config.streakBonus;
 
+    const answerUser = await this.userService.getUser(session.userId);
+    const titlePrefix = this.userService.getDisplayTitle(answerUser);
+    const displayName = `${titlePrefix}@${session.username || session.userId}`;
     await session.send(
-      `恭喜 @${session.username || session.userId} 答对！+${earned} 分（连续${participant.streak}次）。`,
+      `恭喜 ${displayName} 答对！+${earned} 分（连续${participant.streak}次）。`,
     );
 
     game.currentIndex++;
@@ -387,18 +446,33 @@ export class SudokuGame {
       }
 
       let message = "本轮游戏结束！\n\n【得分排行榜】\n";
-      sorted.forEach(([uid, data], index) => {
+      let mvpDisplayName = mvpUserId ?? "";
+      for (let index = 0; index < sorted.length; index++) {
+        const [uid, data] = sorted[index];
         const isMVP = uid === mvpUserId;
         const prefix = isMVP ? "👑 " : "";
         const correctRate =
           data.correct + data.wrong === 0
             ? "0%"
             : ((data.correct / (data.correct + data.wrong)) * 100).toFixed(1) + "%";
-        message += `${prefix}${index + 1}. ${uid}：${data.score}分（✅${data.correct} ❌${data.wrong} 正确率${correctRate}）\n`;
-      });
+        // 解析昵称
+        let nickname = uid;
+        try {
+          if (session.guildId) {
+            const member = await session.bot.getGuildMember?.(session.guildId, uid);
+            nickname = (member as any)?.nickname ?? (member as any)?.name ?? uid;
+          }
+        } catch { /* 忽略 */ }
+        // 获取头衔前缀
+        const u = await this.userService.getUser(uid);
+        const titlePrefix = this.userService.getDisplayTitle(u);
+        const nameDisplay = titlePrefix ? `${titlePrefix}${nickname}` : nickname;
+        if (isMVP) mvpDisplayName = nameDisplay;
+        message += `${prefix}${index + 1}. ${nameDisplay}：${data.score}分（✅${data.correct} ❌${data.wrong} 正确率${correctRate}）\n`;
+      }
 
       if (mvpUserId) {
-        message += `\n🎉 本局MVP：${mvpUserId}`;
+        message += `\n🎉 本局MVP：${mvpDisplayName}`;
       }
 
       await session.send(message);
