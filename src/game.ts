@@ -143,8 +143,9 @@ export class SudokuGame {
     const questions = this.selectQuestions(puzzle, this.config.rounds);
 
     const image = await this.renderer.render(puzzle);
-    // 使用 h.image 将 Buffer 转换为可发送的图片元素
-    await session.send(h.image(image, "image/png"));
+    // 将 Buffer 转换为 base64 字符串
+    const base64Image = `data:image/png;base64,${image.toString("base64")}`;
+    await session.send(h.image(base64Image));
 
     // 确保 channelId 存在（群聊中一定有）
     if (!session.channelId) {

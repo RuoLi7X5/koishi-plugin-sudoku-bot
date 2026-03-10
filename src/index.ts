@@ -6,6 +6,9 @@ import { UserService } from "./user";
 
 export const name = "sudoku-bot";
 
+// 声明插件需要的服务
+export const inject = ["database", "canvas"] as const;
+
 export interface Config {
   commandStart: string;
   commandStop: string;
