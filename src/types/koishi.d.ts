@@ -15,6 +15,10 @@ declare module "koishi" {
       titles: any;
       achievements: any;
       gamesStarted: number;
+      perfectRounds: number;
+      mvpCount: number;
+      lastPlaceCount: number;
+      consecutiveLastPlace: number;
     };
   }
 }

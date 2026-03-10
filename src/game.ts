@@ -20,11 +20,19 @@ export class SudokuGame {
     currentIndex: number;
     participants: Map<
       string,
-      { score: number; correct: number; wrong: number; streak: number }
+      { 
+        score: number; 
+        correct: number; 
+        wrong: number; 
+        streak: number;
+        answerTimes: number[]; // 每题答题用时（秒）
+        answerPattern: string[]; // 答题模式记录（"对"/"错"）
+        lastSecondCount: number; // 最后5秒答对次数
+      }
     >;
     timer: any;
     answered: boolean;
-    questionStartTime: number; // 当前题目开始时间
+    questionStartTime: number;
   } | null = null;
 
   // 嘲讽语句库
@@ -40,6 +48,31 @@ export class SudokuGame {
       "你们是来搞笑的吧？答案揭晓：{answer}",
       "集体摆烂了属于是，答案给你们：{answer}",
       "我觉得这题送分都没人要...答案是 {answer}",
+      "时间到~答案是 {answer}，大家都在思考人生吗？",
+      "居然无人答对？我不信！答案：{answer}",
+      "这题难度：★☆☆☆☆，竟然没人会？答案是 {answer}",
+      "集体沉默是金啊，答案公布：{answer}",
+      "都在发呆？清醒一点！答案：{answer}",
+      "这题我闭着眼都能做...答案是 {answer}",
+      "是题目太难还是你们太菜？答案：{answer}",
+      "我看大家都很有个性，集体不答题。正确答案：{answer}",
+      "全员挂机了是吧？答案揭晓：{answer}",
+      "这波团灭，答案是 {answer}",
+      "一个能打的都没有！答案：{answer}",
+      "我严重怀疑大家在玩别的游戏...答案是 {answer}",
+      "你们这是在比赛谁更能忍住不答题吗？答案：{answer}",
+      "集体装死？答案公布：{answer}",
+      "都在等别人先答？答案是 {answer}",
+      "这就是传说中的默契？集体不答。正确答案：{answer}",
+      "我佛了，答案是 {answer}",
+      "是不是该降低难度了？答案：{answer}",
+      "群里就没有一个会做数独的？答案是 {answer}",
+      "这局可以载入史册了，无人答对！答案：{answer}",
+      "我看你们都挺忙的（做别的事），答案是 {answer}",
+      "别装了，我知道你们都不会，答案：{answer}",
+      "算了算了，答案告诉你们：{answer}",
+      "本题作废！...才怪，答案是 {answer}",
+      "下次记得把题目看完再发呆，答案：{answer}",
     ],
     singleMock: [
       "@{user} 答错了！扣 {penalty} 分，建议多练练~",
@@ -52,6 +85,36 @@ export class SudokuGame {
       "@{user} 我都替你尴尬...扣 {penalty} 分",
       "@{user} 这波啊，这波是纯纯的送分，-{penalty}",
       "@{user} 你可让我失望透了，-{penalty}分",
+      "@{user} 哎呀呀，答错啦！-{penalty}分哦~",
+      "@{user} 这题你确定看清楚了？-{penalty}分",
+      "@{user} 勇气可嘉，但答案不对！-{penalty}",
+      "@{user} 我相信你下次一定能...哦，又错了，-{penalty}",
+      "@{user} 数独不是靠运气的...扣 {penalty} 分",
+      "@{user} 建议先观摩，再答题，-{penalty}分",
+      "@{user} 这个数字和答案八竿子打不着！-{penalty}",
+      "@{user} 你这答案很有创意，但是错的，-{penalty}分",
+      "@{user} 错得很果断啊！-{penalty}分",
+      "@{user} 我觉得你需要眼镜...或者脑子？-{penalty}",
+      "@{user} 这题答案不在1-9里吗？哦对，你答的就是1-9...但是错了，-{penalty}",
+      "@{user} 送你一个字：错！-{penalty}分",
+      "@{user} 重新组织一下语言...哦不，重新组织一下思路，-{penalty}",
+      "@{user} 答案擦肩而过了呢，-{penalty}分",
+      "@{user} 恭喜你答错！-{penalty}分",
+      "@{user} 这就是所谓的自信吗？-{penalty}",
+      "@{user} 我建议你慎重，但你没有...扣 {penalty} 分",
+      "@{user} 你可能对数独有什么误解？-{penalty}分",
+      "@{user} 错得离谱！-{penalty}",
+      "@{user} 这答案...很有个性，但不对！-{penalty}分",
+      "@{user} 你是故意的吧？-{penalty}",
+      "@{user} 我相信你其实知道答案，只是手滑了...对吧？-{penalty}分",
+      "@{user} 下次三思而后答，-{penalty}",
+      "@{user} 本题已被你承包！错误答案承包，-{penalty}分",
+      "@{user} 错得如此从容，-{penalty}",
+      "@{user} 送分题都能错？-{penalty}分！",
+      "@{user} 你这是在测试我的耐心吗？-{penalty}",
+      "@{user} 请不要随机答题好吗？-{penalty}分",
+      "@{user} 我怀疑你根本没看盘面！-{penalty}",
+      "@{user} 建议使用排除法...哦，你已经把对的答案排除了，-{penalty}分",
     ],
   };
 
@@ -146,6 +209,8 @@ export class SudokuGame {
       `正确率：${correctRate}`,
       `当前连续答对：${user.streak}`,
       `历史最高连续：${user.maxStreak}`,
+      `完美局数：${user.perfectRounds} 💯`,
+      `MVP次数：${user.mvpCount} 🏆`,
       `已解锁成就：${user.achievements.length} 个`,
       `当前头衔：${user.titles.map((t) => t.name).join("、") || "无"}`,
     ].join("\n");
@@ -153,36 +218,83 @@ export class SudokuGame {
     await session.send(message);
   }
 
-  async showRank(session: Session, type: string = "score") {
+  async showRank(session: Session, type: string = "积分") {
     let users = await this.ctx.database.get("sudoku_user", {});
     if (users.length === 0) {
       await session.send("暂无数据。");
       return;
     }
 
+    // 中文参数映射
+    const typeAlias: Record<string, string> = {
+      积分: "score",
+      答对: "correct",
+      参与: "rounds",
+      正确率: "rate",
+      mvp: "mvp",
+      MVP: "mvp",
+      完美: "perfect",
+      完美局: "perfect",
+      成就: "achievement",
+      // 保留英文兼容
+      score: "score",
+      correct: "correct",
+      rounds: "rounds",
+      rate: "rate",
+      perfect: "perfect",
+      achievement: "achievement",
+    };
+
+    const normalizedType = typeAlias[type] || "score";
+
     let sorted: any[] = [];
     const typeMap: Record<
       string,
-      { field: string; desc: boolean; name: string }
+      { field: string; desc: boolean; name: string; unit?: string }
     > = {
-      score: { field: "score", desc: true, name: "积分榜" },
-      correct: { field: "totalCorrect", desc: true, name: "答对榜" },
-      rounds: { field: "totalRounds", desc: true, name: "参与榜" },
-      rate: { field: "rate", desc: true, name: "正确率榜" },
+      score: { field: "score", desc: true, name: "积分榜", unit: "分" },
+      correct: { field: "totalCorrect", desc: true, name: "答对榜", unit: "题" },
+      rounds: { field: "totalRounds", desc: true, name: "参与榜", unit: "局" },
+      rate: { field: "rate", desc: true, name: "正确率榜", unit: "%" },
+      mvp: { field: "mvpCount", desc: true, name: "MVP榜", unit: "次" },
+      perfect: {
+        field: "perfectRounds",
+        desc: true,
+        name: "完美局榜",
+        unit: "局",
+      },
+      achievement: {
+        field: "achievementCount",
+        desc: true,
+        name: "成就榜",
+        unit: "个",
+      },
     };
 
-    const selected = typeMap[type] || typeMap.score;
+    const selected = typeMap[normalizedType];
     const title = selected.name;
 
-    if (type === "rate") {
+    // 特殊处理：正确率榜
+    if (normalizedType === "rate") {
       users = users.filter((u) => u.totalCorrect + u.totalWrong >= 5);
       const usersWithRate = users.map((u) => ({
         ...u,
         rate: u.totalCorrect / (u.totalCorrect + u.totalWrong) || 0,
       })) as any[];
       sorted = usersWithRate.sort((a, b) => b.rate - a.rate).slice(0, 10);
-    } else {
-      // 使用类型断言绕过索引签名问题
+    }
+    // 特殊处理：成就榜
+    else if (normalizedType === "achievement") {
+      const usersWithCount = users.map((u) => ({
+        ...u,
+        achievementCount: u.achievements.length,
+      })) as any[];
+      sorted = usersWithCount
+        .sort((a, b) => b.achievementCount - a.achievementCount)
+        .slice(0, 10);
+    }
+    // 通用处理
+    else {
       sorted = (users as any[])
         .sort((a, b) => b[selected.field] - a[selected.field])
         .slice(0, 10);
@@ -207,12 +319,21 @@ export class SudokuGame {
       }
       const titlePrefix = this.userService.getDisplayTitle(u);
       const nameDisplay = titlePrefix ? `${titlePrefix}${nickname}` : nickname;
-      if (type === "rate") {
+      
+      // 格式化输出
+      if (normalizedType === "rate") {
         lines.push(
-          `${i + 1}. ${nameDisplay}：${(u.rate * 100).toFixed(1)}% (答对${u.totalCorrect}，答错${u.totalWrong})`,
+          `${i + 1}. ${nameDisplay}：${(u.rate * 100).toFixed(1)}% (✅${u.totalCorrect} ❌${u.totalWrong})`,
         );
+      } else if (normalizedType === "mvp") {
+        lines.push(`${i + 1}. ${nameDisplay}：${u.mvpCount}次 🏆`);
+      } else if (normalizedType === "perfect") {
+        lines.push(`${i + 1}. ${nameDisplay}：${u.perfectRounds}局 💯`);
+      } else if (normalizedType === "achievement") {
+        lines.push(`${i + 1}. ${nameDisplay}：${u.achievementCount}个 🎖️`);
       } else {
-        lines.push(`${i + 1}. ${nameDisplay}：${u[selected.field]}`);
+        const value = u[selected.field];
+        lines.push(`${i + 1}. ${nameDisplay}：${value}${selected.unit || ""}`);
       }
     }
 
@@ -269,60 +390,6 @@ export class SudokuGame {
     }
   }
 
-  async showPersonalTitles(session: Session) {
-    if (!session.userId) {
-      await session.send("无法获取用户信息。");
-      return;
-    }
-    const info = await this.userService.getPersonalTitlesInfo(session.userId);
-    const lines: string[] = [
-      `【${session.username || session.userId} 的头衔收藏】`,
-    ];
-
-    if (info.valid.length === 0) {
-      lines.push("暂无有效头衔。");
-    } else {
-      lines.push(`有效头衔（${info.valid.length} 枚）：`);
-      for (const t of info.valid) {
-        const wearing = t.name === info.equipped ? " ◀ 佩戴中" : "";
-        lines.push(`  [${t.name}]（剩余 ${t.daysLeft} 天）${wearing}`);
-      }
-    }
-
-    if (info.expired.length > 0) {
-      lines.push(`已过期头衔：${info.expired.map((n) => `[${n}]`).join(" ")}`);
-    }
-
-    if (info.valid.length > 0) {
-      lines.push("");
-      lines.push("使用「佩戴 头衔名」切换佩戴 / 「佩戴 取下」卸下头衔");
-    }
-
-    await session.send(lines.join("\n"));
-  }
-
-  async wearTitle(session: Session, titleName: string) {
-    if (!session.userId) {
-      await session.send("无法获取用户信息。");
-      return;
-    }
-
-    if (titleName === "取下") {
-      await this.userService.removeEquippedTitle(session.userId);
-      await session.send("已卸下头衔，将自动展示最稀有的有效头衔（如有）。");
-      return;
-    }
-
-    const result = await this.userService.wearTitle(session.userId, titleName);
-    if (result === "success") {
-      await session.send(`已佩戴头衔 [${titleName}]，现在你的头衔将展示在所有人面前！`);
-    } else if (result === "expired") {
-      await session.send(`头衔「${titleName}」已过期，无法佩戴。`);
-    } else {
-      await session.send(`未找到头衔「${titleName}」，请检查头衔名称是否正确。`);
-    }
-  }
-
   // ==================== 内部游戏流程 ====================
 
   private async askNextQuestion(session: Session) {
@@ -364,13 +431,16 @@ export class SudokuGame {
     const game = this.currentGame;
     if (session.channelId !== game.channelId) return;
     if (game.answered) return;
-    if (!session.userId) return; // 忽略无用户ID的消息
+    if (!session.userId) return;
 
+    // 计算答题用时
+    const answerTime = Math.floor((Date.now() - game.questionStartTime) / 1000);
+    
     const q = game.questions[game.currentIndex];
     const correct = game.solution[q.row][q.col];
 
     if (number !== correct) {
-      await this.updateParticipant(session.userId, false);
+      await this.updateParticipant(session.userId, false, answerTime);
       // 单人嘲讽：50%概率触发
       const shouldMock = Math.random() < 0.5;
       if (shouldMock) {
@@ -389,8 +459,8 @@ export class SudokuGame {
 
     clearTimeout(game.timer);
     game.answered = true;
-    const participant = await this.updateParticipant(session.userId, true);
-    if (!participant) return; // 理论上不会为 null
+    const participant = await this.updateParticipant(session.userId, true, answerTime);
+    if (!participant) return;
     const earned =
       this.config.baseScore +
       (participant.streak - 1) * this.config.streakBonus;
@@ -406,14 +476,36 @@ export class SudokuGame {
     await this.askNextQuestion(session);
   }
 
-  private async updateParticipant(userId: string, isCorrect: boolean) {
+  private async updateParticipant(userId: string, isCorrect: boolean, answerTime?: number) {
     if (!this.currentGame) return null;
     const game = this.currentGame;
     let p = game.participants.get(userId);
     if (!p) {
-      p = { score: 0, correct: 0, wrong: 0, streak: 0 };
+      p = { 
+        score: 0, 
+        correct: 0, 
+        wrong: 0, 
+        streak: 0,
+        answerTimes: [],
+        answerPattern: [],
+        lastSecondCount: 0,
+      };
       game.participants.set(userId, p);
     }
+    
+    // 记录答题时间
+    if (answerTime !== undefined) {
+      p.answerTimes.push(answerTime);
+    }
+    
+    // 记录答题模式
+    p.answerPattern.push(isCorrect ? "对" : "错");
+    
+    // 检测是否为最后5秒答对
+    if (isCorrect && answerTime !== undefined && answerTime >= this.config.timeout - 5) {
+      p.lastSecondCount++;
+    }
+    
     if (isCorrect) {
       p.correct++;
       p.streak++;
@@ -491,7 +583,7 @@ export class SudokuGame {
         });
       }
 
-      // 检查成就
+      // 检查成就（包含隐藏成就）
       for (const [uid, data] of participants) {
         let username = uid;
         try {
@@ -506,18 +598,66 @@ export class SudokuGame {
         } catch {
           // 忽略
         }
+        
+        // 计算隐藏成就相关数据
+        const isMVP = uid === mvpUserId;
+        const isAlone = participants.length === 1;
+        const leadMargin = sorted.length > 1 && isMVP 
+          ? sorted[0][1].score - sorted[1][1].score 
+          : 0;
+        
+        // 答题模式分析
+        const answerPattern = data.answerPattern.join("");
+        const fastestAnswer = data.answerTimes.length > 0 
+          ? Math.min(...data.answerTimes) 
+          : undefined;
+        const averageTime = data.answerTimes.length > 0
+          ? data.answerTimes.reduce((a, b) => a + b, 0) / data.answerTimes.length
+          : undefined;
+        
+        // 前3题是否全对
+        const firstThreeCorrect = data.answerPattern.slice(0, 3).every(p => p === "对");
+        
+        // 绝地反击：前5题至少错3题，后3题全对
+        const first5Wrong = data.answerPattern.slice(0, 5).filter(p => p === "错").length;
+        const last3Correct = data.answerPattern.slice(-3).every(p => p === "对");
+        const comebackPattern = { first5Wrong, last3Correct: last3Correct ? 3 : 0 };
+        
+        // 答错3题但仍是MVP
+        const wrongButMvp = isMVP && data.wrong >= 3;
+        
+        // 禅定模式：每题都在15-20秒答对
+        const zenPattern = data.answerTimes.length > 0 &&
+          data.answerTimes.every(t => t >= 15 && t <= 20);
+        
         const tempSession = {
           ...session,
           userId: uid,
           username: username,
-          // 使用非空断言，因为游戏只在群聊中进行，channelId 一定存在
           send: (msg: string) =>
             session.bot.sendMessage(session.channelId!, msg),
         } as any;
-        await this.userService.checkAchievements(uid, data, tempSession);
+        
+        await this.userService.checkAchievements(uid, {
+          correct: data.correct,
+          wrong: data.wrong,
+          score: data.score,
+          streak: data.streak,
+          // 隐藏成就数据
+          answerPattern,
+          fastestAnswer,
+          averageTime,
+          lastSecondAnswers: data.lastSecondCount,
+          firstThreeCorrect,
+          comebackPattern,
+          isAlone,
+          leadMargin,
+          wrongButMvp,
+          zenPattern,
+        }, tempSession);
       }
 
-      await this.userService.updateHonorTitles(this.config.titleDuration);
+      await this.userService.updateHonorTitles(this.config.titleDuration, session);
     } else {
       await session.send("本轮游戏无人参与，结束。");
     }
