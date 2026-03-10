@@ -16,8 +16,13 @@ export class ImageRenderer {
     const size = cellSize * 9;
 
     try {
+      // 检查 canvas 服务是否可用
+      if (!this.ctx.canvas) {
+        throw new Error("Canvas 服务未找到，请确保已安装并启用 @koishijs/plugin-canvas");
+      }
+
       // 使用 Koishi 的 canvas 服务
-      return await this.ctx.canvas.render(size, size, (ctx: any) => {
+      const buffer = await this.ctx.canvas.render(size, size, (ctx: any) => {
         // 绘制背景
         ctx.fillStyle = "#ffffff";
         ctx.fillRect(0, 0, size, size);
@@ -67,7 +72,15 @@ export class ImageRenderer {
           }
         }
       });
+
+      // 验证 buffer 是否有效
+      if (!buffer || buffer.length === 0) {
+        throw new Error("Canvas 渲染返回空 Buffer");
+      }
+
+      return buffer;
     } catch (error: any) {
+      console.error("Canvas 渲染错误：", error);
       throw new Error(`Canvas 渲染失败：${error?.message || error}\n请确保已安装并启用 @koishijs/plugin-canvas 插件`);
     }
   }

@@ -142,10 +142,22 @@ export class SudokuGame {
     const { puzzle, solution } = this.generator.generate();
     const questions = this.selectQuestions(puzzle, this.config.rounds);
 
-    const image = await this.renderer.render(puzzle);
-    // 将 Buffer 转换为 base64 字符串
-    const base64Image = `data:image/png;base64,${image.toString("base64")}`;
-    await session.send(h.image(base64Image));
+    try {
+      const image = await this.renderer.render(puzzle);
+      
+      // 验证图片数据
+      if (!image || image.length === 0) {
+        await session.send("⚠️ 图片生成失败，但游戏继续。请查看日志。");
+        this.ctx.logger("sudoku").error("Canvas 返回空 Buffer");
+      } else {
+        // 将 Buffer 转换为 base64 字符串
+        const base64Image = `data:image/png;base64,${image.toString("base64")}`;
+        await session.send(h.image(base64Image));
+      }
+    } catch (error: any) {
+      this.ctx.logger("sudoku").error("图片渲染失败：", error);
+      await session.send(`⚠️ 图片渲染失败：${error.message}\n游戏继续，请根据坐标答题。`);
+    }
 
     // 确保 channelId 存在（群聊中一定有）
     if (!session.channelId) {
@@ -414,13 +426,15 @@ export class SudokuGame {
       if (!this.currentGame || this.currentGame !== game) return;
       if (!game.answered) {
         const answer = game.solution[q.row][q.col];
-        // 群嘲逻辑：参与人数>2时触发
-        if (game.participants.size > 2) {
+        
+        // 群嘲逻辑：参与人数>=2时触发（修改条件）
+        if (game.participants.size >= 2) {
           const mockMsg = this.getRandomMock("groupMock", { answer });
           await session.send(mockMsg);
         } else {
           await session.send(`时间到！答案是 ${answer}。`);
         }
+        
         game.currentIndex++;
         await this.askNextQuestion(session);
       }
@@ -659,6 +673,22 @@ export class SudokuGame {
       }
 
       await this.userService.updateHonorTitles(this.config.titleDuration, session);
+      
+      // 发送完整答案图片
+      try {
+        await session.send("📋 完整答案：");
+        const solutionImage = await this.renderer.render(game.solution);
+        
+        if (solutionImage && solutionImage.length > 0) {
+          const base64Solution = `data:image/png;base64,${solutionImage.toString("base64")}`;
+          await session.send(h.image(base64Solution));
+        } else {
+          await session.send("⚠️ 答案图片生成失败");
+        }
+      } catch (error: any) {
+        this.ctx.logger("sudoku").error("答案图片渲染失败：", error);
+        await session.send("⚠️ 答案图片生成失败");
+      }
     } else {
       await session.send("本轮游戏无人参与，结束。");
     }
