@@ -14,11 +14,27 @@
     "koishi",
     "plugin"
   ],
+  "scripts": {
+    "build": "tsc && esbuild src/index.ts --bundle --platform=node --target=es2020 --external:koishi --external:canvas --external:sudoku --outfile=lib/index.js --format=cjs",
+    "build:dev": "yarn build"
+  },
+  "koishi": {
+    "description": {
+      "zh": "数独答题游戏插件，支持积分系统、成就系统、排行榜等功能"
+    },
+    "service": {
+      "required": ["database"]
+    }
+  },
   "peerDependencies": {
     "koishi": "^4.18.7"
   },
   "dependencies": {
     "canvas": "^3.2.1",
     "sudoku": "^0.0.3"
+  },
+  "devDependencies": {
+    "esbuild": "^0.23.0",
+    "typescript": "^5.0.0"
   }
 }

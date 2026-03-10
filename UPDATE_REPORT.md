@@ -355,5 +355,58 @@ interface UserData {
 
 ---
 
-*更新完成时间：2026-03-10*
-*版本：v0.0.2-beta*
+## 🔧 配置和部署
+
+### 插件配置导出
+
+插件已正确配置 Koishi 插件系统：
+
+1. **package.json 配置**：
+   - 添加 `koishi` 字段，声明插件信息和依赖服务
+   - 添加构建脚本 `build` 和 `build:dev`
+   - 声明必需的 `database` 服务
+
+2. **Schema 配置优化**：
+   - 为所有数值类型参数添加范围限制（min/max）
+   - 添加清晰的配置分组注释
+   - 添加详细的中文说明
+
+3. **TypeScript 配置修复**：
+   - 修改 `tsconfig.json`，移除 `emitDeclarationOnly`
+   - 改用 `commonjs` 模块系统以兼容 Koishi
+   - 生成完整的 `.js` 和 `.d.ts` 文件
+
+4. **类型声明更新**：
+   - 更新 `koishi.d.ts`，添加新数据库字段类型声明
+
+### 配置项说明
+
+插件在 Koishi 控制台中提供以下可配置项：
+
+| 配置项 | 默认值 | 范围 | 说明 |
+|--------|--------|------|------|
+| commandStart | 数独开始 | - | 开始游戏命令 |
+| commandStop | 数独结束 | - | 强制结束命令 |
+| commandScore | 积分 | - | 查看积分命令 |
+| commandExchange | 兑换 | - | 兑换头衔命令 |
+| commandRank | 数独排行 | - | 排行榜命令 |
+| commandProgress | 游戏进度 | - | 查询进度命令 |
+| timeout | 30 | 10-120 | 每题超时（秒） |
+| rounds | 8 | 1-20 | 每轮题目数量 |
+| baseScore | 10 | ≥1 | 答对基础分 |
+| penalty | 5 | ≥0 | 答错扣分 |
+| streakBonus | 1 | ≥0 | 连击加分 |
+| difficulty | medium | easy/medium/hard | 难度级别 |
+| titleDuration | 7 | 1-365 | 荣誉头衔有效期（天） |
+
+### 部署文档
+
+新增以下文档文件：
+
+- **README.md**：插件介绍、安装说明、配置说明
+- **SETUP_GUIDE.md**：详细的配置步骤、故障排查、验证清单
+
+---
+
+*更新完成时间：2026-03-11*
+*版本：v0.0.2*
