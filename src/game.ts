@@ -24,7 +24,36 @@ export class SudokuGame {
     >;
     timer: any;
     answered: boolean;
+    questionStartTime: number; // 当前题目开始时间
   } | null = null;
+
+  // 嘲讽语句库
+  private mockMessages = {
+    groupMock: [
+      "这么简单都不会？真是令人失望呢~",
+      "时间到！看来大家都在划水啊🏊",
+      "emmm...这题有这么难吗？",
+      "全员开摆是吧？答案是 {answer}",
+      "我怀疑你们根本就没在看题！答案：{answer}",
+      "就这？连我家的猫都会做！正确答案是 {answer}",
+      "建议各位回幼儿园重修数学，答案是 {answer}",
+      "你们是来搞笑的吧？答案揭晓：{answer}",
+      "集体摆烂了属于是，答案给你们：{answer}",
+      "我觉得这题送分都没人要...答案是 {answer}",
+    ],
+    singleMock: [
+      "@{user} 答错了！扣 {penalty} 分，建议多练练~",
+      "@{user} 这都能错？离谱！-{penalty}分",
+      "@{user} 寄！扣你 {penalty} 分好好反省",
+      "@{user} 答案都在盘面上，你居然还能错？-{penalty}",
+      "@{user} 醒醒！这不是猜数字游戏！-{penalty}分",
+      "@{user} 你是来搞笑的吧？-{penalty}分",
+      "@{user} 建议回去补补课，-{penalty}分",
+      "@{user} 我都替你尴尬...扣 {penalty} 分",
+      "@{user} 这波啊，这波是纯纯的送分，-{penalty}",
+      "@{user} 你可让我失望透了，-{penalty}分",
+    ],
+  };
 
   constructor(
     ctx: Context,
@@ -70,6 +99,7 @@ export class SudokuGame {
       participants: new Map(),
       timer: null,
       answered: false,
+      questionStartTime: Date.now(),
     };
 
     await this.askNextQuestion(session);
@@ -187,6 +217,40 @@ export class SudokuGame {
     await session.send(lines.join("\n"));
   }
 
+  async showProgress(session: Session) {
+    if (!this.currentGame) {
+      await session.send("当前没有进行中的游戏。");
+      return;
+    }
+    if (session.channelId !== this.currentGame.channelId) {
+      return; // 不是同一个频道
+    }
+
+    const game = this.currentGame;
+    const currentQuestion = game.currentIndex + 1;
+    const totalQuestions = game.questions.length;
+    const elapsed = Math.floor((Date.now() - game.questionStartTime) / 1000);
+    const remaining = Math.max(0, this.config.timeout - elapsed);
+
+    const participantCount = game.participants.size;
+    const topScorers = Array.from(game.participants.entries())
+      .sort((a, b) => b[1].score - a[1].score)
+      .slice(0, 3);
+
+    let message = `【游戏进度】\n`;
+    message += `当前题目：第 ${currentQuestion}/${totalQuestions} 题\n`;
+    message += `剩余时间：${remaining} 秒\n`;
+    message += `参与人数：${participantCount} 人\n`;
+    if (topScorers.length > 0) {
+      message += `暂时领先：\n`;
+      topScorers.forEach(([uid, data], idx) => {
+        message += `  ${idx + 1}. ${uid}：${data.score}分\n`;
+      });
+    }
+
+    await session.send(message);
+  }
+
   async exchangeTitle(session: Session, titleName: string) {
     if (!session.userId) {
       await session.send("无法获取用户信息。");
@@ -221,11 +285,18 @@ export class SudokuGame {
     await session.send(`第${game.currentIndex + 1}题：${coord}格应该填什么？`);
 
     game.answered = false;
+    game.questionStartTime = Date.now(); // 记录题目开始时间
     game.timer = setTimeout(async () => {
       if (!this.currentGame || this.currentGame !== game) return;
       if (!game.answered) {
         const answer = game.solution[q.row][q.col];
-        await session.send(`时间到！答案是 ${answer}。没人答对，下一题。`);
+        // 群嘲逻辑：参与人数>2时触发
+        if (game.participants.size > 2) {
+          const mockMsg = this.getRandomMock("groupMock", { answer });
+          await session.send(mockMsg);
+        } else {
+          await session.send(`时间到！答案是 ${answer}。`);
+        }
         game.currentIndex++;
         await this.askNextQuestion(session);
       }
@@ -244,9 +315,19 @@ export class SudokuGame {
 
     if (number !== correct) {
       await this.updateParticipant(session.userId, false);
-      await session.send(
-        `@${session.username || session.userId} 答错了，扣 ${this.config.penalty} 分。`,
-      );
+      // 单人嘲讽：50%概率触发
+      const shouldMock = Math.random() < 0.5;
+      if (shouldMock) {
+        const mockMsg = this.getRandomMock("singleMock", {
+          user: session.username || session.userId,
+          penalty: this.config.penalty,
+        });
+        await session.send(mockMsg);
+      } else {
+        await session.send(
+          `@${session.username || session.userId} 答错了，扣 ${this.config.penalty} 分。`,
+        );
+      }
       return;
     }
 
@@ -295,19 +376,44 @@ export class SudokuGame {
     const participants = Array.from(game.participants.entries());
     if (participants.length > 0) {
       const sorted = participants.sort((a, b) => b[1].score - a[1].score);
-      let message = "本轮游戏结束，得分排行榜：\n";
+      
+      // 计算MVP：得分最高且答对至少1题
+      let mvpUserId: string | null = null;
+      for (const [uid, data] of sorted) {
+        if (data.correct > 0) {
+          mvpUserId = uid;
+          break;
+        }
+      }
+
+      let message = "本轮游戏结束！\n\n【得分排行榜】\n";
       sorted.forEach(([uid, data], index) => {
-        message += `${index + 1}. ${uid}：${data.score}分（答对${data.correct}，答错${data.wrong}）\n`;
+        const isMVP = uid === mvpUserId;
+        const prefix = isMVP ? "👑 " : "";
+        const correctRate =
+          data.correct + data.wrong === 0
+            ? "0%"
+            : ((data.correct / (data.correct + data.wrong)) * 100).toFixed(1) + "%";
+        message += `${prefix}${index + 1}. ${uid}：${data.score}分（✅${data.correct} ❌${data.wrong} 正确率${correctRate}）\n`;
       });
+
+      if (mvpUserId) {
+        message += `\n🎉 本局MVP：${mvpUserId}`;
+      }
+
       await session.send(message);
 
       // 更新用户统计数据
       for (const [uid, data] of participants) {
+        const isPerfect = data.wrong === 0 && data.correct === game.questions.length;
+        const isMVP = uid === mvpUserId;
         await this.userService.updateUser(uid, {
           scoreDelta: data.score,
           correctDelta: data.correct,
           wrongDelta: data.wrong,
           roundsDelta: 1,
+          perfectDelta: isPerfect ? 1 : 0,
+          mvpDelta: isMVP ? 1 : 0,
         });
       }
 
@@ -334,7 +440,7 @@ export class SudokuGame {
           send: (msg: string) =>
             session.bot.sendMessage(session.channelId!, msg),
         } as any;
-        await this.userService.checkAchievements(uid, tempSession);
+        await this.userService.checkAchievements(uid, data, tempSession);
       }
 
       await this.userService.updateHonorTitles(this.config.titleDuration);
@@ -346,6 +452,15 @@ export class SudokuGame {
   }
 
   // ==================== 辅助方法 ====================
+
+  private getRandomMock(
+    type: "groupMock" | "singleMock",
+    params: Record<string, any>,
+  ): string {
+    const messages = this.mockMessages[type];
+    const template = messages[Math.floor(Math.random() * messages.length)];
+    return template.replace(/\{(\w+)\}/g, (_, key) => params[key] || "");
+  }
 
   private formatCoord(row: number, col: number): string {
     const colLetter = String.fromCharCode(65 + col); // A-I

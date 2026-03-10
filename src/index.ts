@@ -12,6 +12,7 @@ export interface Config {
   commandScore: string;
   commandExchange: string;
   commandRank: string;
+  commandProgress: string;
   timeout: number;
   rounds: number;
   baseScore: number;
@@ -31,6 +32,9 @@ export const Config: Schema<Config> = Schema.object({
   commandRank: Schema.string()
     .default("数独排行")
     .description("查看排行榜命令"),
+  commandProgress: Schema.string()
+    .default("游戏进度")
+    .description("查看当前游戏进度命令"),
   timeout: Schema.number().default(30).description("每题超时（秒）"),
   rounds: Schema.number().default(8).description("每轮题目数量"),
   baseScore: Schema.number().default(10).description("答对基础分"),
@@ -59,6 +63,8 @@ export function apply(ctx: Context, config: Config) {
       titles: "json",
       achievements: "json",
       gamesStarted: "integer",
+      perfectRounds: "integer",
+      mvpCount: "integer",
     },
     {
       primary: "id",
@@ -100,6 +106,11 @@ export function apply(ctx: Context, config: Config) {
       if (!session) return "无法获取会话信息";
       return game.showRank(session, type);
     });
+
+  ctx.command(config.commandProgress).action(({ session }) => {
+    if (!session) return "无法获取会话信息";
+    return game.showProgress(session);
+  });
 
   // 监听消息（抢答）
   ctx.middleware(async (session, next) => {
