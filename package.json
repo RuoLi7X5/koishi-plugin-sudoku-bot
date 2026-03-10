@@ -32,6 +32,6 @@
     "koishi": "^4.17.0"
   },
   "dependencies": {
-    "sudoku": "^0.0.5"
+    "sudoku": "^0.0.3"
   }
 }
