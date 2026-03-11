@@ -142,19 +142,27 @@ export class SudokuGame {
     const { puzzle, solution } = this.generator.generate();
     const questions = this.selectQuestions(puzzle, this.config.rounds);
 
+    console.log("[Sudoku] 游戏开始，准备渲染图片");
+    
     try {
       const image = await this.renderer.render(puzzle);
       
+      console.log("[Sudoku] 图片渲染完成，Buffer 长度:", image ? image.length : 0);
+      
       // 验证图片数据
       if (!image || image.length === 0) {
+        console.error("[Sudoku] 图片 Buffer 为空");
         await session.send("⚠️ 图片生成失败，但游戏继续。请查看日志。");
         this.ctx.logger("sudoku").error("Canvas 返回空 Buffer");
       } else {
         // 将 Buffer 转换为 base64 字符串
         const base64Image = `data:image/png;base64,${image.toString("base64")}`;
+        console.log("[Sudoku] Base64 长度:", base64Image.length, "前50字符:", base64Image.substring(0, 50));
         await session.send(h.image(base64Image));
+        console.log("[Sudoku] 图片发送完成");
       }
     } catch (error: any) {
+      console.error("[Sudoku] 图片渲染异常：", error);
       this.ctx.logger("sudoku").error("图片渲染失败：", error);
       await session.send(`⚠️ 图片渲染失败：${error.message}\n游戏继续，请根据坐标答题。`);
     }

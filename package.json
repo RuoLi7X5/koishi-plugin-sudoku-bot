@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-sudoku-bot",
   "description": "数独答题游戏插件，支持积分系统、成就系统、排行榜等功能",
-  "version": "0.0.8",
+  "version": "0.0.9",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -33,5 +33,9 @@
   },
   "dependencies": {
     "sudoku": "^0.0.3"
+  },
+  "optionalDependencies": {
+    "@napi-rs/canvas": "^0.1.0",
+    "canvas": "^2.11.2"
   }
 }
