@@ -17,6 +17,7 @@ interface UserData {
   mvpCount: number;
   lastPlaceCount: number; // 垫底次数
   consecutiveLastPlace: number; // 连续垫底次数
+  consecutiveMvp: number; // 连续MVP次数
 }
 
 // 普通成就
@@ -212,6 +213,7 @@ export class UserService {
         mvpCount: userData.mvpCount ?? 0,
         lastPlaceCount: userData.lastPlaceCount ?? 0,
         consecutiveLastPlace: userData.consecutiveLastPlace ?? 0,
+        consecutiveMvp: userData.consecutiveMvp ?? 0,
       } as UserData;
     }
     const newUser: UserData = {
@@ -231,6 +233,7 @@ export class UserService {
       mvpCount: 0,
       lastPlaceCount: 0,
       consecutiveLastPlace: 0,
+      consecutiveMvp: 0,
     };
     await this.ctx.database.create("sudoku_user", newUser);
     return newUser;
@@ -245,6 +248,9 @@ export class UserService {
       roundsDelta?: number;
       perfectDelta?: number;
       mvpDelta?: number;
+      isLastPlace?: boolean;       // 是否垫底（仅多人局有效）
+      isMvp?: boolean;             // 是否MVP（追踪连续MVP次数）
+      gamesStartedDelta?: number;  // 主动发起游戏次数
     },
   ) {
     const user = await this.getUser(userId);
@@ -261,6 +267,23 @@ export class UserService {
     if (delta.roundsDelta) user.totalRounds += delta.roundsDelta;
     if (delta.perfectDelta) user.perfectRounds += delta.perfectDelta;
     if (delta.mvpDelta) user.mvpCount += delta.mvpDelta;
+    if (delta.gamesStartedDelta) user.gamesStarted += delta.gamesStartedDelta;
+
+    // 垫底统计（多人局才计入）
+    if (delta.isLastPlace === true) {
+      user.lastPlaceCount++;
+      user.consecutiveLastPlace++;
+    } else if (delta.isLastPlace === false) {
+      user.consecutiveLastPlace = 0;
+    }
+
+    // 连续MVP追踪
+    if (delta.isMvp === true) {
+      user.consecutiveMvp++;
+    } else if (delta.isMvp === false) {
+      user.consecutiveMvp = 0;
+    }
+
     await this.ctx.database.set("sudoku_user", { userId }, user);
   }
 
@@ -283,6 +306,8 @@ export class UserService {
       leadMargin?: number; // 领先第二名的分数
       wrongButMvp?: boolean; // 答错3题但仍是MVP
       zenPattern?: boolean; // 禅定模式（每题都在15-20秒）
+      prevConsecutiveLastPlace?: number; // 本局前的连续垫底次数
+      isCurrentMvp?: boolean; // 本局是否为MVP
     },
     session: Session,
   ) {
@@ -354,6 +379,15 @@ export class UserService {
       checks.push({ key: "zen_master", condition: true });
     }
 
+    // 浴火重生：连续5局垫底后终于获得MVP
+    if (
+      roundData.prevConsecutiveLastPlace !== undefined &&
+      roundData.prevConsecutiveLastPlace >= 5 &&
+      roundData.isCurrentMvp
+    ) {
+      checks.push({ key: "rise_from_ashes", condition: true });
+    }
+
     // 检查连续10局MVP
     const recentMvps = await this.getRecentMvpStreak(userId);
     if (recentMvps >= 10) {
@@ -421,11 +455,10 @@ export class UserService {
     }
   }
 
-  // 获取最近的MVP连胜数
+  // 获取连续MVP次数（基于 consecutiveMvp 字段）
   async getRecentMvpStreak(userId: string): Promise<number> {
-    // 这里需要额外的数据结构来记录每局的MVP
-    // 暂时返回0，后续可以实现
-    return 0;
+    const user = await this.getUser(userId);
+    return user.consecutiveMvp;
   }
 
   async updateHonorTitles(durationDays: number, session?: Session) {
@@ -534,7 +567,16 @@ export class UserService {
         }
       }
       
-      // 更新头衔
+      // 清理所有旧持有者（含异常重复情况），防止易主后旧头衔残留
+      for (const holder of currentHolders) {
+        if (holder.userId !== config.userId) {
+          const oldHolder = await this.getUser(holder.userId);
+          oldHolder.titles = oldHolder.titles.filter((t) => t.name !== config.name);
+          await this.ctx.database.set("sudoku_user", { userId: holder.userId }, oldHolder);
+        }
+      }
+
+      // 授予新持有者头衔
       newHolder.titles = newHolder.titles.filter((title) => title.name !== config.name);
       newHolder.titles.push({ name: config.name, expire: config.expire });
       await this.ctx.database.set("sudoku_user", { userId: config.userId }, newHolder);

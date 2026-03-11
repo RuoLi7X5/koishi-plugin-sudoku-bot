@@ -19,6 +19,7 @@ declare module "koishi" {
       mvpCount: number;
       lastPlaceCount: number;
       consecutiveLastPlace: number;
+      consecutiveMvp: number;
     };
   }
 }

@@ -21,12 +21,16 @@ declare module "koishi" {
 export class ImageRenderer {
   constructor(private ctx: Context) {}
 
-  async render(puzzle: number[][]): Promise<Buffer> {
+  async render(puzzle: number[][], difficulty?: string): Promise<Buffer> {
     const cellSize = 50;
-    const size = cellSize * 9;
+    const gridSize = cellSize * 9;
+    const padding = 20; // 边距
+    const bottomSpace = 40; // 底部空间用于显示难度
+    const size = gridSize + padding * 2;
+    const totalHeight = size + bottomSpace;
 
     try {
-      console.log("[Sudoku] 开始渲染，尺寸:", size, "x", size);
+      console.log("[Sudoku] 开始渲染，尺寸:", size, "x", totalHeight, "难度:", difficulty);
       
       let canvas: any;
       let ctx2d: any;
@@ -40,15 +44,15 @@ export class ImageRenderer {
         // 尝试不同的 API
         if (typeof this.ctx.canvas.createCanvas === "function") {
           console.log("[Sudoku] 使用 canvas.createCanvas()");
-          canvas = this.ctx.canvas.createCanvas(size, size);
+          canvas = this.ctx.canvas.createCanvas(size, totalHeight);
           ctx2d = canvas.getContext("2d");
         } else if (typeof this.ctx.canvas.Canvas === "function") {
           console.log("[Sudoku] 使用 new canvas.Canvas()");
-          canvas = new this.ctx.canvas.Canvas(size, size);
+          canvas = new this.ctx.canvas.Canvas(size, totalHeight);
           ctx2d = canvas.getContext("2d");
         } else if (this.ctx.canvas.constructor && this.ctx.canvas.constructor.name === "Canvas") {
           console.log("[Sudoku] Canvas 服务本身就是 Canvas 构造函数");
-          canvas = new this.ctx.canvas(size, size);
+          canvas = new this.ctx.canvas(size, totalHeight);
           ctx2d = canvas.getContext("2d");
         } else {
           console.log("[Sudoku] Canvas 服务不支持标准 API，尝试原生库");
@@ -60,9 +64,9 @@ export class ImageRenderer {
       if (!canvas && NativeCanvas) {
         console.log("[Sudoku] 使用原生 Canvas 库");
         if (typeof NativeCanvas.createCanvas === "function") {
-          canvas = NativeCanvas.createCanvas(size, size);
+          canvas = NativeCanvas.createCanvas(size, totalHeight);
         } else {
-          canvas = new NativeCanvas(size, size);
+          canvas = new NativeCanvas(size, totalHeight);
         }
         ctx2d = canvas.getContext("2d");
       }
@@ -75,7 +79,11 @@ export class ImageRenderer {
       
       // 绘制背景
       ctx2d.fillStyle = "#ffffff";
-      ctx2d.fillRect(0, 0, size, size);
+      ctx2d.fillRect(0, 0, size, totalHeight);
+
+      // 应用偏移（留白）
+      ctx2d.save();
+      ctx2d.translate(padding, padding);
 
       // 绘制网格线
       ctx2d.strokeStyle = "#000000";
@@ -84,11 +92,11 @@ export class ImageRenderer {
         const pos = i * cellSize;
         ctx2d.beginPath();
         ctx2d.moveTo(pos, 0);
-        ctx2d.lineTo(pos, size);
+        ctx2d.lineTo(pos, gridSize);
         ctx2d.stroke();
         ctx2d.beginPath();
         ctx2d.moveTo(0, pos);
-        ctx2d.lineTo(size, pos);
+        ctx2d.lineTo(gridSize, pos);
         ctx2d.stroke();
       }
 
@@ -98,11 +106,11 @@ export class ImageRenderer {
         const pos = i * cellSize;
         ctx2d.beginPath();
         ctx2d.moveTo(pos, 0);
-        ctx2d.lineTo(pos, size);
+        ctx2d.lineTo(pos, gridSize);
         ctx2d.stroke();
         ctx2d.beginPath();
         ctx2d.moveTo(0, pos);
-        ctx2d.lineTo(size, pos);
+        ctx2d.lineTo(gridSize, pos);
         ctx2d.stroke();
       }
 
@@ -123,6 +131,17 @@ export class ImageRenderer {
             ctx2d.fillText(val.toString(), x, y);
           }
         }
+      }
+      
+      ctx2d.restore();
+      
+      // 绘制难度标注
+      if (difficulty) {
+        ctx2d.font = "16px Arial";
+        ctx2d.fillStyle = "#666666";
+        ctx2d.textAlign = "center";
+        ctx2d.textBaseline = "middle";
+        ctx2d.fillText(`难度：${difficulty}`, size / 2, size + bottomSpace / 2);
       }
       
       console.log("[Sudoku] Canvas 绘制完成");
