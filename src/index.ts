@@ -20,6 +20,9 @@ export interface Config {
   commandHelp: string;
   commandAchievement: string;
   commandInactivity: string;
+  commandTitle: string;
+  commandWear: string;
+  commandUnwear: string;
   timeout: number;
   inactivityTimeout: number;
   rounds: number;
@@ -35,7 +38,7 @@ export const Config: Schema<Config> = Schema.intersect([
     commandStop: Schema.string()
       .default("结束答题")
       .description("结束游戏命令"),
-    commandScore: Schema.string().default("个人积分").description("查看积分命令"),
+    commandScore: Schema.string().default("个人档案").description("查看个人档案命令"),
     commandExchange: Schema.string().default("兑换").description("兑换头衔命令"),
     commandRank: Schema.string()
       .default("排行榜")
@@ -58,6 +61,9 @@ export const Config: Schema<Config> = Schema.intersect([
     commandInactivity: Schema.string()
       .default("无人超时")
       .description("设置无人参与自动结束时长命令（单位：分钟，0=禁用）"),
+    commandTitle: Schema.string().default("头衔").description("查看/管理头衔命令"),
+    commandWear: Schema.string().default("佩戴").description("佩戴头衔命令"),
+    commandUnwear: Schema.string().default("卸下").description("卸下头衔命令"),
   }).description("命令配置"),
   
   Schema.object({
@@ -95,7 +101,8 @@ export function apply(ctx: Context, config: Config) {
     (config as any).difficulty = 2;
   }
 
-  // 扩展数据库模型，使用 as const 解决类型问题
+  // 扩展数据库模型（字段对象用 as any 绕过 Koishi 的 MapField 泛型约束，
+  // 新增字段 activeTitle 未在 Tables 接口中声明，运行时会被 minato 正确处理）
   ctx.model.extend(
     "sudoku_user" as const,
     {
@@ -117,7 +124,9 @@ export function apply(ctx: Context, config: Config) {
       consecutiveLastPlace: "integer",
       consecutiveMvp: "integer",
       guilds: "json",
-    },
+      activeTitle: "string",
+      username: "string",
+    } as any,
     {
       primary: "id",
       autoInc: false,
@@ -156,10 +165,10 @@ export function apply(ctx: Context, config: Config) {
     });
 
   ctx
-    .command(`${config.commandRank} [type:string]`)
-    .action(({ session }, type) => {
+    .command(`${config.commandRank} [type:string] [scope:string]`)
+    .action(({ session }, type, scope) => {
       if (!session) return "无法获取会话信息";
-      return game.showRank(session, type);
+      return game.showRank(session, type, scope);
     });
 
   ctx.command(config.commandProgress).action(({ session }) => {
@@ -201,6 +210,28 @@ export function apply(ctx: Context, config: Config) {
       if (!session) return "无法获取会话信息";
       if (minutes === undefined) return "请指定分钟数，0 表示禁用。例如：无人超时 20";
       return game.setInactivityTimeout(session, minutes);
+    });
+
+  ctx
+    .command(`${config.commandTitle} [name:string]`)
+    .action(({ session }, name) => {
+      if (!session) return "无法获取会话信息";
+      return game.showTitles(session, name);
+    });
+
+  ctx
+    .command(`${config.commandWear} <name:string>`)
+    .action(({ session }, name) => {
+      if (!session) return "无法获取会话信息";
+      if (!name) return `请指定要佩戴的头衔名称。例如：${config.commandWear} 数独学徒`;
+      return game.wearTitle(session, name);
+    });
+
+  ctx
+    .command(`${config.commandUnwear} [name:string]`)
+    .action(({ session }, name) => {
+      if (!session) return "无法获取会话信息";
+      return game.unwearTitle(session, name);
     });
 
   // 监听消息（抢答）—— 先快速检查当前频道是否有游戏，避免处理无关消息

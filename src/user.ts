@@ -26,7 +26,9 @@ interface UserData {
   lastPlaceCount: number;
   consecutiveLastPlace: number;
   consecutiveMvp: number;
-  guilds: string[]; // 参与过的群 ID 列表
+  guilds: string[];    // 参与过的群 ID 列表
+  activeTitle: string; // 当前主动佩戴的头衔名，空字符串表示使用自动优先级
+  username: string;    // 最近一次捕获的用户昵称，用于榜单展示
 }
 
 const ACHIEVEMENTS: Record<
@@ -215,6 +217,22 @@ const ACHIEVEMENT_TITLE_NAMES = new Set(
     .map(a => a.title!)
 );
 
+// 荣誉头衔说明映射（与 updateHonorTitles 中的 rankType 保持同步）
+const HONOR_TITLE_DESC: Record<string, string> = {
+  "积分之王": "本群积分排名第一",
+  "答题之王": "本群答对题数排名第一",
+  "参与之王": "本群参与局数排名第一",
+  "开局之王": "本群发起游戏次数排名第一",
+  "正确率之王": "本群正确率排名第一",
+};
+
+// 商城头衔信息（需与 exchangeTitle 中的 titleCatalog 保持同步）
+const SHOP_TITLE_INFO: Record<string, { price: number; duration: number }> = {
+  "数独学徒": { price: 100, duration: 7 },
+  "解题高手": { price: 500, duration: 30 },
+  "终盘大师": { price: 2000, duration: 365 },
+};
+
 // 荣誉头衔永久有效（不依赖时间过期，通过每局结算易主控制）
 const HONOR_EXPIRE = Number.MAX_SAFE_INTEGER;
 
@@ -231,6 +249,10 @@ export class UserService {
     const now = Date.now();
     // 荣誉头衔 expire = HONOR_EXPIRE，永远不会被清理
     data.titles = data.titles.filter(t => t.expire > now);
+    // 若主动佩戴的头衔已过期或不存在，自动清除
+    if (data.activeTitle && !data.titles.some(t => t.name === data.activeTitle)) {
+      data.activeTitle = "";
+    }
     return data;
   }
 
@@ -248,6 +270,8 @@ export class UserService {
         titles: Array.isArray(u.titles) ? (u.titles as TitleEntry[]) : [],
         achievements: Array.isArray(u.achievements) ? (u.achievements as string[]) : [],
         guilds: Array.isArray(u.guilds) ? (u.guilds as string[]) : [],
+        activeTitle: typeof u.activeTitle === "string" ? u.activeTitle : "",
+        username: typeof u.username === "string" ? u.username : "",
       } as UserData;
     }
     const newUser: UserData = {
@@ -269,6 +293,8 @@ export class UserService {
       consecutiveLastPlace: 0,
       consecutiveMvp: 0,
       guilds: [],
+      activeTitle: "",
+      username: "",
     };
     await this.ctx.database.create("sudoku_user", newUser);
     return newUser;
@@ -288,7 +314,8 @@ export class UserService {
       gamesStartedDelta?: number;
       finalStreak?: number;
       maxInGameStreak?: number;
-      guildId?: string; // 本局所在群（用于群成员记录）
+      guildId?: string;    // 本局所在群（用于群成员记录）
+      username?: string;   // 捕获到的最新昵称（游戏或答题时更新）
     },
   ): Promise<UserData> {
     const user = await this.getUser(userId);
@@ -306,6 +333,9 @@ export class UserService {
     if (delta.perfectDelta) user.perfectRounds += delta.perfectDelta;
     if (delta.mvpDelta) user.mvpCount += delta.mvpDelta;
     if (delta.gamesStartedDelta) user.gamesStarted += delta.gamesStartedDelta;
+
+    // 更新存储昵称（非空时才覆盖，避免清空已有昵称）
+    if (delta.username) user.username = delta.username;
 
     // 记录群成员关系（用于群榜单隔离）
     if (delta.guildId && !user.guilds.includes(delta.guildId)) {
@@ -543,14 +573,16 @@ export class UserService {
 
       // 检测易主
       if (isChange && session) {
-        let oldName = currentHolder.userId;
-        let newName = cfg.userId;
+        let oldName = (currentHolder as any).username || currentHolder.userId;
+        let newName = newHolder.username || cfg.userId;
         try {
           if (session.guildId) {
             const oldM = await session.bot.getGuildMember?.(session.guildId, currentHolder.userId);
-            oldName = (oldM as any)?.nickname ?? (oldM as any)?.name ?? oldName;
+            const oldApi = (oldM as any)?.nickname ?? (oldM as any)?.name;
+            if (oldApi) oldName = oldApi;
             const newM = await session.bot.getGuildMember?.(session.guildId, cfg.userId);
-            newName = (newM as any)?.nickname ?? (newM as any)?.name ?? newName;
+            const newApi = (newM as any)?.nickname ?? (newM as any)?.name;
+            if (newApi) newName = newApi;
           }
         } catch { /* 忽略 */ }
         await session.send(`🔄 ${cfg.rankType}榜首易主！\n${newName} 取代 ${oldName} 成为新的第一！`);
@@ -576,11 +608,12 @@ export class UserService {
 
       // 只在首次授予或易主时播报，持有者不变则静默刷新
       if ((isFirstTime || isChange) && session) {
-        let holderName = cfg.userId;
+        let holderName = newHolder.username || cfg.userId;
         try {
           if (session.guildId) {
             const m = await session.bot.getGuildMember?.(session.guildId, cfg.userId);
-            holderName = (m as any)?.nickname ?? (m as any)?.name ?? holderName;
+            const apiName = (m as any)?.nickname ?? (m as any)?.name;
+            if (apiName) holderName = apiName;
           }
         } catch { /* 忽略 */ }
         await session.send(
@@ -625,6 +658,9 @@ export class UserService {
    */
   async getAchievementListText(userId: string, username: string, detailCommand: string): Promise<string> {
     const user = await this.getUser(userId);
+    // 调用方传入 username 可能是空字符串（session.username 未获取到），
+    // 此时用 DB 存储昵称兜底，最终退回 userId
+    const headerName = username || user.username || userId;
     const unlocked = new Set(user.achievements);
 
     // 按分类组织普通成就
@@ -647,7 +683,7 @@ export class UserService {
     const unlockedHidden = hiddenEntries.filter(([key]) => unlocked.has(key));
 
     const lines: string[] = [
-      `【${username} 的成就档案】`,
+      `【${headerName} 的成就档案】`,
       `普通 ${regularUnlocked}/${regularTotal}  ✨隐藏已解锁 ${unlockedHidden.length} 个`,
       "",
       "📋 普通成就",
@@ -669,7 +705,7 @@ export class UserService {
       }
     }
 
-    lines.push("", `💡 输入「${detailCommand} <成就名>」查看成就详情`);
+    lines.push("", `💡 输入「${detailCommand} 首战告捷」可查看该成就详情（支持所有成就名称）`);
     return lines.join("\n");
   }
 
@@ -704,9 +740,25 @@ export class UserService {
     return lines.join("\n");
   }
 
+  /** 推断头衔类型（兼容旧数据没有 type 字段的情况） */
+  private inferTitleType(t: TitleEntry): "achievement" | "honor" | "regular" {
+    if (t.type) return t.type;
+    if (ACHIEVEMENT_TITLE_NAMES.has(t.name)) return "achievement";
+    if (HONOR_TITLE_NAMES.has(t.name)) return "honor";
+    return "regular";
+  }
+
+  /** 根据头衔类型添加包裹符号 */
+  private wrapTitleName(t: TitleEntry): string {
+    const type = this.inferTitleType(t);
+    if (type === "achievement") return `【${t.name}】`;
+    if (type === "honor") return `「${t.name}」`;
+    return `[${t.name}]`;
+  }
+
   /**
    * 获取展示头衔（带包裹符号）。
-   * 优先级：成就头衔 > 荣誉头衔 > 普通头衔。
+   * 优先使用用户主动佩戴的头衔；未佩戴时自动按优先级（成就 > 荣誉 > 普通）选取。
    * 兼容旧数据（无 type 字段时通过名称推断）。
    */
   getDisplayTitle(user: UserData): string {
@@ -715,23 +767,168 @@ export class UserService {
     const validTitles = user.titles.filter(t => t.expire > now);
     if (validTitles.length === 0) return "";
 
-    // 推断头衔类型（兼容旧数据）
-    const inferType = (t: TitleEntry): "achievement" | "honor" | "regular" => {
-      if (t.type) return t.type;
-      if (ACHIEVEMENT_TITLE_NAMES.has(t.name)) return "achievement";
-      if (HONOR_TITLE_NAMES.has(t.name)) return "honor";
-      return "regular";
-    };
+    // 优先使用用户主动佩戴的头衔
+    if (user.activeTitle) {
+      const activeEntry = validTitles.find(t => t.name === user.activeTitle);
+      if (activeEntry) return this.wrapTitleName(activeEntry);
+      // activeTitle 已过期或不存在，降级到自动优先级
+    }
 
+    // 自动优先级：成就头衔 > 荣誉头衔 > 普通头衔
     const typePriority: Record<string, number> = { achievement: 0, honor: 1, regular: 2 };
     const sorted = [...validTitles].sort(
-      (a, b) => (typePriority[inferType(a)] ?? 2) - (typePriority[inferType(b)] ?? 2)
+      (a, b) => (typePriority[this.inferTitleType(a)] ?? 2) - (typePriority[this.inferTitleType(b)] ?? 2)
     );
+    return this.wrapTitleName(sorted[0]);
+  }
 
-    const best = sorted[0];
-    const type = inferType(best);
-    if (type === "achievement") return `【${best.name}】`;
-    if (type === "honor") return `「${best.name}」`;
-    return `[${best.name}]`;
+  /** 返回用户已拥有头衔的列表文本 */
+  async getOwnedTitlesText(
+    userId: string,
+    commandTitle: string,
+    commandWear: string,
+    commandUnwear: string,
+  ): Promise<string> {
+    const user = await this.getUser(userId);
+    const now = Date.now();
+    const validTitles = user.titles.filter(t => t.expire > now);
+
+    if (validTitles.length === 0) {
+      return "你当前没有任何头衔。\n通过成就解锁、积分商城兑换或成为本群各榜首均可获得头衔！";
+    }
+
+    const achievementTitles = validTitles.filter(t => this.inferTitleType(t) === "achievement");
+    const honorTitles       = validTitles.filter(t => this.inferTitleType(t) === "honor");
+    const regularTitles     = validTitles.filter(t => this.inferTitleType(t) === "regular");
+    const active = user.activeTitle;
+    const currentDisplay = this.getDisplayTitle(user);
+
+    const lines: string[] = [
+      `【头衔列表】共 ${validTitles.length} 个`,
+      `当前展示：${currentDisplay || "无"}`,
+    ];
+
+    if (achievementTitles.length > 0) {
+      lines.push("", "🏅 成就头衔【】");
+      for (const t of achievementTitles) {
+        lines.push(`  【${t.name}】${t.name === active ? " ← 已佩戴" : ""}`);
+      }
+    }
+    if (honorTitles.length > 0) {
+      lines.push("", "👑 荣誉头衔「」（永久有效，条件不满足立即易主）");
+      for (const t of honorTitles) {
+        lines.push(`  「${t.name}」${t.name === active ? " ← 已佩戴" : ""}`);
+      }
+    }
+    if (regularTitles.length > 0) {
+      lines.push("", "🛒 商城头衔[]");
+      for (const t of regularTitles) {
+        const daysLeft = Math.ceil((t.expire - now) / (24 * 60 * 60 * 1000));
+        lines.push(`  [${t.name}] 剩余 ${daysLeft} 天${t.name === active ? " ← 已佩戴" : ""}`);
+      }
+    }
+
+    const exampleTitle = validTitles[0].name;
+    lines.push("");
+    lines.push(`💡 输入「${commandWear} ${exampleTitle}」佩戴指定头衔`);
+    if (active) {
+      lines.push(`💡 输入「${commandUnwear}」卸下当前佩戴的头衔`);
+    }
+    lines.push(`💡 输入「${commandTitle} ${exampleTitle}」查看头衔详情`);
+    return lines.join("\n");
+  }
+
+  /** 返回指定头衔的详情文本 */
+  async getTitleDetailText(userId: string, titleName: string): Promise<string> {
+    const user = await this.getUser(userId);
+    const now = Date.now();
+    const titleEntry = user.titles.find(t => t.name === titleName);
+    const isOwned = titleEntry !== undefined;
+    const isValid = isOwned && titleEntry!.expire > now;
+
+    // 推断头衔所属类型（不论是否已拥有）
+    let detectedType: "achievement" | "honor" | "regular" | null = null;
+    if (isOwned) {
+      detectedType = this.inferTitleType(titleEntry!);
+    } else if (HONOR_TITLE_NAMES.has(titleName)) {
+      detectedType = "honor";
+    } else if (ACHIEVEMENT_TITLE_NAMES.has(titleName)) {
+      detectedType = "achievement";
+    } else if (SHOP_TITLE_INFO[titleName]) {
+      detectedType = "regular";
+    }
+
+    if (!detectedType) {
+      return `未找到名为「${titleName}」的头衔记录，请检查头衔名称是否正确。`;
+    }
+
+    const typeLabel = detectedType === "achievement" ? "成就头衔" : detectedType === "honor" ? "荣誉头衔" : "商城头衔";
+    const wrapped   = detectedType === "achievement" ? `【${titleName}】` : detectedType === "honor" ? `「${titleName}」` : `[${titleName}]`;
+
+    const lines: string[] = [`${wrapped}（${typeLabel}）`];
+
+    if (detectedType === "honor") {
+      lines.push(`来源：${HONOR_TITLE_DESC[titleName] ?? "群内排名第一"}`);
+      lines.push("有效期：永久有效（条件不满足立即易主）");
+    } else if (detectedType === "achievement") {
+      const achEntry = Object.entries(ACHIEVEMENTS).find(([, a]) => a.title === titleName);
+      if (achEntry) {
+        lines.push(`来源：解锁隐藏成就「${achEntry[1].name}」`);
+        lines.push(`成就条件：${achEntry[1].desc}`);
+      }
+      if (isValid) {
+        const expireDate = new Date(titleEntry!.expire).toLocaleDateString("zh-CN");
+        lines.push(`有效期至：${expireDate}`);
+      }
+    } else {
+      const info = SHOP_TITLE_INFO[titleName];
+      if (info) {
+        lines.push(`来源：积分商城（${info.price} 积分 / ${info.duration} 天）`);
+      }
+      if (isValid) {
+        const daysLeft = Math.ceil((titleEntry!.expire - now) / (24 * 60 * 60 * 1000));
+        lines.push(`剩余有效期：${daysLeft} 天`);
+      }
+    }
+
+    if (!isOwned || !isValid) {
+      lines.push("状态：❌ 未拥有");
+    } else if (user.activeTitle === titleName) {
+      lines.push("状态：✅ 已拥有 · 当前佩戴中");
+    } else {
+      lines.push("状态：✅ 已拥有 · 未佩戴");
+    }
+    return lines.join("\n");
+  }
+
+  /** 佩戴指定头衔（必须已拥有且未过期） */
+  async wearTitle(userId: string, titleName: string): Promise<string> {
+    const user = await this.getUser(userId);
+    const now = Date.now();
+    const validTitle = user.titles.find(t => t.name === titleName && t.expire > now);
+    if (!validTitle) {
+      return `你当前没有头衔「${titleName}」，或该头衔已过期。\n输入「头衔」可查看你拥有的全部头衔。`;
+    }
+    if (user.activeTitle === titleName) {
+      return `你已经在佩戴头衔「${this.wrapTitleName(validTitle)}」了。`;
+    }
+    user.activeTitle = titleName;
+    await this.ctx.database.set("sudoku_user", { userId }, this.toUpdateData(user));
+    return `已佩戴头衔：${this.wrapTitleName(validTitle)}`;
+  }
+
+  /** 卸下当前佩戴的头衔（恢复自动优先级） */
+  async unwearTitle(userId: string, titleName?: string): Promise<string> {
+    const user = await this.getUser(userId);
+    if (!user.activeTitle) {
+      return "当前没有佩戴任何头衔（展示头衔由系统自动选取）。";
+    }
+    if (titleName && user.activeTitle !== titleName) {
+      return `当前佩戴的头衔是「${user.activeTitle}」，与指定的「${titleName}」不符。\n直接输入「卸下」可卸下当前佩戴的头衔。`;
+    }
+    const removed = user.activeTitle;
+    user.activeTitle = "";
+    await this.ctx.database.set("sudoku_user", { userId }, this.toUpdateData(user));
+    return `已卸下头衔「${removed}」，系统将自动选取展示头衔。`;
   }
 }

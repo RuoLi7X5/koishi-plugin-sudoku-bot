@@ -35,7 +35,8 @@ type GameState = {
   timer: any;
   answered: boolean;
   questionStartTime: number;
-  userTitleCache: Map<string, string>; // 本局内头衔缓存，避免每次答对都查 DB
+  userTitleCache: Map<string, string>;    // 本局内头衔缓存，避免每次答对都查 DB
+  usernameCache: Map<string, string>;     // 本局内昵称缓存（answer 时捕获），用于结算和存储
 };
 
 export class SudokuGame {
@@ -113,9 +114,9 @@ export class SudokuGame {
       `  ${c.commandProgress} - 查看当前游戏进度与倒计时`,
       "",
       "📊 数据指令",
-      `  ${c.commandScore} - 查看个人积分与档案`,
+      `  ${c.commandScore} - 查看个人档案`,
       `  ${c.commandAchievement} - 查看成就列表`,
-      `  ${c.commandAchievement} <成就名> - 查看指定成就详情`,
+      `  ${c.commandAchievement} 首战告捷 - 查看指定成就详情`,
       `  ${c.commandRank} [类型] - 查看排行榜`,
       "    类型：积分 / 答对 / 参与 / 正确率 / MVP / 完美 / 成就",
       "",
@@ -126,8 +127,12 @@ export class SudokuGame {
       `  ${c.commandInactivity} <分钟> - 设置无人参与自动结束时长（0=禁用，当前：${curInactivity > 0 ? `${curInactivity}分钟` : "禁用"}）`,
       "",
       "🎖️ 头衔指令",
+      `  ${c.commandTitle} - 查看已拥有的头衔`,
+      `  ${c.commandTitle} 数独学徒 - 查看指定头衔的详情`,
+      `  ${c.commandWear} 数独学徒 - 佩戴已拥有的头衔`,
+      `  ${c.commandUnwear} - 卸下当前佩戴的头衔（恢复自动展示）`,
       `  ${c.commandExchange} - 查看可兑换头衔列表`,
-      `  ${c.commandExchange} <头衔名> - 用积分兑换头衔`,
+      `  ${c.commandExchange} 数独学徒 - 用积分兑换头衔`,
       "",
       "📝 玩法说明",
       `  每轮 ${c.rounds} 题，每题限时 ${curTimeout > 0 ? `${curTimeout} 秒` : "无限制（答对才进入下一题）"}`,
@@ -183,15 +188,19 @@ export class SudokuGame {
       answered: false,
       questionStartTime: Date.now(),
       userTitleCache: new Map(),
+      usernameCache: new Map(),
     };
 
     this.games.set(session.channelId, newGame);
 
     // 记录发起游戏次数，同时绑定群成员关系（用于群榜单隔离和"开局之魂"成就）
     if (session.userId) {
+      const startUsername = this.captureUsername(session);
+      if (startUsername) newGame.usernameCache.set(session.userId, startUsername);
       await this.userService.updateUser(session.userId, {
         gamesStartedDelta: 1,
         guildId: session.guildId,
+        username: startUsername,
       });
     }
 
@@ -262,8 +271,12 @@ export class SudokuGame {
         ? "暂无"
         : ((user.totalCorrect / (user.totalCorrect + user.totalWrong)) * 100).toFixed(1) + "%";
 
+    const validTitleCount = user.titles.filter(t => t.expire > Date.now()).length;
+    const displayTitle = this.userService.getDisplayTitle(user);
+    // 优先用本次 session 捕获的昵称，其次用 DB 存储昵称，最后退回 ID
+    const profileName = this.captureUsername(session) || user.username || session.userId;
     const message = [
-      `【${session.username || session.userId} 的数独档案】`,
+      `【${profileName} 的数独档案】`,
       `积分：${user.score}`,
       `参与轮数：${user.totalRounds}`,
       `答对/答错：${user.totalCorrect}/${user.totalWrong}`,
@@ -273,7 +286,7 @@ export class SudokuGame {
       `完美局数：${user.perfectRounds} 💯`,
       `MVP次数：${user.mvpCount} 🏆`,
       `已解锁成就：${(user.achievements ?? []).length} 个（输入「${this.config.commandAchievement}」查看详情）`,
-      `当前头衔：${user.titles.filter(t => t.expire > Date.now()).map(t => t.name).join("、") || "无"}`,
+      `当前展示头衔：${displayTitle || "无"}${validTitleCount > 0 ? `（共拥有 ${validTitleCount} 个，输入「${this.config.commandTitle}」查看全部）` : ""}`,
     ].join("\n");
 
     await session.send(message);
@@ -288,20 +301,65 @@ export class SudokuGame {
       const text = await this.userService.getAchievementDetailText(session.userId, name);
       await session.send(text);
     } else {
+      // 名字优先级：session 捕获 > session.username > userId（getAchievementListText 内部会再用 DB 存储名兜底）
+      const displayName = this.captureUsername(session) || session.userId;
       const text = await this.userService.getAchievementListText(
         session.userId,
-        session.username || session.userId,
+        displayName,
         this.config.commandAchievement,
       );
       await session.send(text);
     }
   }
 
-  async showRank(session: Session, type: string = "积分") {
-    // 解析 "全服" 前缀：全服模式不过滤群成员
-    let isGlobal = false;
+  async showTitles(session: Session, name?: string) {
+    if (!session.userId) {
+      await session.send("无法获取用户信息。");
+      return;
+    }
+    if (name) {
+      const text = await this.userService.getTitleDetailText(session.userId, name);
+      await session.send(text);
+    } else {
+      const text = await this.userService.getOwnedTitlesText(
+        session.userId,
+        this.config.commandTitle,
+        this.config.commandWear,
+        this.config.commandUnwear,
+      );
+      await session.send(text);
+    }
+  }
+
+  async wearTitle(session: Session, titleName: string) {
+    if (!session.userId) {
+      await session.send("无法获取用户信息。");
+      return;
+    }
+    const msg = await this.userService.wearTitle(session.userId, titleName);
+    await session.send(msg);
+  }
+
+  async unwearTitle(session: Session, titleName?: string) {
+    if (!session.userId) {
+      await session.send("无法获取用户信息。");
+      return;
+    }
+    const msg = await this.userService.unwearTitle(session.userId, titleName);
+    await session.send(msg);
+  }
+
+  async showRank(session: Session, type: string = "积分", scope?: string) {
+    // 解析全服模式：
+    //   "排行榜 答对 全服"    → type="答对", scope="全服"
+    //   "排行榜 全服"         → type="全服", scope=undefined（type 本身就是"全服"）
+    //   "排行榜 全服积分"     → 兼容旧格式前缀
+    let isGlobal = scope === "全服";
     let effectiveType = type;
-    if (type.startsWith("全服")) {
+    if (type === "全服") {
+      isGlobal = true;
+      effectiveType = "积分";
+    } else if (type.startsWith("全服")) {
       isGlobal = true;
       effectiveType = type.slice(2).trim() || "积分";
     }
@@ -378,13 +436,18 @@ export class SudokuGame {
     const lines = [`【${scopeLabel}${title} TOP 10】`];
     for (let i = 0; i < sorted.length; i++) {
       const u = sorted[i];
-      let nickname = u.userId;
-      try {
-        if (session.guildId) {
-          const member = await session.bot.getGuildMember?.(session.guildId, u.userId);
-          nickname = (member as any)?.nickname ?? (member as any)?.name ?? u.userId;
-        }
-      } catch { /* 忽略 */ }
+      // 优先使用 DB 存储昵称作为基础（全服榜无法跨群调 API）
+      let nickname = (u as any).username || u.userId;
+      // 本群榜额外尝试从 API 取群昵称（可能与存储昵称不同）
+      if (!isGlobal) {
+        try {
+          if (session.guildId) {
+            const member = await session.bot.getGuildMember?.(session.guildId, u.userId);
+            const apiName = (member as any)?.nickname ?? (member as any)?.name;
+            if (apiName) nickname = apiName;
+          }
+        } catch { /* 忽略 */ }
+      }
       const titlePrefix = this.userService.getDisplayTitle(u);
       const nameDisplay = titlePrefix ? `${titlePrefix}${nickname}` : nickname;
 
@@ -429,11 +492,11 @@ export class SudokuGame {
       message += `暂时领先：\n`;
       for (let idx = 0; idx < topScorers.length; idx++) {
         const [uid, data] = topScorers[idx];
-        let nickname = uid;
+        let nickname = game.usernameCache.get(uid) || uid;
         try {
           if (session.guildId) {
             const member = await session.bot.getGuildMember?.(session.guildId, uid);
-            nickname = (member as any)?.nickname ?? (member as any)?.name ?? uid;
+            nickname = (member as any)?.nickname ?? (member as any)?.name ?? nickname;
           }
         } catch { /* 忽略 */ }
         message += `  ${idx + 1}. ${nickname}：${data.score}分\n`;
@@ -459,7 +522,7 @@ export class SudokuGame {
         "  终盘大师 - 2000积分 / 有效期365天",
         "",
         `当前积分：${user.score}`,
-        `输入「${this.config.commandExchange} <头衔名>」即可兑换`,
+        `输入「${this.config.commandExchange} 数独学徒」即可兑换`,
       ];
       await session.send(shopLines.join("\n"));
       return;
@@ -574,9 +637,11 @@ export class SudokuGame {
     // 若题目尚未就绪（极短窗口期），忽略输入
     if (!game.currentQuestion) return;
 
-    // 有玩家应答，更新活动时间并重置无人超时计时器
+    // 有玩家应答：更新活动时间、重置无人超时计时器、缓存昵称（多来源捕捉）
     game.lastActivityTime = Date.now();
     this.resetInactivityTimer(session, game);
+    const capturedName = this.captureUsername(session);
+    if (capturedName) game.usernameCache.set(session.userId, capturedName);
 
     const q = game.currentQuestion;
     const correct = game.currentSolution[q.row][q.col];
@@ -585,8 +650,10 @@ export class SudokuGame {
       this.updateParticipant(game, session.userId, false, answerTime);
       // 单人嘲讽：50%概率触发
       if (Math.random() < 0.5) {
+        // 使用已缓存的昵称（本次捕获 > 之前缓存 > userId）
+        const displayUser = capturedName || game.usernameCache.get(session.userId) || session.userId;
         const mockMsg = this.getRandomMock("singleMock", {
-          user: session.username || session.userId,
+          user: displayUser,
           penalty: this.config.penalty,
         });
         await session.send(mockMsg);
@@ -674,23 +741,26 @@ export class SudokuGame {
     if (participants.length > 0) {
       const sorted = participants.sort((a, b) => b[1].score - a[1].score);
 
-      // ── 1. 构建昵称缓存（单次 API 调用，排行榜与成就检测共用）──
-      const nicknameMap = new Map<string, string>();
-      for (const [uid] of participants) {
-        let nickname = uid;
-        try {
-          if (session.guildId) {
-            const member = await session.bot.getGuildMember?.(session.guildId, uid);
-            nickname = (member as any)?.nickname ?? (member as any)?.name ?? uid;
-          }
-        } catch { /* 忽略 */ }
-        nicknameMap.set(uid, nickname);
-      }
-
-      // ── 2. 预加载用户数据（单次 DB 读取，供排行榜头衔展示 + prevConsecutiveLastPlaces 复用）──
+      // ── 1. 预加载用户数据（单次 DB 读取，供排行榜头衔展示 + 昵称兜底 + prevConsecutiveLastPlaces）──
       const preUpdateUsers = new Map<string, any>();
       for (const [uid] of participants) {
         preUpdateUsers.set(uid, await this.userService.getUser(uid));
+      }
+
+      // ── 2. 构建昵称缓存（优先级：API群昵称 > 本局session捕获 > DB存储 > userId）──
+      const nicknameMap = new Map<string, string>();
+      for (const [uid] of participants) {
+        // 先取本局 session 捕获或 DB 存储的昵称作为兜底（比裸 userId 更友好）
+        const storedName = game.usernameCache.get(uid) || (preUpdateUsers.get(uid) as any)?.username || "";
+        let nickname = storedName || uid;
+        try {
+          if (session.guildId) {
+            const member = await session.bot.getGuildMember?.(session.guildId, uid);
+            const apiName = (member as any)?.nickname ?? (member as any)?.name;
+            if (apiName) nickname = apiName;
+          }
+        } catch { /* 忽略 */ }
+        nicknameMap.set(uid, nickname);
       }
 
       // 计算MVP：多人局中得分最高且答对至少1题（单人局无MVP概念）
@@ -742,6 +812,7 @@ export class SudokuGame {
             correctDelta: data.correct,
             roundsDelta: 1,
             guildId: game.guildId,
+            username: nicknameMap.get(uid) || game.usernameCache.get(uid) || "",
           });
         }
         return;
@@ -788,6 +859,7 @@ export class SudokuGame {
           finalStreak: data.streak,
           maxInGameStreak: data.maxStreak,
           guildId: game.guildId,
+          username: nicknameMap.get(uid) || game.usernameCache.get(uid) || "",
         });
         updatedUsers.set(uid, updated);
       }
@@ -913,6 +985,31 @@ export class SudokuGame {
         await this.endGame(session, game, false);
       }
     }, game.currentInactivityTimeout * 60 * 1000);
+  }
+
+  /**
+   * 多来源捕获用户昵称。
+   *
+   * 各来源说明：
+   * 1. session.event.member.nick   —— Satori 标准的群成员昵称（QQ 群名片），随消息事件一起下发，不需要额外 API 调用
+   * 2. session.event.user.name     —— Satori 标准的用户全局名称
+   * 3. session.username            —— Koishi 封装的快捷属性，通常等于上面两者之一
+   * 4. session.author.nickname     —— 部分适配器在 author 对象上暴露的昵称（OneBot 兼容层等）
+   * 5. session.author.name         —— author 的 name 字段
+   *
+   * 返回第一个非空字符串；全部失败则返回空字符串，调用方应回退到 userId。
+   */
+  private captureUsername(session: Session): string {
+    const candidates: unknown[] = [
+      (session.event?.member as any)?.nick,
+      (session.event?.user as any)?.name,
+      session.username,
+      (session.author as any)?.nickname,
+      session.author?.name,
+    ];
+    return candidates.find(
+      (n): n is string => typeof n === "string" && n.trim().length > 0,
+    ) ?? "";
   }
 
   private getRandomMock(type: "groupMock" | "singleMock", params: Record<string, any>): string {
