@@ -16,6 +16,7 @@ export interface Config {
   commandRank: string;
   commandProgress: string;
   commandDifficulty: string;
+  commandTimeout: string;
   commandHelp: string;
   timeout: number;
   rounds: number;
@@ -27,14 +28,14 @@ export interface Config {
 
 export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
-    commandStart: Schema.string().default("数独开始").description("开始游戏命令"),
+    commandStart: Schema.string().default("开始答题").description("开始游戏命令"),
     commandStop: Schema.string()
-      .default("数独结束")
+      .default("结束答题")
       .description("结束游戏命令"),
-    commandScore: Schema.string().default("积分").description("查看积分命令"),
+    commandScore: Schema.string().default("个人积分").description("查看积分命令"),
     commandExchange: Schema.string().default("兑换").description("兑换头衔命令"),
     commandRank: Schema.string()
-      .default("数独排行")
+      .default("排行榜")
       .description("查看排行榜命令"),
     commandProgress: Schema.string()
       .default("游戏进度")
@@ -42,13 +43,16 @@ export const Config: Schema<Config> = Schema.intersect([
     commandDifficulty: Schema.string()
       .default("难度")
       .description("设置难度命令"),
+    commandTimeout: Schema.string()
+      .default("时间限制")
+      .description("设置每题答题时间命令（0 = 无时间限制）"),
     commandHelp: Schema.string()
-      .default("数独帮助")
+      .default("游戏帮助")
       .description("查看帮助命令"),
   }).description("命令配置"),
   
   Schema.object({
-    timeout: Schema.number().default(30).min(10).max(120).description("每题超时时间（秒）"),
+    timeout: Schema.number().default(0).min(0).max(120).description("每题超时时间（秒），0 = 无时间限制"),
     rounds: Schema.number().default(8).min(1).max(20).description("每轮题目数量"),
     difficulty: Schema.union([
       Schema.union([1, 2, 3, 4, 5, 6, 7] as const),
@@ -159,6 +163,14 @@ export function apply(ctx: Context, config: Config) {
       if (!session) return "无法获取会话信息";
       if (level === undefined) return "请指定难度级别（1-7）。例如：难度 3";
       return game.setDifficulty(session, level);
+    });
+
+  ctx
+    .command(`${config.commandTimeout} <seconds:number>`)
+    .action(({ session }, seconds) => {
+      if (!session) return "无法获取会话信息";
+      if (seconds === undefined) return "请指定时间（秒），0 表示无时间限制。例如：时间限制 60";
+      return game.setTimeoutLimit(session, seconds);
     });
 
   ctx.command(config.commandHelp).action(({ session }) => {

@@ -92,13 +92,12 @@ export class SudokuGenerator {
 
   // ── 内部工具方法 ────────────────────────────────────────────────────────
 
-  /** 用 dachev/sudoku 求解（供 @forfuns 路径使用） */
+  /** 用 dachev/sudoku 求解（供 @forfuns 路径使用）。求解失败时抛出异常由上层重新生成。 */
   private solvePuzzle(puzzleArray: number[]): number[] {
     const input = puzzleArray.map((v) => (v === 0 ? null : v - 1));
     const result = dachev.solvepuzzle(input);
     if (!result) {
-      console.error("[Sudoku] 求解失败，返回原始 puzzle");
-      return puzzleArray;
+      throw new Error("dachev/sudoku 求解失败，本题盘面无解");
     }
     return result.map((v: number) => v + 1);
   }
