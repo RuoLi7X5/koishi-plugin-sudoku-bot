@@ -335,7 +335,7 @@ export class UserService {
       wrong: number;
       score: number;
       streak: number;
-      answerPattern?: string;
+      answerPattern?: string[];
       fastestAnswer?: number;
       slowestCorrect?: number;
       averageTime?: number;
@@ -389,10 +389,11 @@ export class UserService {
     if (roundData.lastSecondAnswers !== undefined && roundData.lastSecondAnswers > 0) {
       checks.push({ key: "last_second_hero", condition: true });
     }
-    // 对错或错对严格交替（至少4题）
+    // 对错或错对严格交替（至少4题，answerPattern 本身已是 string[]）
     if (roundData.answerPattern && roundData.answerPattern.length >= 4) {
-      const patternArr = roundData.answerPattern.split("");
-      const isAlternating = patternArr.every((p, i) => i === 0 || p !== patternArr[i - 1]);
+      const isAlternating = roundData.answerPattern.every(
+        (p, i) => i === 0 || p !== roundData.answerPattern![i - 1],
+      );
       checks.push({ key: "own_rhythm", condition: isAlternating });
     }
     if (roundData.firstThreeCorrect) {
@@ -428,11 +429,7 @@ export class UserService {
       checks.push({ key: "rise_from_ashes", condition: true });
     }
 
-    const recentMvps = await this.getRecentMvpStreak(userId);
-    if (recentMvps >= 10) {
-      checks.push({ key: "never_defeated", condition: true });
-    }
-
+    checks.push({ key: "never_defeated", condition: user.consecutiveMvp >= 10 });
     checks.push({ key: "brave_heart", condition: user.consecutiveLastPlace >= 5 });
     checks.push({ key: "iron_will", condition: user.consecutiveLastPlace >= 10 });
     checks.push({ key: "eternal_warrior", condition: user.lastPlaceCount >= 20 });
@@ -482,24 +479,22 @@ export class UserService {
     }
   }
 
-  async getRecentMvpStreak(userId: string): Promise<number> {
-    const user = await this.getUser(userId);
-    return user.consecutiveMvp;
-  }
-
   /**
    * 每局结算荣誉头衔。
    * - 荣誉头衔永久有效（不设时间过期），条件不符立即易主。
    * - 每个群独立结算，只考虑在该群参与过游戏的用户。
    */
   async updateHonorTitles(guildId: string, session?: Session) {
+    // 没有 guildId 时跳过，避免对全服误结算
+    if (!guildId) return;
+
     const allUsers = await this.ctx.database.get("sudoku_user", {});
     if (allUsers.length === 0) return;
 
     // 筛选本群成员
-    const users = guildId
-      ? allUsers.filter(u => ((u as any).guilds as string[] ?? []).includes(guildId))
-      : allUsers;
+    const users = allUsers.filter(
+      u => ((u as any).guilds as string[] ?? []).includes(guildId)
+    );
 
     if (users.length === 0) return;
 
@@ -537,10 +532,12 @@ export class UserService {
       );
 
       const currentHolder = currentHolders.length > 0 ? currentHolders[0] : null;
+      const isFirstTime = currentHolder === null;
+      const isChange = currentHolder !== null && currentHolder.userId !== cfg.userId;
       const newHolder = await this.getUser(cfg.userId);
 
       // 检测易主
-      if (currentHolder && currentHolder.userId !== cfg.userId && session) {
+      if (isChange && session) {
         let oldName = currentHolder.userId;
         let newName = cfg.userId;
         try {
@@ -572,8 +569,8 @@ export class UserService {
       newHolder.titles.push({ name: cfg.name, expire: HONOR_EXPIRE, type: "honor", guildId });
       await this.ctx.database.set("sudoku_user", { userId: cfg.userId }, this.toUpdateData(newHolder));
 
-      // 播报（不再显示有效期）
-      if (session) {
+      // 只在首次授予或易主时播报，持有者不变则静默刷新
+      if ((isFirstTime || isChange) && session) {
         let holderName = cfg.userId;
         try {
           if (session.guildId) {
@@ -623,7 +620,7 @@ export class UserService {
    * 兼容旧数据（无 type 字段时通过名称推断）。
    */
   getDisplayTitle(user: UserData): string {
-    if (user.titles.length === 0) return "";
+    if (!user.titles || user.titles.length === 0) return "";
     const now = Date.now();
     const validTitles = user.titles.filter(t => t.expire > now);
     if (validTitles.length === 0) return "";

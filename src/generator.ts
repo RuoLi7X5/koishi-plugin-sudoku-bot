@@ -1,4 +1,6 @@
-import * as sudoku from "sudoku";
+import * as dachev from "sudoku";
+
+type SudokuGenDifficulty = "easy" | "medium" | "hard" | "expert";
 
 export class SudokuGenerator {
   private difficulty: number;
@@ -8,82 +10,96 @@ export class SudokuGenerator {
   }
 
   generate(): { puzzle: number[][]; solution: number[][] } {
-    // 根据难度档位选择生成器
-    // 1: sudoku-gen easy
-    // 2: sudoku-gen medium  
-    // 3: @forfuns/sudoku medium (level 1)
-    // 4: sudoku-gen hard
-    // 5: @forfuns/sudoku hard (level 2)
-    // 6: sudoku-gen expert
-    // 7: @forfuns/sudoku hell (level 4)
-    
+    // 难度档位与生成器的映射：
+    //   1: sudoku-gen easy    （简单）
+    //   2: sudoku-gen medium  （较易）
+    //   3: @forfuns/sudoku level 1（中等）
+    //   4: sudoku-gen hard    （中等+）
+    //   5: @forfuns/sudoku level 2（困难）
+    //   6: sudoku-gen expert  （困难+）
+    //   7: @forfuns/sudoku level 4（极难）
     const useForfuns = [3, 5, 7].includes(this.difficulty);
-    
-    if (useForfuns) {
-      return this.generateWithForfuns();
-    } else {
+    return useForfuns ? this.generateWithForfuns() : this.generateWithSudokuGen();
+  }
+
+  // ── sudoku-gen 路径（档位 1 / 2 / 4 / 6） ──────────────────────────────
+  private generateWithSudokuGen(): { puzzle: number[][]; solution: number[][] } {
+    const difficultyMap: Record<number, SudokuGenDifficulty> = {
+      1: "easy",
+      2: "medium",
+      4: "hard",
+      6: "expert",
+    };
+    const level = difficultyMap[this.difficulty] ?? "medium";
+
+    try {
+      const { generateSudoku } = require("sudoku-gen") as {
+        generateSudoku: (d: SudokuGenDifficulty) => { puzzle: string; solution: string };
+      };
+      const result = generateSudoku(level);
+      // sudoku-gen 返回 81 字符字符串，'-' 表示空格
+      return {
+        puzzle: this.stringTo2D(result.puzzle),
+        solution: this.stringTo2D(result.solution),
+      };
+    } catch (error) {
+      console.error("[Sudoku] sudoku-gen 生成失败，回退到 dachev/sudoku:", error);
+      return this.generateWithDachev();
+    }
+  }
+
+  // ── @forfuns/sudoku 路径（档位 3 / 5 / 7） ─────────────────────────────
+  private generateWithForfuns(): { puzzle: number[][]; solution: number[][] } {
+    const levelMap: Record<number, number> = { 3: 1, 5: 2, 7: 4 };
+    const level = levelMap[this.difficulty] ?? 1;
+
+    try {
+      const { generator } = require("@forfuns/sudoku") as {
+        generator: (level: number) => number[];
+      };
+      const puzzleArray = generator(level);
+      // @forfuns/sudoku 用 -1 表示空格，转换为 0
+      const normalized = puzzleArray.map((v) => (v === -1 ? 0 : v));
+      const puzzle = this.to2D(normalized);
+      const solution = this.to2D(this.solvePuzzle(normalized));
+      return { puzzle, solution };
+    } catch (error) {
+      console.error("[Sudoku] @forfuns/sudoku 生成失败，回退到 sudoku-gen:", error);
       return this.generateWithSudokuGen();
     }
   }
 
-  private generateWithSudokuGen(): { puzzle: number[][]; solution: number[][] } {
-    // 原有的 sudoku 包逻辑（实际是 dachev/sudoku，不支持难度）
-    const puzzleArray = sudoku.makepuzzle();
+  // ── dachev/sudoku 兜底（不支持难度，仅作 fallback） ────────────────────
+  private generateWithDachev(): { puzzle: number[][]; solution: number[][] } {
+    const puzzleArray = dachev.makepuzzle();
     const puzzle = this.to2D(
       puzzleArray.map((v: number | null) => (v === null ? 0 : v + 1)),
     );
-
-    const solutionArray = sudoku.solvepuzzle(puzzleArray);
+    const solutionArray = dachev.solvepuzzle(puzzleArray);
     const solution = this.to2D(solutionArray.map((v: number) => v + 1));
-
     return { puzzle, solution };
   }
 
-  private generateWithForfuns(): { puzzle: number[][]; solution: number[][] } {
-    try {
-      const { generator } = require('@forfuns/sudoku');
-      
-      // 映射难度档位到 @forfuns/sudoku 的 level
-      const levelMap: Record<number, number> = {
-        3: 1, // 中等 -> medium
-        5: 2, // 困难 -> hard
-        7: 4, // 极难 -> hell
-      };
-      
-      const level = levelMap[this.difficulty] || 1;
-      const puzzleArray = generator(level);
-      
-      // 转换为我们的格式（将 -1 转为 0）
-      const normalizedArray = puzzleArray.map((v: number) => v === -1 ? 0 : v);
-      const puzzle = this.to2D(normalizedArray);
-      
-      // 求解答案
-      const solutionArray = this.solvePuzzle(normalizedArray);
-      const solution = this.to2D(solutionArray);
-      
-      return { puzzle, solution };
-    } catch (error) {
-      console.error("[Sudoku] @forfuns/sudoku 生成失败，回退到 sudoku 包:", error);
-      return this.generateWithSudokuGen();
-    }
-  }
+  // ── 内部工具方法 ────────────────────────────────────────────────────────
 
+  /** 用 dachev/sudoku 求解（供 @forfuns 路径使用） */
   private solvePuzzle(puzzleArray: number[]): number[] {
-    // 使用 dachev/sudoku 包求解
-    // 转换格式：0 -> null，数字 -> 数字-1
-    const inputArray = puzzleArray.map(v => v === 0 ? null : v - 1);
-    const solutionArray = sudoku.solvepuzzle(inputArray);
-    
-    if (!solutionArray) {
-      // 如果求解失败，返回原puzzle（不应该发生）
-      console.error("[Sudoku] 求解失败");
+    const input = puzzleArray.map((v) => (v === 0 ? null : v - 1));
+    const result = dachev.solvepuzzle(input);
+    if (!result) {
+      console.error("[Sudoku] 求解失败，返回原始 puzzle");
       return puzzleArray;
     }
-    
-    // 转换回我们的格式：数字+1
-    return solutionArray.map((v: number) => v + 1);
+    return result.map((v: number) => v + 1);
   }
 
+  /** 将 sudoku-gen 的字符串（'-' / '.' 表示空格）转为 9×9 数字数组 */
+  private stringTo2D(str: string): number[][] {
+    const arr = str.split("").map((c) => (c === "-" || c === ".") ? 0 : parseInt(c, 10));
+    return this.to2D(arr);
+  }
+
+  /** 将长度为 81 的一维数组转为 9×9 二维数组 */
   private to2D(arr: number[]): number[][] {
     const result: number[][] = [];
     for (let i = 0; i < 9; i++) {

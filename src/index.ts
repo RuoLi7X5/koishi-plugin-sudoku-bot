@@ -23,7 +23,6 @@ export interface Config {
   penalty: number;
   streakBonus: number;
   difficulty: 1 | 2 | 3 | 4 | 5 | 6 | 7;
-  titleDuration: number;
 }
 
 export const Config: Schema<Config> = Schema.intersect([
@@ -69,9 +68,6 @@ export const Config: Schema<Config> = Schema.intersect([
     streakBonus: Schema.number().default(1).min(0).description("连续答对额外加分"),
   }).description("积分配置"),
   
-  Schema.object({
-    titleDuration: Schema.number().default(7).min(1).max(365).description("荣誉头衔有效期（天）"),
-  }).description("其他配置"),
 ]) as Schema<Config>;
 
 export function apply(ctx: Context, config: Config) {
@@ -161,12 +157,8 @@ export function apply(ctx: Context, config: Config) {
     .command(`${config.commandDifficulty} <level:number>`)
     .action(({ session }, level) => {
       if (!session) return "无法获取会话信息";
-      if (level === undefined) {
-        return "请指定难度级别（1-7）。例如：难度 3";
-      }
-      // 将字符串转为数字
-      const numLevel = typeof level === "string" ? parseInt(level) : level;
-      return game.setDifficulty(session, numLevel);
+      if (level === undefined) return "请指定难度级别（1-7）。例如：难度 3";
+      return game.setDifficulty(session, level);
     });
 
   ctx.command(config.commandHelp).action(({ session }) => {
