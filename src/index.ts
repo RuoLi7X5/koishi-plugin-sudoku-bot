@@ -23,6 +23,7 @@ export interface Config {
   commandTitle: string;
   commandWear: string;
   commandUnwear: string;
+  commandHint: string;
   timeout: number;
   inactivityTimeout: number;
   rounds: number;
@@ -64,6 +65,7 @@ export const Config: Schema<Config> = Schema.intersect([
     commandTitle: Schema.string().default("头衔").description("查看/管理头衔命令"),
     commandWear: Schema.string().default("佩戴").description("佩戴头衔命令"),
     commandUnwear: Schema.string().default("卸下").description("卸下头衔命令"),
+    commandHint: Schema.string().default("获取答案").description("查询题目求解路径的指令名"),
   }).description("命令配置"),
   
   Schema.object({
@@ -232,6 +234,15 @@ export function apply(ctx: Context, config: Config) {
     .action(({ session }, name) => {
       if (!session) return "无法获取会话信息";
       return game.unwearTitle(session, name);
+    });
+
+  ctx
+    .command(`${config.commandHint} <questionId:string>`)
+    .action(({ session }, questionId) => {
+      if (!session) return "无法获取会话信息";
+      if (!questionId)
+        return `请输入题目编号，例如：${config.commandHint} a1`;
+      return game.showHint(session, questionId);
     });
 
   // 监听消息（抢答）—— 先快速检查当前频道是否有游戏，避免处理无关消息

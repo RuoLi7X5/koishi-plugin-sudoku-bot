@@ -26,6 +26,7 @@ export class ImageRenderer {
     puzzle: number[][],
     difficulty?: string,
     questionCell?: { row: number; col: number },
+    questionId?: string,
   ): Promise<Buffer> {
     const cellSize = 50;
     const gridSize = cellSize * 9;
@@ -148,13 +149,24 @@ export class ImageRenderer {
       
       ctx2d.restore();
       
-      // 绘制难度标注
-      if (difficulty) {
-        ctx2d.font = "bold 16px Arial";
-        ctx2d.fillStyle = "#666666";
+      // 绘制底部信息区：难度居中，题目编号右对齐（同行）
+      const bottomY = size + bottomSpace / 2;
+      ctx2d.font = "bold 16px Arial";
+      ctx2d.fillStyle = "#666666";
+      ctx2d.textBaseline = "middle";
+
+      if (difficulty && questionId) {
+        // 难度居中，题目编号右对齐
         ctx2d.textAlign = "center";
-        ctx2d.textBaseline = "middle";
-        ctx2d.fillText(difficulty, size / 2, size + bottomSpace / 2);
+        ctx2d.fillText(difficulty, size / 2, bottomY);
+        ctx2d.textAlign = "right";
+        ctx2d.fillText(questionId, size - padding, bottomY);
+      } else if (difficulty) {
+        ctx2d.textAlign = "center";
+        ctx2d.fillText(difficulty, size / 2, bottomY);
+      } else if (questionId) {
+        ctx2d.textAlign = "right";
+        ctx2d.fillText(questionId, size - padding, bottomY);
       }
       
       console.log("[Sudoku] Canvas 绘制完成");

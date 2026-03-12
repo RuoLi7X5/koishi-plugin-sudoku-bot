@@ -4,6 +4,7 @@ import { SudokuGenerator } from "./generator";
 import { ImageRenderer } from "./renderer";
 import { UserService } from "./user";
 import { MOCK_MESSAGES } from "./mockMessages";
+import { HintManager } from "./hint";
 
 // 每个频道独立的游戏状态
 type GameState = {
@@ -37,6 +38,8 @@ type GameState = {
   questionStartTime: number;
   userTitleCache: Map<string, string>;    // 本局内头衔缓存，避免每次答对都查 DB
   usernameCache: Map<string, string>;     // 本局内昵称缓存（answer 时捕获），用于结算和存储
+  currentPrefix: string;                  // 本轮分配的题目前缀，如 "a"、"ab"
+  currentQuestionIdx: number;             // 本轮已出题序号（1-based），当前题编号 = currentPrefix + currentQuestionIdx
 };
 
 export class SudokuGame {
@@ -62,6 +65,7 @@ export class SudokuGame {
   ];
 
   private mockMessages = MOCK_MESSAGES;
+  private hintManager: HintManager = new HintManager();
 
   constructor(
     ctx: Context,
@@ -138,6 +142,9 @@ export class SudokuGame {
       `  每轮 ${c.rounds} 题，每题限时 ${curTimeout > 0 ? `${curTimeout} 秒` : "无限制（答对才进入下一题）"}`,
       "  答对得分答错扣分，连续答对有积分加成",
       `  完美局（全 ${c.rounds} 题全对，无一答错）可解锁专属成就，探索隐藏成就获得专属头衔！`,
+      "",
+      "🔍 求解指引",
+      `  ${c.commandHint} a1 - 查询题目 a1 的推理解法（游戏结束后可用，24小时内有效）`,
     ].join("\n");
     await session.send(message);
   }
@@ -189,9 +196,14 @@ export class SudokuGame {
       questionStartTime: Date.now(),
       userTitleCache: new Map(),
       usernameCache: new Map(),
+      currentPrefix: "",
+      currentQuestionIdx: 0,
     };
 
     this.games.set(session.channelId, newGame);
+
+    // 分配本轮唯一前缀（24h 回收机制由 HintManager 内部管理）
+    newGame.currentPrefix = this.hintManager.allocatePrefix(session.channelId);
 
     // 记录发起游戏次数，同时绑定群成员关系（用于群榜单隔离和"开局之魂"成就）
     if (session.userId) {
@@ -347,6 +359,76 @@ export class SudokuGame {
     }
     const msg = await this.userService.unwearTitle(session.userId, titleName);
     await session.send(msg);
+  }
+
+  async showHint(session: Session, rawId: string) {
+    if (!session.channelId) return;
+
+    const parsed = this.hintManager.parseQuestionId(rawId);
+    if (!parsed) {
+      await session.send(
+        `题目编号格式不正确，请输入如 a1、ab3 格式的编号。\n示例：${this.config.commandHint} a1`,
+      );
+      return;
+    }
+
+    const { prefix } = parsed;
+
+    // 游戏进行中时，禁止查询当前轮次的题目（历史轮次不受限）
+    const game = this.games.get(session.channelId);
+    if (game && game.currentPrefix === prefix) {
+      await session.send("本轮游戏尚未结束，无法查询当前题目答案。");
+      return;
+    }
+
+    // 统一小写再查缓存
+    const normalizedId = rawId.trim().toLowerCase();
+    const record = this.hintManager.getQuestion(session.channelId, normalizedId);
+
+    if (!record) {
+      // 区分"编号从未出现过"与"已过期"
+      if (this.hintManager.isPrefixKnown(session.channelId, prefix)) {
+        await session.send("该题目已过期，无法查询（题目数据仅保留 24 小时）。");
+      } else {
+        await session.send("题目编号无效，请确认编号是否正确。");
+      }
+      return;
+    }
+
+    // 调用求解（第一期：占位回复）
+    const result = this.hintManager.solveHint(record);
+    if (!result.success) {
+      if (result.reason === "not_implemented") {
+        await session.send("求解功能正在开发中，敬请期待！");
+      } else {
+        await session.send(
+          "此题超出当前支持的逻辑技巧范围，无法生成推理路径。",
+        );
+      }
+      return;
+    }
+
+    // 格式化推理路径输出（第二期才会到达这里）
+    const coord = this.formatCoord(record.targetRow, record.targetCol);
+    const levelNames = ["", "入门", "基础", "中级", "进阶", "高阶"];
+    const lines: string[] = [
+      `【${coord} 格推理路径】目标答案：${record.targetAnswer}`,
+      "",
+    ];
+    for (let i = 0; i < result.steps.length; i++) {
+      const step = result.steps[i];
+      lines.push(`步骤 ${i + 1} → ${step.technique} [L${step.level}]`);
+      lines.push(`  ${step.description}`);
+      lines.push(`  ${coord} 候选数剩余：${step.remaining.join(", ")}`);
+      lines.push("");
+    }
+    lines.push(
+      `使用技巧：${result.steps.map((s) => s.technique).join(" → ")}`,
+    );
+    lines.push(
+      `最高层级：L${result.maxLevel}（${levelNames[result.maxLevel] ?? ""}）`,
+    );
+    await session.send(lines.join("\n"));
   }
 
   async showRank(session: Session, type: string = "积分", scope?: string) {
@@ -575,17 +657,29 @@ export class SudokuGame {
     game.currentSolution = solution;
     game.currentQuestion = q;
 
+    // 生成本题编号并注册到 HintManager 缓存
+    game.currentQuestionIdx++;
+    const questionId = `${game.currentPrefix}${game.currentQuestionIdx}`;
+    this.hintManager.registerQuestion(game.channelId, questionId, {
+      puzzle: puzzle.map((row) => [...row]),
+      solution: solution.map((row) => [...row]),
+      targetRow: q.row,
+      targetCol: q.col,
+      targetAnswer: solution[q.row][q.col],
+      createdAt: Date.now(),
+    });
+
     // 发送本题盘面图片
     const difficultyLabel = `level ${game.difficulty}`;
     const logger = this.ctx.logger("sudoku");
     try {
-      const image = await this.renderer.render(puzzle, difficultyLabel, q);
+      const image = await this.renderer.render(puzzle, difficultyLabel, q, questionId);
       if (!image || image.length === 0) {
         logger.error("Canvas 返回空 Buffer，图片生成失败");
         await session.send("⚠️ 图片生成失败，但游戏继续。");
       } else {
         await session.send(h.image(`data:image/png;base64,${image.toString("base64")}`));
-        logger.info(`第 ${game.currentRound + 1} 题盘面发送（${image.length} bytes）`);
+        logger.info(`第 ${game.currentRound + 1} 题盘面发送（${image.length} bytes）编号：${questionId}`);
       }
     } catch (error: any) {
       logger.error("图片渲染失败：", error);
