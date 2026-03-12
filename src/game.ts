@@ -746,8 +746,10 @@ export class SudokuGame {
   }
 
   private formatCoord(row: number, col: number): string {
-    const colLetter = String.fromCharCode(65 + col); // A-I
-    return `${colLetter}${row + 1}`;
+    // 行用字母（A=第1行，从上往下），列用数字（1=第1列，从左往右）
+    // 与玩家直觉一致：A6 = 第A行第6列
+    const rowLetter = String.fromCharCode(65 + row); // A-I（行，从上到下）
+    return `${rowLetter}${col + 1}`; // 列 1-9（从左到右）
   }
 
   private selectQuestions(puzzle: number[][], count: number): { row: number; col: number }[] {
