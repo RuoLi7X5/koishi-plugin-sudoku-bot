@@ -22,7 +22,11 @@ export class ImageRenderer {
   constructor(private ctx: Context) {}
 
 
-  async render(puzzle: number[][], difficulty?: string): Promise<Buffer> {
+  async render(
+    puzzle: number[][],
+    difficulty?: string,
+    questionCell?: { row: number; col: number },
+  ): Promise<Buffer> {
     const cellSize = 50;
     const gridSize = cellSize * 9;
     const padding = 20; // 边距
@@ -113,6 +117,14 @@ export class ImageRenderer {
         ctx2d.moveTo(0, pos);
         ctx2d.lineTo(gridSize, pos);
         ctx2d.stroke();
+      }
+
+      // 题目格高亮（浅绿色背景）
+      if (questionCell) {
+        ctx2d.fillStyle = "#90EE90";
+        const qx = questionCell.col * cellSize + 1;
+        const qy = questionCell.row * cellSize + 1;
+        ctx2d.fillRect(qx, qy, cellSize - 2, cellSize - 2);
       }
 
       // 绘制数字

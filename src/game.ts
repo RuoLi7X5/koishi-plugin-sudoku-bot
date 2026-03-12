@@ -15,7 +15,10 @@ type GameState = {
   currentPuzzle: number[][];          // 本轮盘面
   currentSolution: number[][];        // 本轮答案
   currentQuestion: { row: number; col: number } | null; // 本轮问题坐标
-  currentTimeout: number;    // 本局每题限时（秒），0 = 无限制
+  currentTimeout: number;             // 本局每题限时（秒），0 = 无限制
+  currentInactivityTimeout: number;   // 本局无人参与自动结束时长（分钟），0 = 禁用
+  lastActivityTime: number;           // 最近一次任意玩家操作的时间戳
+  inactivityTimer: any;               // 无人参与超时计时器（与 timer 独立）
   participants: Map<
     string,
     {
@@ -24,7 +27,6 @@ type GameState = {
       wrong: number;
       streak: number;       // 当前连击数（答错重置）
       maxStreak: number;    // 本局最高连击数
-      answerTimes: number[];
       correctAnswerTimes: number[]; // 仅答对时的用时（用于 speed_demon / zen_master）
       answerPattern: string[];
       lastSecondCount: number;
@@ -42,8 +44,13 @@ export class SudokuGame {
   private generator: SudokuGenerator;
   private renderer: ImageRenderer;
   private userService: UserService;
-  private currentDifficulty: number;
-  private currentTimeout: number;   // 运行时可调整的每题限时（秒），0 = 无限制
+  private currentDifficulty: number;   // 全局默认难度（来自插件配置，作为兜底）
+  private currentTimeout: number;      // 全局默认限时（来自插件配置，作为兜底）
+
+  // 各群独立的难度 / 限时 / 无人超时设置（key = guildId || channelId）
+  private channelDifficulty: Map<string, number> = new Map();
+  private channelTimeout: Map<string, number> = new Map();
+  private channelInactivityTimeout: Map<string, number> = new Map();
 
   // 多频道游戏状态表（key = channelId）
   private games: Map<string, GameState> = new Map();
@@ -72,8 +79,31 @@ export class SudokuGame {
 
   // ==================== 公开方法 ====================
 
+  /** 取群/频道唯一 key，用于按群隔离难度设置 */
+  private getChannelKey(session: Session): string {
+    return session.guildId || session.channelId || "global";
+  }
+
+  /** 取当前频道生效的难度（群设置 > 全局默认） */
+  private getEffectiveDifficulty(session: Session): number {
+    return this.channelDifficulty.get(this.getChannelKey(session)) ?? this.currentDifficulty;
+  }
+
+  /** 取当前频道生效的限时（群设置 > 全局默认） */
+  private getEffectiveTimeout(session: Session): number {
+    return this.channelTimeout.get(this.getChannelKey(session)) ?? this.currentTimeout;
+  }
+
+  /** 取当前频道生效的无人超时（群设置 > 全局默认，单位：分钟） */
+  private getEffectiveInactivityTimeout(session: Session): number {
+    return this.channelInactivityTimeout.get(this.getChannelKey(session)) ?? this.config.inactivityTimeout;
+  }
+
   async showHelp(session: Session) {
     const c = this.config;
+    const curDiff = this.getEffectiveDifficulty(session);
+    const curTimeout = this.getEffectiveTimeout(session);
+    const curInactivity = this.getEffectiveInactivityTimeout(session);
     const message = [
       "【数独游戏帮助】",
       "",
@@ -84,22 +114,25 @@ export class SudokuGame {
       "",
       "📊 数据指令",
       `  ${c.commandScore} - 查看个人积分与档案`,
+      `  ${c.commandAchievement} - 查看成就列表`,
+      `  ${c.commandAchievement} <成就名> - 查看指定成就详情`,
       `  ${c.commandRank} [类型] - 查看排行榜`,
       "    类型：积分 / 答对 / 参与 / 正确率 / MVP / 完美 / 成就",
       "",
       "⚙️ 设置指令",
-      `  ${c.commandDifficulty} <1-7> - 设置默认难度`,
+      `  ${c.commandDifficulty} <1-7> - 设置本群默认难度（当前：${SudokuGame.DIFFICULTY_NAMES[curDiff]}·级别${curDiff}）`,
       "    1简单  2较易  3中等  4中等+  5困难  6困难+  7极难",
-      `  ${c.commandTimeout} <秒> - 设置每题答题时间（0=无时间限制）`,
+      `  ${c.commandTimeout} <秒> - 设置每题答题时间（0=无时间限制，当前：${curTimeout > 0 ? `${curTimeout}秒` : "无限制"}）`,
+      `  ${c.commandInactivity} <分钟> - 设置无人参与自动结束时长（0=禁用，当前：${curInactivity > 0 ? `${curInactivity}分钟` : "禁用"}）`,
       "",
       "🎖️ 头衔指令",
       `  ${c.commandExchange} - 查看可兑换头衔列表`,
       `  ${c.commandExchange} <头衔名> - 用积分兑换头衔`,
       "",
       "📝 玩法说明",
-      `  每轮 ${c.rounds} 题，每题限时 ${this.currentTimeout > 0 ? `${this.currentTimeout} 秒` : "无限制（答对才进入下一题）"}`,
+      `  每轮 ${c.rounds} 题，每题限时 ${curTimeout > 0 ? `${curTimeout} 秒` : "无限制（答对才进入下一题）"}`,
       "  答对得分答错扣分，连续答对有积分加成",
-      "  完美局（全对）可解锁专属成就，探索隐藏成就获得专属头衔！",
+      `  完美局（全 ${c.rounds} 题全对，无一答错）可解锁专属成就，探索隐藏成就获得专属头衔！`,
     ].join("\n");
     await session.send(message);
   }
@@ -121,8 +154,8 @@ export class SudokuGame {
       return;
     }
 
-    // 确定使用的难度：优先使用参数，否则使用当前设置
-    let useDifficulty = this.currentDifficulty;
+    // 确定使用的难度：优先使用本次参数，否则使用本群设置，最后兜底全局默认
+    let useDifficulty = this.getEffectiveDifficulty(session);
     if (difficulty !== undefined) {
       if (difficulty < 1 || difficulty > 7) {
         await session.send("难度级别必须在 1-7 之间。\n1-简单 2-较易 3-中等 4-中等+ 5-困难 6-困难+ 7-极难");
@@ -141,7 +174,10 @@ export class SudokuGame {
       currentPuzzle: [],
       currentSolution: [],
       currentQuestion: null,
-      currentTimeout: this.currentTimeout,
+      currentTimeout: this.getEffectiveTimeout(session),
+      currentInactivityTimeout: this.getEffectiveInactivityTimeout(session),
+      lastActivityTime: Date.now(),
+      inactivityTimer: null,
       participants: new Map(),
       timer: null,
       answered: false,
@@ -172,7 +208,8 @@ export class SudokuGame {
 
     // 立即从 Map 中移除，防止并发 stop 请求在 await 间隙重复找到同一局游戏，导致双重结算
     this.games.delete(session.channelId);
-    if (game.timer) clearTimeout(game.timer);
+    if (game.timer) { clearTimeout(game.timer); game.timer = null; }
+    if (game.inactivityTimer) { clearTimeout(game.inactivityTimer); game.inactivityTimer = null; }
 
     const completedQuestions = game.currentRound;
 
@@ -193,8 +230,8 @@ export class SudokuGame {
       await session.send("游戏进行中无法更改难度，请先结束当前游戏。");
       return;
     }
-    this.currentDifficulty = level;
-    await session.send(`已设置难度为：${SudokuGame.DIFFICULTY_NAMES[level]}（级别 ${level}）`);
+    this.channelDifficulty.set(this.getChannelKey(session), level);
+    await session.send(`已设置本群难度为：${SudokuGame.DIFFICULTY_NAMES[level]}（级别 ${level}）`);
   }
 
   async setTimeoutLimit(session: Session, seconds: number) {
@@ -206,11 +243,11 @@ export class SudokuGame {
       await session.send("游戏进行中无法更改时间限制，请先结束当前游戏。");
       return;
     }
-    this.currentTimeout = seconds;
+    this.channelTimeout.set(this.getChannelKey(session), seconds);
     if (seconds === 0) {
-      await session.send("已设置为无时间限制，答对才会进入下一题。");
+      await session.send("已设置本群为无时间限制，答对才会进入下一题。");
     } else {
-      await session.send(`已设置每题答题时间为 ${seconds} 秒。`);
+      await session.send(`已设置本群每题答题时间为 ${seconds} 秒。`);
     }
   }
 
@@ -231,15 +268,33 @@ export class SudokuGame {
       `参与轮数：${user.totalRounds}`,
       `答对/答错：${user.totalCorrect}/${user.totalWrong}`,
       `正确率：${correctRate}`,
-      `当前连续答对：${user.streak}`,
-      `历史最高连续：${user.maxStreak}`,
+      `上局结束连击：${user.streak}`,
+      `历史最高连击：${user.maxStreak}`,
       `完美局数：${user.perfectRounds} 💯`,
       `MVP次数：${user.mvpCount} 🏆`,
-      `已解锁成就：${(user.achievements ?? []).length} 个`,
+      `已解锁成就：${(user.achievements ?? []).length} 个（输入「${this.config.commandAchievement}」查看详情）`,
       `当前头衔：${user.titles.filter(t => t.expire > Date.now()).map(t => t.name).join("、") || "无"}`,
     ].join("\n");
 
     await session.send(message);
+  }
+
+  async showAchievements(session: Session, name?: string) {
+    if (!session.userId) {
+      await session.send("无法获取用户信息。");
+      return;
+    }
+    if (name) {
+      const text = await this.userService.getAchievementDetailText(session.userId, name);
+      await session.send(text);
+    } else {
+      const text = await this.userService.getAchievementListText(
+        session.userId,
+        session.username || session.userId,
+        this.config.commandAchievement,
+      );
+      await session.send(text);
+    }
   }
 
   async showRank(session: Session, type: string = "积分") {
@@ -461,7 +516,7 @@ export class SudokuGame {
     const difficultyLabel = `level ${game.difficulty}`;
     const logger = this.ctx.logger("sudoku");
     try {
-      const image = await this.renderer.render(puzzle, difficultyLabel);
+      const image = await this.renderer.render(puzzle, difficultyLabel, q);
       if (!image || image.length === 0) {
         logger.error("Canvas 返回空 Buffer，图片生成失败");
         await session.send("⚠️ 图片生成失败，但游戏继续。");
@@ -479,6 +534,9 @@ export class SudokuGame {
 
     game.answered = false;
     game.questionStartTime = Date.now();
+
+    // 每次出题重置无人参与超时计时器
+    this.resetInactivityTimer(session, game);
 
     if (game.currentTimeout > 0) {
       // 有时间限制：倒计时结束后公布答案并进入下一题
@@ -515,6 +573,10 @@ export class SudokuGame {
 
     // 若题目尚未就绪（极短窗口期），忽略输入
     if (!game.currentQuestion) return;
+
+    // 有玩家应答，更新活动时间并重置无人超时计时器
+    game.lastActivityTime = Date.now();
+    this.resetInactivityTimer(session, game);
 
     const q = game.currentQuestion;
     const correct = game.currentSolution[q.row][q.col];
@@ -567,7 +629,6 @@ export class SudokuGame {
         wrong: 0,
         streak: 0,
         maxStreak: 0,
-        answerTimes: [],
         correctAnswerTimes: [],
         answerPattern: [],
         lastSecondCount: 0,
@@ -575,9 +636,6 @@ export class SudokuGame {
       game.participants.set(userId, p);
     }
 
-    if (answerTime !== undefined) {
-      p.answerTimes.push(answerTime);
-    }
     p.answerPattern.push(isCorrect ? "对" : "错");
 
     if (isCorrect) {
@@ -608,14 +666,34 @@ export class SudokuGame {
    */
   private async endGame(session: Session, game: GameState, isComplete = true) {
     if (game.timer) clearTimeout(game.timer);
-    // 从游戏表中移除，防止后续定时器重复触发
+    if (game.inactivityTimer) clearTimeout(game.inactivityTimer);
+    game.inactivityTimer = null;
     this.games.delete(game.channelId);
 
     const participants = Array.from(game.participants.entries());
     if (participants.length > 0) {
       const sorted = participants.sort((a, b) => b[1].score - a[1].score);
 
-      // 计算MVP：多人局中得分最高且答对至少1题（单人局无MVP概念，避免刷成就）
+      // ── 1. 构建昵称缓存（单次 API 调用，排行榜与成就检测共用）──
+      const nicknameMap = new Map<string, string>();
+      for (const [uid] of participants) {
+        let nickname = uid;
+        try {
+          if (session.guildId) {
+            const member = await session.bot.getGuildMember?.(session.guildId, uid);
+            nickname = (member as any)?.nickname ?? (member as any)?.name ?? uid;
+          }
+        } catch { /* 忽略 */ }
+        nicknameMap.set(uid, nickname);
+      }
+
+      // ── 2. 预加载用户数据（单次 DB 读取，供排行榜头衔展示 + prevConsecutiveLastPlaces 复用）──
+      const preUpdateUsers = new Map<string, any>();
+      for (const [uid] of participants) {
+        preUpdateUsers.set(uid, await this.userService.getUser(uid));
+      }
+
+      // 计算MVP：多人局中得分最高且答对至少1题（单人局无MVP概念）
       let mvpUserId: string | null = null;
       if (participants.length > 1) {
         for (const [uid, data] of sorted) {
@@ -639,22 +717,16 @@ export class SudokuGame {
           data.correct + data.wrong === 0
             ? "0%"
             : ((data.correct / (data.correct + data.wrong)) * 100).toFixed(1) + "%";
-        let nickname = uid;
-        try {
-          if (session.guildId) {
-            const member = await session.bot.getGuildMember?.(session.guildId, uid);
-            nickname = (member as any)?.nickname ?? (member as any)?.name ?? uid;
-          }
-        } catch { /* 忽略 */ }
-        const u = await this.userService.getUser(uid);
-        const titlePrefix = this.userService.getDisplayTitle(u);
+        const nickname = nicknameMap.get(uid) ?? uid;
+        const preUser = preUpdateUsers.get(uid);
+        const titlePrefix = preUser ? this.userService.getDisplayTitle(preUser) : "";
         const nameDisplay = titlePrefix ? `${titlePrefix}${nickname}` : nickname;
         if (isMVP) mvpDisplayName = nameDisplay;
         message += `${prefix}${index + 1}. ${nameDisplay}：${data.score}分（✅${data.correct} ❌${data.wrong} 正确率${correctRate}）\n`;
       }
 
       if (participants.length === 1) {
-        // 单人局不评 MVP，无需播报
+        // 单人局不评 MVP
       } else if (mvpUserId) {
         message += `\n🎉 本局MVP：${mvpDisplayName}`;
       } else {
@@ -677,39 +749,34 @@ export class SudokuGame {
 
       // 以下仅完整完成时执行 ↓↓↓
 
-      // 垫底判定：
-      //   多人局且唯一最低分 → true（计入垫底）
-      //   多人局且并列最低分 → undefined（不计、不重置，避免并列误惩）
-      //   多人局且非最低分  → false（重置连续垫底）
-      //   单人局            → undefined（无对手语境，不影响垫底统计）
+      // 垫底判定
       const isMultiPlayer = participants.length > 1;
       const lowestScore = sorted[sorted.length - 1][1].score;
       const lowestCount = isMultiPlayer
         ? sorted.filter(([, d]) => d.score === lowestScore).length
         : 0;
 
-      // 提前记录各玩家的连续垫底数（用于 rise_from_ashes 成就检测）
+      // 从预加载数据取 prevConsecutiveLastPlaces（无额外 DB 查询）
       const prevConsecutiveLastPlaces = new Map<string, number>();
       for (const [uid] of participants) {
-        const u = await this.userService.getUser(uid);
-        prevConsecutiveLastPlaces.set(uid, u.consecutiveLastPlace);
+        prevConsecutiveLastPlaces.set(uid, preUpdateUsers.get(uid)?.consecutiveLastPlace ?? 0);
       }
 
+      // ── 3. updateUser 并收集更新后的用户对象（避免 checkAchievements 重复读 DB）──
+      const updatedUsers = new Map<string, any>();
       for (const [uid, data] of participants) {
-        // 完美局：无错答且答对至少一半题目（允许中途加入的玩家也有机会）
-        const isPerfect = data.wrong === 0 && data.correct >= Math.ceil(game.totalRounds / 2);
+        // 完美局：必须全程参与且所有题目全部答对（无任何答错）
+        const isPerfect = data.wrong === 0 && data.correct === game.totalRounds;
         const isMVP = uid === mvpUserId;
         let isLastPlace: boolean | undefined;
         if (isMultiPlayer) {
           if (data.score === lowestScore && lowestCount === 1) {
-            isLastPlace = true;          // 唯一垫底
+            isLastPlace = true;
           } else if (data.score > lowestScore) {
-            isLastPlace = false;         // 非垫底，重置连续计数
+            isLastPlace = false;
           }
-          // 并列最低：isLastPlace = undefined，不变
         }
-        // 单人局：isLastPlace = undefined，不变
-        await this.userService.updateUser(uid, {
+        const updated = await this.userService.updateUser(uid, {
           scoreDelta: data.score,
           correctDelta: data.correct,
           wrongDelta: data.wrong,
@@ -717,37 +784,29 @@ export class SudokuGame {
           perfectDelta: isPerfect ? 1 : 0,
           mvpDelta: isMVP ? 1 : 0,
           isLastPlace,
-          isMvp: isMultiPlayer ? isMVP : undefined, // 单人局不影响连续MVP统计
-          finalStreak: data.streak,         // 本局结束时的当前连击
-          maxInGameStreak: data.maxStreak,  // 本局最高连击
-          guildId: game.guildId,            // 记录群成员关系
+          isMvp: isMultiPlayer ? isMVP : undefined,
+          finalStreak: data.streak,
+          maxInGameStreak: data.maxStreak,
+          guildId: game.guildId,
         });
+        updatedUsers.set(uid, updated);
       }
 
-      // 检查成就（包含隐藏成就）
+      // ── 4. 成就检测（昵称缓存 + 已更新用户对象，减少重复 DB 查询）──
       for (const [uid, data] of participants) {
-        let username = uid;
-        try {
-          if (session.guildId) {
-            const member = await session.bot.getGuildMember?.(session.guildId, uid);
-            username = (member as any)?.nickname ?? (member as any)?.name ?? uid;
-          }
-        } catch { /* 忽略 */ }
-
+        const username = nicknameMap.get(uid) ?? uid;
         const isMVP = uid === mvpUserId;
         const isAlone = participants.length === 1;
         const leadMargin = sorted.length > 1 && isMVP
           ? sorted[0][1].score - sorted[1][1].score
           : 0;
 
-        const answerPattern = data.answerPattern; // 直接传数组，user.ts 侧消除 split/join 往返
-        // 使用仅答对的用时，排除答错时间对 speed_demon / zen_master 的干扰
+        const answerPattern = data.answerPattern;
         const fastestAnswer = data.correctAnswerTimes.length > 0 ? Math.min(...data.correctAnswerTimes) : undefined;
         const averageTime = data.correctAnswerTimes.length > 0
           ? data.correctAnswerTimes.reduce((a, b) => a + b, 0) / data.correctAnswerTimes.length
           : undefined;
 
-        // 加 length >= N 防护，避免 JS 空数组 .every() 返回 true 的 vacuous truth 问题
         const firstThreeCorrect = data.answerPattern.length >= 3 &&
           data.answerPattern.slice(0, 3).every(p => p === "对");
         const first5Wrong = data.answerPattern.slice(0, 5).filter(p => p === "错").length;
@@ -755,7 +814,6 @@ export class SudokuGame {
           data.answerPattern.slice(-3).every(p => p === "对");
         const comebackPattern = { first5Wrong, last3Correct: last3Correct ? 3 : 0 };
         const wrongButMvp = isMVP && data.wrong >= 3;
-        // zen_master：仅在有时间限制时生效；每次答对时剩余时间在 15-20 秒内
         const zenPattern = game.currentTimeout > 0 &&
           data.correctAnswerTimes.length > 0 &&
           data.correctAnswerTimes.every(t => {
@@ -766,7 +824,7 @@ export class SudokuGame {
         const tempSession = {
           ...session,
           userId: uid,
-          username: username,
+          username,
           send: (msg: string) => session.bot.sendMessage(game.channelId, msg),
         } as any;
 
@@ -774,7 +832,7 @@ export class SudokuGame {
           correct: data.correct,
           wrong: data.wrong,
           score: data.score,
-          streak: data.maxStreak,  // 传本局最高连击，用于成就条件检测
+          streak: data.maxStreak,
           answerPattern,
           fastestAnswer,
           averageTime,
@@ -787,34 +845,75 @@ export class SudokuGame {
           zenPattern,
           prevConsecutiveLastPlace: prevConsecutiveLastPlaces.get(uid) ?? 0,
           isCurrentMvp: uid === mvpUserId,
-        }, tempSession);
+        }, tempSession, updatedUsers.get(uid));
       }
 
       await this.userService.updateHonorTitles(game.guildId || "", session);
-
-      // 发送最后一题的完整答案图片（game.currentSolution 为最后一轮的盘面答案）
-      if (game.currentSolution.length > 0) {
-        const difficultyLabel = `level ${game.difficulty}`;
-        try {
-          await session.send("📋 最后一题答案：");
-          const solutionImage = await this.renderer.render(game.currentSolution, difficultyLabel);
-          if (solutionImage && solutionImage.length > 0) {
-            const base64Solution = `data:image/png;base64,${solutionImage.toString("base64")}`;
-            await session.send(h.image(base64Solution));
-          } else {
-            await session.send("⚠️ 答案图片生成失败");
-          }
-        } catch (error: any) {
-          this.ctx.logger("sudoku").error("答案图片渲染失败：", error);
-          await session.send("⚠️ 答案图片生成失败");
-        }
-      }
     } else {
       await session.send("本轮游戏无人参与，结束。");
     }
   }
 
+  async setInactivityTimeout(session: Session, minutes: number) {
+    if (!Number.isInteger(minutes) || minutes < 0) {
+      await session.send("超时时长必须为非负整数（分钟），0 表示禁用。");
+      return;
+    }
+    if (session.channelId && this.games.has(session.channelId)) {
+      await session.send("游戏进行中无法更改超时设置，请先结束当前游戏。");
+      return;
+    }
+    this.channelInactivityTimeout.set(this.getChannelKey(session), minutes);
+    if (minutes === 0) {
+      await session.send("已关闭无人参与自动结束功能。");
+    } else {
+      await session.send(`已设置本群无人参与自动结束时长为 ${minutes} 分钟。`);
+    }
+  }
+
   // ==================== 辅助方法 ====================
+
+  // 林黛玉风格的无人参与超时播报语句
+  private readonly LDY_TIMEOUT_MESSAGES = [
+    "出了题目，等了许久，却无人应声……小仙这厢伤心，你们可知？（游戏已结束，呜呜）",
+    "花谢花飞花满天，无人答题泪涟涟……既然没有人陪小仙玩，那便散了吧。（游戏已结束）",
+    "良辰美景奈何天，题已出来无人怜……等了半天无人理，小仙只好独自散场。（游戏已结束）",
+    "小仙精心出了一道题，竟等来满室寂寥，心里苦哟……（超时无人参与，游戏已结束）",
+    "呜……侬今葬题知是谁？等了这许久无人应，小仙含泪收场。（游戏已结束）",
+    "一灯如豆，孤题悬挂，却连一个来答的人都没有……小仙心如刀绞，就此别过。（游戏已结束）",
+    "问君能有几多愁？出了题竟无人搭理，泪眼问花花不语，小仙伤心离去。（游戏已结束）",
+  ];
+
+  /**
+   * 重置"无人参与"超时计时器。
+   * 在每次出题和每次有玩家应答时调用，保证只要有人在线就不会触发超时结束。
+   */
+  private resetInactivityTimer(session: Session, game: GameState) {
+    if (game.inactivityTimer) clearTimeout(game.inactivityTimer);
+    game.inactivityTimer = null;
+    if (game.currentInactivityTimeout <= 0) return;
+
+    game.inactivityTimer = setTimeout(async () => {
+      const currentGame = this.games.get(game.channelId);
+      if (!currentGame || currentGame !== game) return;
+
+      // ── 先删除游戏记录（与 stop() 的防并发写法一致），防止 stop() 在 await 期间
+      //    仍能取到这局游戏，导致 endGame 被并发调用两次造成双重结算 ──
+      this.games.delete(game.channelId);
+      if (game.timer) { clearTimeout(game.timer); game.timer = null; }
+      game.inactivityTimer = null;
+
+      const msg = this.LDY_TIMEOUT_MESSAGES[
+        Math.floor(Math.random() * this.LDY_TIMEOUT_MESSAGES.length)
+      ];
+      await session.send(msg);
+
+      // 有参与者时才调 endGame 结算；无人参与时 LDY 播报即已完整说明，无需额外消息
+      if (game.participants.size > 0) {
+        await this.endGame(session, game, false);
+      }
+    }, game.currentInactivityTimeout * 60 * 1000);
+  }
 
   private getRandomMock(type: "groupMock" | "singleMock", params: Record<string, any>): string {
     const messages = this.mockMessages[type];

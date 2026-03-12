@@ -290,7 +290,7 @@ export class UserService {
       maxInGameStreak?: number;
       guildId?: string; // 本局所在群（用于群成员记录）
     },
-  ) {
+  ): Promise<UserData> {
     const user = await this.getUser(userId);
     if (delta.scoreDelta) user.score += delta.scoreDelta;
     // 积分下限为 0，不允许负分
@@ -328,6 +328,7 @@ export class UserService {
     }
 
     await this.ctx.database.set("sudoku_user", { userId }, this.toUpdateData(user));
+    return user;
   }
 
   async checkAchievements(
@@ -352,8 +353,9 @@ export class UserService {
       isCurrentMvp?: boolean;
     },
     session: Session,
+    preloadedUser?: UserData,
   ) {
-    const user = await this.getUser(userId);
+    const user = preloadedUser ?? await this.getUser(userId);
     const unlocked: Array<{ name: string; reward: number; isHidden: boolean }> = [];
     const totalAnswered = user.totalCorrect + user.totalWrong;
     const accuracy = totalAnswered === 0 ? 0 : user.totalCorrect / totalAnswered;
@@ -615,6 +617,91 @@ export class UserService {
 
     await this.ctx.database.set("sudoku_user", { userId }, this.toUpdateData(user));
     return true;
+  }
+
+  /**
+   * 返回用户成就列表的格式化文本（供 game.ts 发送）。
+   * 普通成就全部展示 ✅/❌，隐藏成就只展示已解锁的。
+   */
+  async getAchievementListText(userId: string, username: string, detailCommand: string): Promise<string> {
+    const user = await this.getUser(userId);
+    const unlocked = new Set(user.achievements);
+
+    // 按分类组织普通成就
+    const categories: Array<{ label: string; keys: string[] }> = [
+      { label: "基础",   keys: ["first_win", "first_wrong"] },
+      { label: "连击",   keys: ["streak_5", "streak_10", "streak_20"] },
+      { label: "参与",   keys: ["rounds_10", "rounds_50", "rounds_100"] },
+      { label: "积分",   keys: ["score_100", "score_500", "score_1000", "score_5000"] },
+      { label: "正确率", keys: ["accuracy_80", "accuracy_90", "accuracy_95"] },
+      { label: "完美局", keys: ["perfect_1", "perfect_10"] },
+      { label: "MVP",   keys: ["mvp_1", "mvp_10", "mvp_50"] },
+      { label: "答题量", keys: ["correct_100", "correct_500", "correct_1000"] },
+    ];
+
+    const regularKeys = new Set(categories.flatMap(c => c.keys));
+    const regularTotal = regularKeys.size;
+    const regularUnlocked = [...regularKeys].filter(k => unlocked.has(k)).length;
+
+    const hiddenEntries = Object.entries(ACHIEVEMENTS).filter(([, a]) => a.hidden);
+    const unlockedHidden = hiddenEntries.filter(([key]) => unlocked.has(key));
+
+    const lines: string[] = [
+      `【${username} 的成就档案】`,
+      `普通 ${regularUnlocked}/${regularTotal}  ✨隐藏已解锁 ${unlockedHidden.length} 个`,
+      "",
+      "📋 普通成就",
+    ];
+
+    for (const cat of categories) {
+      const parts = cat.keys.map(key => {
+        const ach = ACHIEVEMENTS[key];
+        return `${unlocked.has(key) ? "✅" : "❌"}${ach?.name ?? key}`;
+      });
+      lines.push(`${cat.label}:  ${parts.join("  ")}`);
+    }
+
+    if (unlockedHidden.length > 0) {
+      lines.push("", "✨ 已解锁隐藏成就");
+      for (const [, ach] of unlockedHidden) {
+        const titlePart = ach.title ? `  头衔：${ach.title}` : "";
+        lines.push(`  【${ach.name}】${titlePart}`);
+      }
+    }
+
+    lines.push("", `💡 输入「${detailCommand} <成就名>」查看成就详情`);
+    return lines.join("\n");
+  }
+
+  /**
+   * 返回指定成就的详情文本。
+   * 隐藏成就未解锁时只返回神秘提示，已解锁或普通成就则展示全部信息。
+   */
+  async getAchievementDetailText(userId: string, achievementName: string): Promise<string> {
+    const user = await this.getUser(userId);
+
+    const entry = Object.entries(ACHIEVEMENTS).find(([, a]) => a.name === achievementName);
+    if (!entry) {
+      return `未找到名为「${achievementName}」的成就，请检查名称是否正确。`;
+    }
+
+    const [key, ach] = entry;
+    const isUnlocked = user.achievements.includes(key);
+
+    if (ach.hidden && !isUnlocked) {
+      return `【成就：${achievementName}】\n该成就尚未解锁，继续探索吧～ 🔒`;
+    }
+
+    const lines: string[] = [
+      `【成就：${ach.name}】${ach.hidden ? "（隐藏成就）" : ""}`,
+      `条件：${ach.desc}`,
+      `奖励：+${ach.reward} 积分`,
+    ];
+    if (ach.title) {
+      lines.push(`专属头衔：${ach.title}`);
+    }
+    lines.push(`状态：${isUnlocked ? "✅ 已解锁" : "❌ 未解锁"}`);
+    return lines.join("\n");
   }
 
   /**

@@ -18,7 +18,10 @@ export interface Config {
   commandDifficulty: string;
   commandTimeout: string;
   commandHelp: string;
+  commandAchievement: string;
+  commandInactivity: string;
   timeout: number;
+  inactivityTimeout: number;
   rounds: number;
   baseScore: number;
   penalty: number;
@@ -49,10 +52,17 @@ export const Config: Schema<Config> = Schema.intersect([
     commandHelp: Schema.string()
       .default("游戏帮助")
       .description("查看帮助命令"),
+    commandAchievement: Schema.string()
+      .default("个人成就")
+      .description("查看成就命令"),
+    commandInactivity: Schema.string()
+      .default("无人超时")
+      .description("设置无人参与自动结束时长命令（单位：分钟，0=禁用）"),
   }).description("命令配置"),
   
   Schema.object({
     timeout: Schema.number().default(0).min(0).max(120).description("每题超时时间（秒），0 = 无时间限制"),
+    inactivityTimeout: Schema.number().default(20).min(0).max(60).description("无人参与自动结束时长（分钟），0 = 禁用，默认 20 分钟"),
     rounds: Schema.number().default(8).min(1).max(20).description("每轮题目数量"),
     difficulty: Schema.union([
       Schema.union([1, 2, 3, 4, 5, 6, 7] as const),
@@ -177,6 +187,21 @@ export function apply(ctx: Context, config: Config) {
     if (!session) return "无法获取会话信息";
     return game.showHelp(session);
   });
+
+  ctx
+    .command(`${config.commandAchievement} [name:string]`)
+    .action(({ session }, name) => {
+      if (!session) return "无法获取会话信息";
+      return game.showAchievements(session, name);
+    });
+
+  ctx
+    .command(`${config.commandInactivity} <minutes:number>`)
+    .action(({ session }, minutes) => {
+      if (!session) return "无法获取会话信息";
+      if (minutes === undefined) return "请指定分钟数，0 表示禁用。例如：无人超时 20";
+      return game.setInactivityTimeout(session, minutes);
+    });
 
   // 监听消息（抢答）—— 先快速检查当前频道是否有游戏，避免处理无关消息
   ctx.middleware(async (session, next) => {
