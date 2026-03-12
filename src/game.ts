@@ -185,9 +185,9 @@ export class SudokuGame {
       return;
     }
 
-    if (game.timer) {
-      clearTimeout(game.timer);
-    }
+    // 立即从 Map 中移除，防止并发 stop 请求在 await 间隙重复找到同一局游戏，导致双重结算
+    this.games.delete(session.channelId);
+    if (game.timer) clearTimeout(game.timer);
 
     const completedQuestions = game.currentIndex;
 
@@ -196,7 +196,6 @@ export class SudokuGame {
       await this.endGame(session, game);
     } else {
       await session.send("游戏已结束。");
-      this.games.delete(session.channelId);
     }
   }
 
@@ -260,7 +259,10 @@ export class SudokuGame {
     const scopeLabel = !isGlobal && session.guildId ? "本群" : "全服";
     let users = allUsers;
     if (!isGlobal && session.guildId) {
-      users = allUsers.filter(u => ((u as any).guilds as string[] ?? []).includes(session.guildId!));
+      users = allUsers.filter(u => {
+        const g = (u as any).guilds;
+        return Array.isArray(g) && g.includes(session.guildId!);
+      });
       if (users.length === 0) {
         await session.send(`本群暂无玩家数据。\n使用「${this.config.commandRank} 全服」可查看全服排行榜。`);
         return;
@@ -475,7 +477,7 @@ export class SudokuGame {
         });
         await session.send(mockMsg);
       } else {
-        await session.send(`@${session.username || session.userId} 答错了，扣 ${this.config.penalty} 分。`);
+        await session.send(`${h.at(session.userId)} 答错了，扣 ${this.config.penalty} 分。`);
       }
       return;
     }
@@ -491,7 +493,8 @@ export class SudokuGame {
       titlePrefix = this.userService.getDisplayTitle(answerUser);
       game.userTitleCache.set(session.userId, titlePrefix);
     }
-    const displayName = titlePrefix ? `${titlePrefix}@${session.username || session.userId}` : `@${session.username || session.userId}`;
+    const atMention = h.at(session.userId);
+    const displayName = titlePrefix ? `${titlePrefix}${atMention}` : `${atMention}`;
     await session.send(`恭喜 ${displayName} 答对！+${earned} 分（连续${participant.streak}次）。`);
 
     game.currentIndex++;
@@ -619,7 +622,8 @@ export class SudokuGame {
       }
 
       for (const [uid, data] of participants) {
-        const isPerfect = data.wrong === 0 && data.correct === game.questions.length;
+        // 完美局：无错答且答对至少一半题目（允许中途加入的玩家也有机会）
+        const isPerfect = data.wrong === 0 && data.correct >= Math.ceil(game.questions.length / 2);
         const isMVP = uid === mvpUserId;
         let isLastPlace: boolean | undefined;
         if (isMultiPlayer) {
@@ -669,9 +673,12 @@ export class SudokuGame {
           ? data.correctAnswerTimes.reduce((a, b) => a + b, 0) / data.correctAnswerTimes.length
           : undefined;
 
-        const firstThreeCorrect = data.answerPattern.slice(0, 3).every(p => p === "对");
+        // 加 length >= N 防护，避免 JS 空数组 .every() 返回 true 的 vacuous truth 问题
+        const firstThreeCorrect = data.answerPattern.length >= 3 &&
+          data.answerPattern.slice(0, 3).every(p => p === "对");
         const first5Wrong = data.answerPattern.slice(0, 5).filter(p => p === "错").length;
-        const last3Correct = data.answerPattern.slice(-3).every(p => p === "对");
+        const last3Correct = data.answerPattern.length >= 3 &&
+          data.answerPattern.slice(-3).every(p => p === "对");
         const comebackPattern = { first5Wrong, last3Correct: last3Correct ? 3 : 0 };
         const wrongButMvp = isMVP && data.wrong >= 3;
         // zen_master：每次答对时剩余时间在 15-20 秒（即用时在 timeout-20 ~ timeout-15 秒内）

@@ -33,10 +33,15 @@ export class SudokuGenerator {
     const level = difficultyMap[this.difficulty] ?? "medium";
 
     try {
-      const { generateSudoku } = require("sudoku-gen") as {
-        generateSudoku: (d: SudokuGenDifficulty) => { puzzle: string; solution: string };
-      };
-      const result = generateSudoku(level);
+      // sudoku-gen 实际导出名为 getSudoku（非 generateSudoku）
+      const mod = require("sudoku-gen") as any;
+      const getSudoku = (mod.getSudoku ?? mod.default?.getSudoku) as
+        | ((d: SudokuGenDifficulty) => { puzzle: string; solution: string })
+        | undefined;
+      if (typeof getSudoku !== "function") {
+        throw new TypeError(`getSudoku is not a function (got ${typeof getSudoku})`);
+      }
+      const result = getSudoku(level);
       // sudoku-gen 返回 81 字符字符串，'-' 表示空格
       return {
         puzzle: this.stringTo2D(result.puzzle),
@@ -54,9 +59,14 @@ export class SudokuGenerator {
     const level = levelMap[this.difficulty] ?? 1;
 
     try {
-      const { generator } = require("@forfuns/sudoku") as {
-        generator: (level: number) => number[];
-      };
+      // @forfuns/sudoku 同样可能包含 ESM 默认导出
+      const mod = require("@forfuns/sudoku") as any;
+      const generator = (mod.generator ?? mod.default?.generator ?? mod.default) as
+        | ((level: number) => number[])
+        | undefined;
+      if (typeof generator !== "function") {
+        throw new TypeError(`generator is not a function (got ${typeof generator})`);
+      }
       const puzzleArray = generator(level);
       // @forfuns/sudoku 用 -1 表示空格，转换为 0
       const normalized = puzzleArray.map((v) => (v === -1 ? 0 : v));

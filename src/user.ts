@@ -1,4 +1,4 @@
-import { Context, Session } from "koishi";
+import { Context, Session, h } from "koishi";
 
 // 头衔条目：type 用于显示优先级和包裹符号，guildId 用于荣誉头衔的群隔离
 interface TitleEntry {
@@ -245,7 +245,9 @@ export class UserService {
         lastPlaceCount: u.lastPlaceCount ?? 0,
         consecutiveLastPlace: u.consecutiveLastPlace ?? 0,
         consecutiveMvp: u.consecutiveMvp ?? 0,
-        guilds: (u.guilds as string[]) ?? [],
+        titles: Array.isArray(u.titles) ? (u.titles as TitleEntry[]) : [],
+        achievements: Array.isArray(u.achievements) ? (u.achievements as string[]) : [],
+        guilds: Array.isArray(u.guilds) ? (u.guilds as string[]) : [],
       } as UserData;
     }
     const newUser: UserData = {
@@ -463,16 +465,16 @@ export class UserService {
           const prefix = "✨✨✨ 隐藏成就解锁 ✨✨✨";
           if (achievement?.title) {
             await session.send(
-              `${prefix}\n恭喜 @${session.username} 解锁成就【${ach.name}】！\n🎁 获得 ${ach.reward} 积分奖励！\n🎖️ 同时获得专属头衔【${achievement.title}】！（有效期1年）`,
+              `${prefix}\n恭喜 ${h.at(session.userId)} 解锁成就【${ach.name}】！\n🎁 获得 ${ach.reward} 积分奖励！\n🎖️ 同时获得专属头衔【${achievement.title}】！（有效期1年）`,
             );
           } else {
             await session.send(
-              `${prefix}\n恭喜 @${session.username} 解锁成就【${ach.name}】！\n🎁 获得 ${ach.reward} 积分奖励！`,
+              `${prefix}\n恭喜 ${h.at(session.userId)} 解锁成就【${ach.name}】！\n🎁 获得 ${ach.reward} 积分奖励！`,
             );
           }
         } else {
           await session.send(
-            `🎊\n恭喜 @${session.username} 解锁成就[${ach.name}]！\n🎁 获得 ${ach.reward} 积分奖励！`,
+            `🎊\n恭喜 ${h.at(session.userId)} 解锁成就[${ach.name}]！\n🎁 获得 ${ach.reward} 积分奖励！`,
           );
         }
       }
@@ -491,34 +493,35 @@ export class UserService {
     const allUsers = await this.ctx.database.get("sudoku_user", {});
     if (allUsers.length === 0) return;
 
-    // 筛选本群成员
-    const users = allUsers.filter(
-      u => ((u as any).guilds as string[] ?? []).includes(guildId)
-    );
+    // 筛选本群成员（用 Array.isArray 防旧数据非数组崩溃）
+    const users = allUsers.filter(u => {
+      const g = (u as any).guilds;
+      return Array.isArray(g) && g.includes(guildId);
+    });
 
     if (users.length === 0) return;
 
-    // 计算各维度榜首（积分榜首须 score > 0 才有意义）
-    const topScore = [...users].filter(u => u.score > 0).sort((a, b) => b.score - a.score)[0];
-    const topCorrect = [...users].sort((a, b) => b.totalCorrect - a.totalCorrect)[0];
-    const topRounds = [...users].sort((a, b) => b.totalRounds - a.totalRounds)[0];
-    const topStarted = [...users].sort((a, b) => b.gamesStarted - a.gamesStarted)[0];
+    // 资格过滤：参与场次 >= 10 且积分 >= 100，才有资格竞争荣誉头衔
+    const eligible = users.filter(u => u.totalRounds >= 10 && u.score >= 100);
+    if (eligible.length === 0) return; // 无人达到门槛，本轮跳过
 
-    const qualified = users.filter(u => u.totalRounds >= 10);
-    const topAccuracy = qualified.length
-      ? [...qualified].sort((a, b) => {
-          const rA = a.totalCorrect / (a.totalCorrect + a.totalWrong) || 0;
-          const rB = b.totalCorrect / (b.totalCorrect + b.totalWrong) || 0;
-          return rB - rA;
-        })[0]
-      : null;
+    // 计算各维度榜首（均在有资格玩家中产生）
+    const topScore   = [...eligible].sort((a, b) => b.score - a.score)[0];
+    const topCorrect = [...eligible].sort((a, b) => b.totalCorrect - a.totalCorrect)[0];
+    const topRounds  = [...eligible].sort((a, b) => b.totalRounds - a.totalRounds)[0];
+    const topStarted = [...eligible].sort((a, b) => b.gamesStarted - a.gamesStarted)[0];
+    const topAccuracy = [...eligible].sort((a, b) => {
+      const rA = a.totalCorrect / (a.totalCorrect + a.totalWrong) || 0;
+      const rB = b.totalCorrect / (b.totalCorrect + b.totalWrong) || 0;
+      return rB - rA;
+    })[0];
 
     const titleConfig = [
-      { userId: topScore?.userId,   name: "积分之王",   rankType: "积分" },
-      { userId: topCorrect?.userId, name: "答题之王",   rankType: "答对数" },
-      { userId: topRounds?.userId,  name: "参与之王",   rankType: "参与局数" },
-      { userId: topStarted?.userId, name: "开局之王",   rankType: "开局数" },
-      { userId: topAccuracy?.userId,name: "正确率之王", rankType: "正确率" },
+      { userId: topScore?.userId,    name: "积分之王",   rankType: "积分" },
+      { userId: topCorrect?.userId,  name: "答题之王",   rankType: "答对数" },
+      { userId: topRounds?.userId,   name: "参与之王",   rankType: "参与局数" },
+      { userId: topStarted?.userId,  name: "开局之王",   rankType: "开局数" },
+      { userId: topAccuracy?.userId, name: "正确率之王", rankType: "正确率" },
     ];
 
     for (const cfg of titleConfig) {
