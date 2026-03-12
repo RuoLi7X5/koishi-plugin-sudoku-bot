@@ -20,6 +20,7 @@ declare module "koishi" {
       lastPlaceCount: number;
       consecutiveLastPlace: number;
       consecutiveMvp: number;
+      guilds: any;
     };
   }
 }

@@ -5,6 +5,34 @@ import { ImageRenderer } from "./renderer";
 import { UserService } from "./user";
 import { MOCK_MESSAGES } from "./mockMessages";
 
+// 每个频道独立的游戏状态
+type GameState = {
+  channelId: string;
+  guildId?: string;
+  puzzle: number[][];
+  solution: number[][];
+  questions: { row: number; col: number }[];
+  currentIndex: number;
+  difficulty: number;
+  participants: Map<
+    string,
+    {
+      score: number;
+      correct: number;
+      wrong: number;
+      streak: number;       // 当前连击数（答错重置）
+      maxStreak: number;    // 本局最高连击数
+      answerTimes: number[];
+      correctAnswerTimes: number[]; // 仅答对时的用时（用于 speed_demon / zen_master）
+      answerPattern: string[];
+      lastSecondCount: number;
+    }
+  >;
+  timer: any;
+  answered: boolean;
+  questionStartTime: number;
+};
+
 export class SudokuGame {
   private ctx: Context;
   private config: Config;
@@ -13,35 +41,13 @@ export class SudokuGame {
   private userService: UserService;
   private currentDifficulty: number;
 
+  // 多频道游戏状态表（key = channelId）
+  private games: Map<string, GameState> = new Map();
+
   // 难度名称映射
   private static readonly DIFFICULTY_NAMES = [
     "", "简单", "较易", "中等", "中等+", "困难", "困难+", "极难"
   ];
-
-  private currentGame: {
-    channelId: string;
-    guildId?: string;
-    puzzle: number[][];
-    solution: number[][];
-    questions: { row: number; col: number }[];
-    currentIndex: number;
-    difficulty: number;
-    participants: Map<
-      string,
-      {
-        score: number;
-        correct: number;
-        wrong: number;
-        streak: number;
-        answerTimes: number[];
-        answerPattern: string[];
-        lastSecondCount: number;
-      }
-    >;
-    timer: any;
-    answered: boolean;
-    questionStartTime: number;
-  } | null = null;
 
   private mockMessages = MOCK_MESSAGES;
 
@@ -94,7 +100,7 @@ export class SudokuGame {
 
   hasGameInChannel(channelId?: string): boolean {
     if (!channelId) return false;
-    return this.currentGame?.channelId === channelId;
+    return this.games.has(channelId);
   }
 
   async start(session: Session, difficulty?: number) {
@@ -104,7 +110,7 @@ export class SudokuGame {
       return;
     }
 
-    if (this.currentGame) {
+    if (this.games.has(session.channelId)) {
       await session.send("当前已有游戏在进行中，请稍后。");
       return;
     }
@@ -124,7 +130,7 @@ export class SudokuGame {
     const { puzzle, solution } = this.generator.generate();
     const questions = this.selectQuestions(puzzle, this.config.rounds);
 
-    const difficultyLabel = `难度 ${useDifficulty} ${SudokuGame.DIFFICULTY_NAMES[useDifficulty]}`;
+    const difficultyLabel = `level ${useDifficulty}`;
     const logger = this.ctx.logger("sudoku");
 
     try {
@@ -142,7 +148,7 @@ export class SudokuGame {
       await session.send(`⚠️ 图片渲染失败：${error.message}\n游戏继续，请根据坐标答题。`);
     }
 
-    this.currentGame = {
+    const newGame: GameState = {
       channelId: session.channelId,
       guildId: session.guildId,
       puzzle,
@@ -156,37 +162,36 @@ export class SudokuGame {
       questionStartTime: Date.now(),
     };
 
+    this.games.set(session.channelId, newGame);
+
     // 记录发起游戏次数（用于"开局之魂"成就）
     if (session.userId) {
       await this.userService.updateUser(session.userId, { gamesStartedDelta: 1 });
     }
 
-    await this.askNextQuestion(session);
+    await this.askNextQuestion(session, newGame);
   }
 
   async stop(session: Session) {
-    if (!this.currentGame) {
+    if (!session.channelId) return;
+    const game = this.games.get(session.channelId);
+    if (!game) {
       await session.send("当前没有进行中的游戏。");
       return;
     }
-    if (session.channelId !== this.currentGame.channelId) {
-      await session.send("当前频道没有进行中的游戏。");
-      return;
+
+    if (game.timer) {
+      clearTimeout(game.timer);
     }
 
-    if (this.currentGame.timer) {
-      clearTimeout(this.currentGame.timer);
-    }
-
-    const game = this.currentGame;
     const completedQuestions = game.currentIndex;
 
     if (game.participants.size > 0) {
       await session.send(`游戏被提前结束！已完成 ${completedQuestions}/${game.questions.length} 题。\n正在结算...`);
-      await this.endGame(session);
+      await this.endGame(session, game);
     } else {
       await session.send("游戏已结束。");
-      this.currentGame = null;
+      this.games.delete(session.channelId);
     }
   }
 
@@ -195,7 +200,7 @@ export class SudokuGame {
       await session.send("难度级别必须在 1-7 之间。\n1-简单 2-较易 3-中等 4-中等+ 5-困难 6-困难+ 7-极难");
       return;
     }
-    if (this.currentGame) {
+    if (session.channelId && this.games.has(session.channelId)) {
       await session.send("游戏进行中无法更改难度，请先结束当前游戏。");
       return;
     }
@@ -225,17 +230,36 @@ export class SudokuGame {
       `完美局数：${user.perfectRounds} 💯`,
       `MVP次数：${user.mvpCount} 🏆`,
       `已解锁成就：${user.achievements.length} 个`,
-      `当前头衔：${user.titles.map((t) => t.name).join("、") || "无"}`,
+      `当前头衔：${user.titles.filter(t => t.expire > Date.now()).map(t => t.name).join("、") || "无"}`,
     ].join("\n");
 
     await session.send(message);
   }
 
   async showRank(session: Session, type: string = "积分") {
-    let users = await this.ctx.database.get("sudoku_user", {});
-    if (users.length === 0) {
+    // 解析 "全服" 前缀：全服模式不过滤群成员
+    let isGlobal = false;
+    let effectiveType = type;
+    if (type.startsWith("全服")) {
+      isGlobal = true;
+      effectiveType = type.slice(2).trim() || "积分";
+    }
+
+    const allUsers = await this.ctx.database.get("sudoku_user", {});
+    if (allUsers.length === 0) {
       await session.send("暂无数据。");
       return;
+    }
+
+    // 本群筛选（有 guildId 且非全服模式时，只显示本群成员）
+    const scopeLabel = !isGlobal && session.guildId ? "本群" : "全服";
+    let users = allUsers;
+    if (!isGlobal && session.guildId) {
+      users = allUsers.filter(u => ((u as any).guilds as string[] ?? []).includes(session.guildId!));
+      if (users.length === 0) {
+        await session.send(`本群暂无玩家数据。\n使用「${this.config.commandRank} 全服」可查看全服排行榜。`);
+        return;
+      }
     }
 
     const typeAlias: Record<string, string> = {
@@ -246,7 +270,7 @@ export class SudokuGame {
       rate: "rate", perfect: "perfect", achievement: "achievement",
     };
 
-    const normalizedType = typeAlias[type] || "score";
+    const normalizedType = typeAlias[effectiveType] || "score";
 
     let sorted: any[] = [];
     const typeMap: Record<string, { field: string; desc: boolean; name: string; unit?: string }> = {
@@ -287,7 +311,7 @@ export class SudokuGame {
         .slice(0, 10);
     }
 
-    const lines = [`【${title} TOP 10】`];
+    const lines = [`【${scopeLabel}${title} TOP 10】`];
     for (let i = 0; i < sorted.length; i++) {
       const u = sorted[i];
       let nickname = u.userId;
@@ -317,13 +341,13 @@ export class SudokuGame {
   }
 
   async showProgress(session: Session) {
-    if (!this.currentGame) {
+    if (!session.channelId) return;
+    const game = this.games.get(session.channelId);
+    if (!game) {
       await session.send("当前没有进行中的游戏。");
       return;
     }
-    if (session.channelId !== this.currentGame.channelId) return;
 
-    const game = this.currentGame;
     const currentQuestion = game.currentIndex + 1;
     const totalQuestions = game.questions.length;
     const elapsed = Math.floor((Date.now() - game.questionStartTime) / 1000);
@@ -381,20 +405,20 @@ export class SudokuGame {
     if (success) {
       await session.send(`兑换成功！你现在拥有头衔「${titleName}」。`);
     } else {
-      await session.send(`兑换失败，积分不足或头衔不存在。\n输入「${this.config.commandExchange}」可查看头衔列表。`);
+      await session.send(`兑换失败，积分不足、头衔不存在或已持有该头衔。\n输入「${this.config.commandExchange}」可查看头衔列表。`);
     }
   }
 
   // ==================== 内部游戏流程 ====================
 
-  private async askNextQuestion(session: Session) {
-    if (!this.currentGame) return;
-    const game = this.currentGame;
+  private async askNextQuestion(session: Session, game: GameState) {
+    // 确认游戏仍存在（可能被 stop 提前终止）
+    if (!this.games.has(game.channelId)) return;
 
     if (game.timer) clearTimeout(game.timer);
 
     if (game.currentIndex >= game.questions.length) {
-      await this.endGame(session);
+      await this.endGame(session, game);
       return;
     }
 
@@ -405,10 +429,12 @@ export class SudokuGame {
     game.answered = false;
     game.questionStartTime = Date.now();
     game.timer = setTimeout(async () => {
-      if (!this.currentGame || this.currentGame !== game) return;
+      // 校验游戏是否仍是同一局（防止已停止/重开后的定时器触发）
+      const currentGame = this.games.get(game.channelId);
+      if (!currentGame || currentGame !== game) return;
       if (!game.answered) {
         const answer = game.solution[q.row][q.col];
-        // 群嘲逻辑：参与人数>=2时触发
+        // 群嘲逻辑：参与人数 >=2 时触发
         if (game.participants.size >= 2) {
           const mockMsg = this.getRandomMock("groupMock", { answer });
           await session.send(mockMsg);
@@ -416,15 +442,15 @@ export class SudokuGame {
           await session.send(`时间到！答案是 ${answer}。`);
         }
         game.currentIndex++;
-        await this.askNextQuestion(session);
+        await this.askNextQuestion(session, game);
       }
     }, this.config.timeout * 1000);
   }
 
   async handleAnswer(session: Session, number: number) {
-    if (!this.currentGame) return;
-    const game = this.currentGame;
-    if (session.channelId !== game.channelId) return;
+    if (!session.channelId) return;
+    const game = this.games.get(session.channelId);
+    if (!game) return;
     if (game.answered) return;
     if (!session.userId) return;
 
@@ -435,7 +461,7 @@ export class SudokuGame {
     const correct = game.solution[q.row][q.col];
 
     if (number !== correct) {
-      await this.updateParticipant(session.userId, false, answerTime);
+      await this.updateParticipant(game, session.userId, false, answerTime);
       // 单人嘲讽：50%概率触发
       if (Math.random() < 0.5) {
         const mockMsg = this.getRandomMock("singleMock", {
@@ -451,8 +477,7 @@ export class SudokuGame {
 
     clearTimeout(game.timer);
     game.answered = true;
-    const participant = await this.updateParticipant(session.userId, true, answerTime);
-    if (!participant) return;
+    const participant = await this.updateParticipant(game, session.userId, true, answerTime);
     const earned = this.config.baseScore + (participant.streak - 1) * this.config.streakBonus;
 
     const answerUser = await this.userService.getUser(session.userId);
@@ -461,12 +486,15 @@ export class SudokuGame {
     await session.send(`恭喜 ${displayName} 答对！+${earned} 分（连续${participant.streak}次）。`);
 
     game.currentIndex++;
-    await this.askNextQuestion(session);
+    await this.askNextQuestion(session, game);
   }
 
-  private async updateParticipant(userId: string, isCorrect: boolean, answerTime?: number) {
-    if (!this.currentGame) return null;
-    const game = this.currentGame;
+  private async updateParticipant(
+    game: GameState,
+    userId: string,
+    isCorrect: boolean,
+    answerTime?: number,
+  ) {
     let p = game.participants.get(userId);
     if (!p) {
       p = {
@@ -474,7 +502,9 @@ export class SudokuGame {
         correct: 0,
         wrong: 0,
         streak: 0,
+        maxStreak: 0,
         answerTimes: [],
+        correctAnswerTimes: [],
         answerPattern: [],
         lastSecondCount: 0,
       };
@@ -486,15 +516,19 @@ export class SudokuGame {
     }
     p.answerPattern.push(isCorrect ? "对" : "错");
 
-    // 检测是否为最后5秒答对
-    if (isCorrect && answerTime !== undefined && answerTime >= this.config.timeout - 5) {
-      p.lastSecondCount++;
-    }
-
     if (isCorrect) {
       p.correct++;
       p.streak++;
+      if (p.streak > p.maxStreak) p.maxStreak = p.streak;
       p.score += this.config.baseScore + (p.streak - 1) * this.config.streakBonus;
+      // 仅记录答对的用时（用于 speed_demon / zen_master 成就判断）
+      if (answerTime !== undefined) {
+        p.correctAnswerTimes.push(answerTime);
+        // 检测是否为最后5秒答对
+        if (answerTime >= this.config.timeout - 5) {
+          p.lastSecondCount++;
+        }
+      }
     } else {
       p.wrong++;
       p.streak = 0;
@@ -503,10 +537,10 @@ export class SudokuGame {
     return p;
   }
 
-  private async endGame(session: Session) {
-    if (!this.currentGame) return;
-    const game = this.currentGame;
+  private async endGame(session: Session, game: GameState) {
     if (game.timer) clearTimeout(game.timer);
+    // 从游戏表中移除，防止后续定时器重复触发
+    this.games.delete(game.channelId);
 
     const participants = Array.from(game.participants.entries());
     if (participants.length > 0) {
@@ -577,6 +611,9 @@ export class SudokuGame {
           mvpDelta: isMVP ? 1 : 0,
           isLastPlace,
           isMvp: isMVP,
+          finalStreak: data.streak,         // 本局结束时的当前连击
+          maxInGameStreak: data.maxStreak,  // 本局最高连击
+          guildId: game.guildId,            // 记录群成员关系
         });
       }
 
@@ -597,9 +634,10 @@ export class SudokuGame {
           : 0;
 
         const answerPattern = data.answerPattern.join("");
-        const fastestAnswer = data.answerTimes.length > 0 ? Math.min(...data.answerTimes) : undefined;
-        const averageTime = data.answerTimes.length > 0
-          ? data.answerTimes.reduce((a, b) => a + b, 0) / data.answerTimes.length
+        // 使用仅答对的用时，排除答错时间对 speed_demon / zen_master 的干扰
+        const fastestAnswer = data.correctAnswerTimes.length > 0 ? Math.min(...data.correctAnswerTimes) : undefined;
+        const averageTime = data.correctAnswerTimes.length > 0
+          ? data.correctAnswerTimes.reduce((a, b) => a + b, 0) / data.correctAnswerTimes.length
           : undefined;
 
         const firstThreeCorrect = data.answerPattern.slice(0, 3).every(p => p === "对");
@@ -607,21 +645,22 @@ export class SudokuGame {
         const last3Correct = data.answerPattern.slice(-3).every(p => p === "对");
         const comebackPattern = { first5Wrong, last3Correct: last3Correct ? 3 : 0 };
         const wrongButMvp = isMVP && data.wrong >= 3;
-        const zenPattern = data.answerTimes.length > 0 &&
-          data.answerTimes.every(t => t >= 15 && t <= 20);
+        // zen_master：仅用答对时间判断
+        const zenPattern = data.correctAnswerTimes.length > 0 &&
+          data.correctAnswerTimes.every(t => t >= 15 && t <= 20);
 
         const tempSession = {
           ...session,
           userId: uid,
           username: username,
-          send: (msg: string) => session.bot.sendMessage(session.channelId!, msg),
+          send: (msg: string) => session.bot.sendMessage(game.channelId, msg),
         } as any;
 
         await this.userService.checkAchievements(uid, {
           correct: data.correct,
           wrong: data.wrong,
           score: data.score,
-          streak: data.streak,
+          streak: data.maxStreak,  // 传本局最高连击，用于成就条件检测
           answerPattern,
           fastestAnswer,
           averageTime,
@@ -637,10 +676,10 @@ export class SudokuGame {
         }, tempSession);
       }
 
-      await this.userService.updateHonorTitles(this.config.titleDuration, session);
+      await this.userService.updateHonorTitles(game.guildId || "", session);
 
       // 发送完整答案图片
-      const difficultyLabel = `难度 ${game.difficulty} ${SudokuGame.DIFFICULTY_NAMES[game.difficulty]}`;
+      const difficultyLabel = `level ${game.difficulty}`;
       try {
         await session.send("📋 完整答案：");
         const solutionImage = await this.renderer.render(game.solution, difficultyLabel);
@@ -657,8 +696,6 @@ export class SudokuGame {
     } else {
       await session.send("本轮游戏无人参与，结束。");
     }
-
-    this.currentGame = null;
   }
 
   // ==================== 辅助方法 ====================

@@ -1,5 +1,13 @@
 import { Context, Session } from "koishi";
 
+// 头衔条目：type 用于显示优先级和包裹符号，guildId 用于荣誉头衔的群隔离
+interface TitleEntry {
+  name: string;
+  expire: number;
+  type?: "honor" | "achievement" | "regular";
+  guildId?: string;
+}
+
 interface UserData {
   id: string;
   platform: string;
@@ -10,17 +18,17 @@ interface UserData {
   totalWrong: number;
   streak: number;
   maxStreak: number;
-  titles: { name: string; expire: number }[];
+  titles: TitleEntry[];
   achievements: string[];
   gamesStarted: number;
   perfectRounds: number;
   mvpCount: number;
-  lastPlaceCount: number; // 垫底次数
-  consecutiveLastPlace: number; // 连续垫底次数
-  consecutiveMvp: number; // 连续MVP次数
+  lastPlaceCount: number;
+  consecutiveLastPlace: number;
+  consecutiveMvp: number;
+  guilds: string[]; // 参与过的群 ID 列表
 }
 
-// 普通成就
 const ACHIEVEMENTS: Record<
   string,
   { name: string; desc: string; reward: number; hidden?: boolean; title?: string }
@@ -28,172 +36,187 @@ const ACHIEVEMENTS: Record<
   // 基础成就
   first_win: { name: "首战告捷", desc: "首次答对", reward: 20 },
   first_wrong: { name: "初尝败绩", desc: "首次答错", reward: 5 },
-  
+
   // 连胜成就
   streak_5: { name: "连击高手", desc: "连续答对5题", reward: 50 },
   streak_10: { name: "连击大师", desc: "连续答对10题", reward: 100 },
   streak_20: { name: "连击传说", desc: "连续答对20题", reward: 200 },
-  
+
   // 参与成就
   rounds_10: { name: "新手村毕业", desc: "参与10局游戏", reward: 30 },
   rounds_50: { name: "资深玩家", desc: "参与50局游戏", reward: 100 },
   rounds_100: { name: "数独狂热者", desc: "参与100局游戏", reward: 300 },
-  
+
   // 积分成就
   score_100: { name: "小有成就", desc: "累计积分达到100", reward: 10 },
   score_500: { name: "积分大户", desc: "累计积分达到500", reward: 50 },
   score_1000: { name: "积分富豪", desc: "累计积分达到1000", reward: 100 },
   score_5000: { name: "积分巨擘", desc: "累计积分达到5000", reward: 500 },
-  
+
   // 正确率成就
   accuracy_80: { name: "稳健发挥", desc: "正确率达到80%（至少答20题）", reward: 50 },
   accuracy_90: { name: "数独精英", desc: "正确率达到90%（至少答20题）", reward: 100 },
   accuracy_95: { name: "数独宗师", desc: "正确率达到95%（至少答20题）", reward: 200 },
-  
+
   // 完美局成就
   perfect_1: { name: "完美首秀", desc: "首次全对完成一局", reward: 100 },
   perfect_10: { name: "完美主义者", desc: "完成10局完美对局", reward: 300 },
-  
+
   // MVP成就
   mvp_1: { name: "初露锋芒", desc: "获得首次MVP", reward: 50 },
   mvp_10: { name: "常胜将军", desc: "获得10次MVP", reward: 200 },
   mvp_50: { name: "传奇MVP", desc: "获得50次MVP", reward: 1000 },
-  
+
   // 答题量成就
   correct_100: { name: "百题斩", desc: "累计答对100题", reward: 80 },
   correct_500: { name: "五百题斩", desc: "累计答对500题", reward: 300 },
   correct_1000: { name: "千题斩", desc: "累计答对1000题", reward: 800 },
-  
+
   // === 隐藏成就（每个都配有专属头衔）===
-  lightning_hand: { 
-    name: "闪电之手", 
-    desc: "在5秒内答对", 
-    reward: 150, 
+  lightning_hand: {
+    name: "闪电之手",
+    desc: "在5秒内答对",
+    reward: 150,
     hidden: true,
-    title: "⚡闪电侠"
+    title: "⚡闪电侠",
   },
-  last_second_hero: { 
-    name: "压哨绝杀", 
-    desc: "在最后5秒答对（该题无人答对过）", 
-    reward: 200, 
+  last_second_hero: {
+    name: "压哨绝杀",
+    desc: "在最后5秒答对",
+    reward: 200,
     hidden: true,
-    title: "🏀绝杀王"
+    title: "🏀绝杀王",
   },
-  own_rhythm: { 
-    name: "自有旋律", 
-    desc: "单局对错交替完成全部8题", 
-    reward: 300, 
+  own_rhythm: {
+    name: "自有旋律",
+    desc: "单局答题严格对错或错对交替（至少4题）",
+    reward: 300,
     hidden: true,
-    title: "🎵节奏大师"
+    title: "🎵节奏大师",
   },
-  perfect_start: { 
-    name: "完美开局", 
-    desc: "单局前3题全对", 
-    reward: 80, 
+  perfect_start: {
+    name: "完美开局",
+    desc: "单局前3题全对",
+    reward: 80,
     hidden: true,
-    title: "🚀开局王者"
+    title: "🚀开局王者",
   },
-  comeback_king: { 
-    name: "绝地反击", 
-    desc: "前5题至少错3题，但最后3题全对", 
-    reward: 250, 
+  comeback_king: {
+    name: "绝地反击",
+    desc: "前5题至少错3题，但最后3题全对",
+    reward: 250,
     hidden: true,
-    title: "💪逆转之王"
+    title: "💪逆转之王",
   },
-  lone_wolf: { 
-    name: "孤胆英雄", 
-    desc: "独自一人完成一局游戏", 
-    reward: 500, 
+  lone_wolf: {
+    name: "孤胆英雄",
+    desc: "独自一人完成一局游戏",
+    reward: 500,
     hidden: true,
-    title: "🦸独行侠"
+    title: "🦸独行侠",
   },
-  dominator: { 
-    name: "一骑绝尘", 
-    desc: "单局领先第二名30分以上", 
-    reward: 180, 
+  dominator: {
+    name: "一骑绝尘",
+    desc: "单局领先第二名30分以上",
+    reward: 180,
     hidden: true,
-    title: "🏇霸主"
+    title: "🏇霸主",
   },
-  never_defeated: { 
-    name: "不败传说", 
-    desc: "连续10局都获得MVP", 
-    reward: 1500, 
+  never_defeated: {
+    name: "不败传说",
+    desc: "连续10局都获得MVP",
+    reward: 1500,
     hidden: true,
-    title: "👑不败神话"
+    title: "👑不败神话",
   },
-  wrong_is_right: { 
-    name: "歪打正着", 
-    desc: "单局答错3题但仍然获得MVP", 
-    reward: 350, 
+  wrong_is_right: {
+    name: "歪打正着",
+    desc: "单局答错3题但仍然获得MVP",
+    reward: 350,
     hidden: true,
-    title: "🎲幸运之子"
+    title: "🎲幸运之子",
   },
-  speed_demon: { 
-    name: "速度恶魔", 
-    desc: "单局所有答对题目平均用时不超过10秒", 
-    reward: 400, 
+  speed_demon: {
+    name: "速度恶魔",
+    desc: "单局所有答对题目平均用时不超过10秒",
+    reward: 400,
     hidden: true,
-    title: "👹极速狂飙"
+    title: "👹极速狂飙",
   },
-  lucky_seven: { 
-    name: "幸运七", 
-    desc: "恰好答对7题答错1题", 
-    reward: 120, 
+  lucky_seven: {
+    name: "幸运七",
+    desc: "恰好答对7题答错1题",
+    reward: 120,
     hidden: true,
-    title: "🍀七星高照"
+    title: "🍀七星高照",
   },
-  zen_master: { 
-    name: "禅定大师", 
-    desc: "单局每题都在倒计时剩余15-20秒时答对", 
-    reward: 500, 
+  zen_master: {
+    name: "禅定大师",
+    desc: "单局每题都在倒计时剩余15-20秒时答对",
+    reward: 500,
     hidden: true,
-    title: "🧘禅心如一"
+    title: "🧘禅心如一",
   },
-  
+
   // === 不屈勇士系列隐藏成就 ===
   brave_heart: {
     name: "不屈之心",
     desc: "连续5局垫底仍继续参与",
     reward: 600,
     hidden: true,
-    title: "💖屡败屡战"
+    title: "💖屡败屡战",
   },
   iron_will: {
     name: "钢铁意志",
     desc: "连续10局垫底仍继续参与",
     reward: 1200,
     hidden: true,
-    title: "🛡️钢铁战士"
+    title: "🛡️钢铁战士",
   },
   eternal_warrior: {
     name: "永恒战士",
     desc: "虽然累计垫底20次，但从未放弃",
     reward: 2000,
     hidden: true,
-    title: "⚔️不灭斗魂"
+    title: "⚔️不灭斗魂",
   },
   rise_from_ashes: {
     name: "浴火重生",
     desc: "连续5局垫底后，终于获得MVP",
     reward: 1500,
     hidden: true,
-    title: "🔥凤凰涅槃"
+    title: "🔥凤凰涅槃",
   },
   starter_spirit: {
     name: "开局之魂",
     desc: "累计主动发起游戏50次（无论成绩）",
     reward: 800,
     hidden: true,
-    title: "🎮游戏先驱"
+    title: "🎮游戏先驱",
   },
   never_give_up: {
     name: "永不言弃",
     desc: "在正确率低于30%的情况下仍参与50局",
     reward: 1000,
     hidden: true,
-    title: "🌟不屈之魂"
+    title: "🌟不屈之魂",
   },
 };
+
+// 荣誉头衔名集合（用于兼容旧数据的类型推断）
+const HONOR_TITLE_NAMES = new Set([
+  "积分之王", "答题之王", "参与之王", "开局之王", "正确率之王",
+]);
+
+// 隐藏成就专属头衔名集合（用于兼容旧数据的类型推断）
+const ACHIEVEMENT_TITLE_NAMES = new Set(
+  Object.values(ACHIEVEMENTS)
+    .filter(a => a.hidden && a.title)
+    .map(a => a.title!)
+);
+
+// 荣誉头衔永久有效（不依赖时间过期，通过每局结算易主控制）
+const HONOR_EXPIRE = Number.MAX_SAFE_INTEGER;
 
 export class UserService {
   private ctx: Context;
@@ -202,18 +225,27 @@ export class UserService {
     this.ctx = ctx;
   }
 
+  // 剔除主键 id，并清理过期的非永久头衔，避免数组无限膨胀
+  private toUpdateData(user: UserData): Omit<UserData, "id"> {
+    const { id, ...data } = user;
+    const now = Date.now();
+    // 荣誉头衔 expire = HONOR_EXPIRE，永远不会被清理
+    data.titles = data.titles.filter(t => t.expire > now);
+    return data;
+  }
+
   async getUser(userId: string): Promise<UserData> {
     const [user] = await this.ctx.database.get("sudoku_user", { userId });
     if (user) {
-      // 确保旧数据兼容新字段
-      const userData = user as any;
+      const u = user as any;
       return {
         ...user,
-        perfectRounds: userData.perfectRounds ?? 0,
-        mvpCount: userData.mvpCount ?? 0,
-        lastPlaceCount: userData.lastPlaceCount ?? 0,
-        consecutiveLastPlace: userData.consecutiveLastPlace ?? 0,
-        consecutiveMvp: userData.consecutiveMvp ?? 0,
+        perfectRounds: u.perfectRounds ?? 0,
+        mvpCount: u.mvpCount ?? 0,
+        lastPlaceCount: u.lastPlaceCount ?? 0,
+        consecutiveLastPlace: u.consecutiveLastPlace ?? 0,
+        consecutiveMvp: u.consecutiveMvp ?? 0,
+        guilds: (u.guilds as string[]) ?? [],
       } as UserData;
     }
     const newUser: UserData = {
@@ -234,6 +266,7 @@ export class UserService {
       lastPlaceCount: 0,
       consecutiveLastPlace: 0,
       consecutiveMvp: 0,
+      guilds: [],
     };
     await this.ctx.database.create("sudoku_user", newUser);
     return newUser;
@@ -248,28 +281,36 @@ export class UserService {
       roundsDelta?: number;
       perfectDelta?: number;
       mvpDelta?: number;
-      isLastPlace?: boolean;       // 是否垫底（仅多人局有效）
-      isMvp?: boolean;             // 是否MVP（追踪连续MVP次数）
-      gamesStartedDelta?: number;  // 主动发起游戏次数
+      isLastPlace?: boolean;
+      isMvp?: boolean;
+      gamesStartedDelta?: number;
+      finalStreak?: number;
+      maxInGameStreak?: number;
+      guildId?: string; // 本局所在群（用于群成员记录）
     },
   ) {
     const user = await this.getUser(userId);
     if (delta.scoreDelta) user.score += delta.scoreDelta;
-    if (delta.correctDelta) {
-      user.totalCorrect += delta.correctDelta;
-      user.streak += delta.correctDelta;
-      if (user.streak > user.maxStreak) user.maxStreak = user.streak;
-    }
-    if (delta.wrongDelta) {
-      user.totalWrong += delta.wrongDelta;
-      user.streak = 0;
+    // 积分下限为 0，不允许负分
+    user.score = Math.max(0, user.score);
+
+    if (delta.correctDelta) user.totalCorrect += delta.correctDelta;
+    if (delta.wrongDelta) user.totalWrong += delta.wrongDelta;
+    if (delta.finalStreak !== undefined) user.streak = delta.finalStreak;
+    if (delta.maxInGameStreak !== undefined && delta.maxInGameStreak > user.maxStreak) {
+      user.maxStreak = delta.maxInGameStreak;
     }
     if (delta.roundsDelta) user.totalRounds += delta.roundsDelta;
     if (delta.perfectDelta) user.perfectRounds += delta.perfectDelta;
     if (delta.mvpDelta) user.mvpCount += delta.mvpDelta;
     if (delta.gamesStartedDelta) user.gamesStarted += delta.gamesStartedDelta;
 
-    // 垫底统计（多人局才计入）
+    // 记录群成员关系（用于群榜单隔离）
+    if (delta.guildId && !user.guilds.includes(delta.guildId)) {
+      user.guilds.push(delta.guildId);
+    }
+
+    // 垫底统计
     if (delta.isLastPlace === true) {
       user.lastPlaceCount++;
       user.consecutiveLastPlace++;
@@ -284,30 +325,29 @@ export class UserService {
       user.consecutiveMvp = 0;
     }
 
-    await this.ctx.database.set("sudoku_user", { userId }, user);
+    await this.ctx.database.set("sudoku_user", { userId }, this.toUpdateData(user));
   }
 
   async checkAchievements(
     userId: string,
-    roundData: { 
-      correct: number; 
-      wrong: number; 
-      score: number; 
+    roundData: {
+      correct: number;
+      wrong: number;
+      score: number;
       streak: number;
-      // 隐藏成就相关数据
-      answerPattern?: string; // 答题模式，如"对错对错对错对错"
-      fastestAnswer?: number; // 最快答题时间（秒）
-      slowestCorrect?: number; // 最慢的正确答案（秒）
-      averageTime?: number; // 平均答题时间
-      lastSecondAnswers?: number; // 最后5秒答对数
-      firstThreeCorrect?: boolean; // 前3题是否全对
-      comebackPattern?: { first5Wrong: number; last3Correct: number }; // 反击模式
-      isAlone?: boolean; // 是否独自完成
-      leadMargin?: number; // 领先第二名的分数
-      wrongButMvp?: boolean; // 答错3题但仍是MVP
-      zenPattern?: boolean; // 禅定模式（每题都在15-20秒）
-      prevConsecutiveLastPlace?: number; // 本局前的连续垫底次数
-      isCurrentMvp?: boolean; // 本局是否为MVP
+      answerPattern?: string;
+      fastestAnswer?: number;
+      slowestCorrect?: number;
+      averageTime?: number;
+      lastSecondAnswers?: number;
+      firstThreeCorrect?: boolean;
+      comebackPattern?: { first5Wrong: number; last3Correct: number };
+      isAlone?: boolean;
+      leadMargin?: number;
+      wrongButMvp?: boolean;
+      zenPattern?: boolean;
+      prevConsecutiveLastPlace?: number;
+      isCurrentMvp?: boolean;
     },
     session: Session,
   ) {
@@ -316,7 +356,6 @@ export class UserService {
     const totalAnswered = user.totalCorrect + user.totalWrong;
     const accuracy = totalAnswered === 0 ? 0 : user.totalCorrect / totalAnswered;
 
-    // 检查普通成就
     const checks: Array<{ key: string; condition: boolean }> = [
       { key: "first_win", condition: user.totalCorrect >= 1 },
       { key: "first_wrong", condition: user.totalWrong >= 1 },
@@ -343,15 +382,18 @@ export class UserService {
       { key: "correct_1000", condition: user.totalCorrect >= 1000 },
     ];
 
-    // 检查隐藏成就
+    // 隐藏成就检测
     if (roundData.fastestAnswer !== undefined && roundData.fastestAnswer <= 5) {
       checks.push({ key: "lightning_hand", condition: true });
     }
     if (roundData.lastSecondAnswers !== undefined && roundData.lastSecondAnswers > 0) {
       checks.push({ key: "last_second_hero", condition: true });
     }
-    if (roundData.answerPattern === "对错对错对错对错") {
-      checks.push({ key: "own_rhythm", condition: true });
+    // 对错或错对严格交替（至少4题）
+    if (roundData.answerPattern && roundData.answerPattern.length >= 4) {
+      const patternArr = roundData.answerPattern.split("");
+      const isAlternating = patternArr.every((p, i) => i === 0 || p !== patternArr[i - 1]);
+      checks.push({ key: "own_rhythm", condition: isAlternating });
     }
     if (roundData.firstThreeCorrect) {
       checks.push({ key: "perfect_start", condition: true });
@@ -378,8 +420,6 @@ export class UserService {
     if (roundData.zenPattern) {
       checks.push({ key: "zen_master", condition: true });
     }
-
-    // 浴火重生：连续5局垫底后终于获得MVP
     if (
       roundData.prevConsecutiveLastPlace !== undefined &&
       roundData.prevConsecutiveLastPlace >= 5 &&
@@ -388,13 +428,11 @@ export class UserService {
       checks.push({ key: "rise_from_ashes", condition: true });
     }
 
-    // 检查连续10局MVP
     const recentMvps = await this.getRecentMvpStreak(userId);
     if (recentMvps >= 10) {
       checks.push({ key: "never_defeated", condition: true });
     }
-    
-    // 检查不屈勇士系列成就
+
     checks.push({ key: "brave_heart", condition: user.consecutiveLastPlace >= 5 });
     checks.push({ key: "iron_will", condition: user.consecutiveLastPlace >= 10 });
     checks.push({ key: "eternal_warrior", condition: user.lastPlaceCount >= 20 });
@@ -404,274 +442,209 @@ export class UserService {
     for (const check of checks) {
       if (check.condition && !user.achievements.includes(check.key)) {
         const achievement = ACHIEVEMENTS[check.key];
-        unlocked.push({ 
-          name: achievement.name, 
+        unlocked.push({
+          name: achievement.name,
           reward: achievement.reward,
-          isHidden: achievement.hidden || false
+          isHidden: achievement.hidden || false,
         });
         user.achievements.push(check.key);
         user.score += achievement.reward;
-        
-        // 如果隐藏成就有专属头衔，自动授予
+
+        // 隐藏成就专属头衔（标记 type: "achievement"）
         if (achievement.hidden && achievement.title) {
-          const titleExpire = Date.now() + 365 * 24 * 60 * 60 * 1000; // 隐藏成就头衔有效期1年
-          user.titles.push({ name: achievement.title, expire: titleExpire });
+          const titleExpire = Date.now() + 365 * 24 * 60 * 60 * 1000;
+          user.titles.push({ name: achievement.title, expire: titleExpire, type: "achievement" });
         }
       }
     }
 
     if (unlocked.length > 0) {
-      await this.ctx.database.set("sudoku_user", { userId }, user);
+      await this.ctx.database.set("sudoku_user", { userId }, this.toUpdateData(user));
       for (const ach of unlocked) {
-        let prefix: string;
-        let titleWrapper: [string, string];
-        
         const achievement = Object.values(ACHIEVEMENTS).find(a => a.name === ach.name);
-        
         if (ach.isHidden) {
-          // 隐藏成就：特殊播报 + 【】符号
-          prefix = "✨✨✨ 隐藏成就解锁 ✨✨✨";
-          titleWrapper = ["【", "】"];
-          
-          // 如果有专属头衔，一并播报
+          const prefix = "✨✨✨ 隐藏成就解锁 ✨✨✨";
           if (achievement?.title) {
             await session.send(
-              `${prefix}\n恭喜 @${session.username} 解锁成就${titleWrapper[0]}${ach.name}${titleWrapper[1]}！\n🎁 获得 ${ach.reward} 积分奖励！\n🎖️ 同时获得专属头衔【${achievement.title}】！（有效期1年）`,
+              `${prefix}\n恭喜 @${session.username} 解锁成就【${ach.name}】！\n🎁 获得 ${ach.reward} 积分奖励！\n🎖️ 同时获得专属头衔【${achievement.title}】！（有效期1年）`,
             );
           } else {
             await session.send(
-              `${prefix}\n恭喜 @${session.username} 解锁成就${titleWrapper[0]}${ach.name}${titleWrapper[1]}！\n🎁 获得 ${ach.reward} 积分奖励！`,
+              `${prefix}\n恭喜 @${session.username} 解锁成就【${ach.name}】！\n🎁 获得 ${ach.reward} 积分奖励！`,
             );
           }
         } else {
-          // 普通成就：普通播报 + []符号
-          prefix = "🎊";
-          titleWrapper = ["[", "]"];
           await session.send(
-            `${prefix}\n恭喜 @${session.username} 解锁成就${titleWrapper[0]}${ach.name}${titleWrapper[1]}！\n🎁 获得 ${ach.reward} 积分奖励！`,
+            `🎊\n恭喜 @${session.username} 解锁成就[${ach.name}]！\n🎁 获得 ${ach.reward} 积分奖励！`,
           );
         }
       }
     }
   }
 
-  // 获取连续MVP次数（基于 consecutiveMvp 字段）
   async getRecentMvpStreak(userId: string): Promise<number> {
     const user = await this.getUser(userId);
     return user.consecutiveMvp;
   }
 
-  async updateHonorTitles(durationDays: number, session?: Session) {
-    const users = await this.ctx.database.get("sudoku_user", {});
+  /**
+   * 每局结算荣誉头衔。
+   * - 荣誉头衔永久有效（不设时间过期），条件不符立即易主。
+   * - 每个群独立结算，只考虑在该群参与过游戏的用户。
+   */
+  async updateHonorTitles(guildId: string, session?: Session) {
+    const allUsers = await this.ctx.database.get("sudoku_user", {});
+    if (allUsers.length === 0) return;
+
+    // 筛选本群成员
+    const users = guildId
+      ? allUsers.filter(u => ((u as any).guilds as string[] ?? []).includes(guildId))
+      : allUsers;
+
     if (users.length === 0) return;
 
-    const topScore = [...users].sort((a, b) => b.score - a.score)[0];
-    const topCorrect = [...users].sort(
-      (a, b) => b.totalCorrect - a.totalCorrect,
-    )[0];
-    const topRounds = [...users].sort(
-      (a, b) => b.totalRounds - a.totalRounds,
-    )[0];
-    const topStarted = [...users].sort(
-      (a, b) => b.gamesStarted - a.gamesStarted,
-    )[0];
+    // 计算各维度榜首（积分榜首须 score > 0 才有意义）
+    const topScore = [...users].filter(u => u.score > 0).sort((a, b) => b.score - a.score)[0];
+    const topCorrect = [...users].sort((a, b) => b.totalCorrect - a.totalCorrect)[0];
+    const topRounds = [...users].sort((a, b) => b.totalRounds - a.totalRounds)[0];
+    const topStarted = [...users].sort((a, b) => b.gamesStarted - a.gamesStarted)[0];
 
-    const qualified = users.filter((u) => u.totalRounds >= 10);
+    const qualified = users.filter(u => u.totalRounds >= 10);
     const topAccuracy = qualified.length
       ? [...qualified].sort((a, b) => {
-          const rateA = a.totalCorrect / (a.totalCorrect + a.totalWrong) || 0;
-          const rateB = b.totalCorrect / (b.totalCorrect + b.totalWrong) || 0;
-          return rateB - rateA;
+          const rA = a.totalCorrect / (a.totalCorrect + a.totalWrong) || 0;
+          const rB = b.totalCorrect / (b.totalCorrect + b.totalWrong) || 0;
+          return rB - rA;
         })[0]
       : null;
 
-    const now = Date.now();
-    const expire = now + durationDays * 24 * 60 * 60 * 1000;
-    
     const titleConfig = [
-      { 
-        userId: topScore?.userId, 
-        name: "积分之王", 
-        rankType: "积分",
-        value: topScore?.score,
-        expire 
-      },
-      { 
-        userId: topCorrect?.userId, 
-        name: "答题之王", 
-        rankType: "答对数",
-        value: topCorrect?.totalCorrect,
-        expire 
-      },
-      { 
-        userId: topRounds?.userId, 
-        name: "参与之王", 
-        rankType: "参与局数",
-        value: topRounds?.totalRounds,
-        expire 
-      },
-      { 
-        userId: topStarted?.userId, 
-        name: "开局之王", 
-        rankType: "开局数",
-        value: topStarted?.gamesStarted,
-        expire 
-      },
-      { 
-        userId: topAccuracy?.userId, 
-        name: "正确率之王", 
-        rankType: "正确率",
-        value: topAccuracy ? 
-          ((topAccuracy.totalCorrect / (topAccuracy.totalCorrect + topAccuracy.totalWrong)) * 100).toFixed(1) + "%" : 
-          null,
-        expire 
-      },
+      { userId: topScore?.userId,   name: "积分之王",   rankType: "积分" },
+      { userId: topCorrect?.userId, name: "答题之王",   rankType: "答对数" },
+      { userId: topRounds?.userId,  name: "参与之王",   rankType: "参与局数" },
+      { userId: topStarted?.userId, name: "开局之王",   rankType: "开局数" },
+      { userId: topAccuracy?.userId,name: "正确率之王", rankType: "正确率" },
     ];
 
-    // 检测易主并播报
-    for (const config of titleConfig) {
-      if (!config.userId) continue;
-      
-      // 查找当前拥有该头衔的用户
-      const currentHolders = users.filter(u => 
-        u.titles.some((t: { name: string; expire: number }) => t.name === config.name && t.expire > now)
+    for (const cfg of titleConfig) {
+      if (!cfg.userId) continue;
+
+      // 找到当前持有该群荣誉头衔的用户（通过 guildId 隔离）
+      const currentHolders = allUsers.filter(u =>
+        (u.titles as TitleEntry[]).some(
+          t => t.name === cfg.name && (t.guildId === guildId || (!t.guildId && !guildId))
+        )
       );
-      
+
       const currentHolder = currentHolders.length > 0 ? currentHolders[0] : null;
-      const newHolder = await this.getUser(config.userId);
-      
-      // 检测是否易主
-      if (currentHolder && currentHolder.userId !== config.userId) {
-        // 发生易主
-        if (session) {
-          let oldHolderName = currentHolder.userId;
-          let newHolderName = config.userId;
-          
-          // 尝试获取昵称
-          try {
-            if (session.guildId) {
-              const oldMember = await session.bot.getGuildMember?.(session.guildId, currentHolder.userId);
-              oldHolderName = (oldMember as any)?.nickname ?? (oldMember as any)?.name ?? currentHolder.userId;
-              
-              const newMember = await session.bot.getGuildMember?.(session.guildId, config.userId);
-              newHolderName = (newMember as any)?.nickname ?? (newMember as any)?.name ?? config.userId;
-            }
-          } catch {
-            // 忽略错误
+      const newHolder = await this.getUser(cfg.userId);
+
+      // 检测易主
+      if (currentHolder && currentHolder.userId !== cfg.userId && session) {
+        let oldName = currentHolder.userId;
+        let newName = cfg.userId;
+        try {
+          if (session.guildId) {
+            const oldM = await session.bot.getGuildMember?.(session.guildId, currentHolder.userId);
+            oldName = (oldM as any)?.nickname ?? (oldM as any)?.name ?? oldName;
+            const newM = await session.bot.getGuildMember?.(session.guildId, cfg.userId);
+            newName = (newM as any)?.nickname ?? (newM as any)?.name ?? newName;
           }
-          
-          await session.send(
-            `🔄 ${config.rankType}榜首易主了！\n` +
-            `${newHolderName} 取代 ${oldHolderName} 成为新的第一！`
-          );
-        }
+        } catch { /* 忽略 */ }
+        await session.send(`🔄 ${cfg.rankType}榜首易主！\n${newName} 取代 ${oldName} 成为新的第一！`);
       }
-      
-      // 清理所有旧持有者（含异常重复情况），防止易主后旧头衔残留
+
+      // 清除所有旧持有者在此群的该荣誉头衔
       for (const holder of currentHolders) {
-        if (holder.userId !== config.userId) {
+        if (holder.userId !== cfg.userId) {
           const oldHolder = await this.getUser(holder.userId);
-          oldHolder.titles = oldHolder.titles.filter((t) => t.name !== config.name);
-          await this.ctx.database.set("sudoku_user", { userId: holder.userId }, oldHolder);
+          oldHolder.titles = oldHolder.titles.filter(
+            t => !(t.name === cfg.name && (t.guildId === guildId || (!t.guildId && !guildId)))
+          );
+          await this.ctx.database.set("sudoku_user", { userId: holder.userId }, this.toUpdateData(oldHolder));
         }
       }
 
-      // 授予新持有者头衔
-      newHolder.titles = newHolder.titles.filter((title) => title.name !== config.name);
-      newHolder.titles.push({ name: config.name, expire: config.expire });
-      await this.ctx.database.set("sudoku_user", { userId: config.userId }, newHolder);
-      
-      // 播报授予头衔
+      // 授予新持有者（刷新）
+      newHolder.titles = newHolder.titles.filter(
+        t => !(t.name === cfg.name && (t.guildId === guildId || (!t.guildId && !guildId)))
+      );
+      newHolder.titles.push({ name: cfg.name, expire: HONOR_EXPIRE, type: "honor", guildId });
+      await this.ctx.database.set("sudoku_user", { userId: cfg.userId }, this.toUpdateData(newHolder));
+
+      // 播报（不再显示有效期）
       if (session) {
-        let holderName = config.userId;
+        let holderName = cfg.userId;
         try {
           if (session.guildId) {
-            const member = await session.bot.getGuildMember?.(session.guildId, config.userId);
-            holderName = (member as any)?.nickname ?? (member as any)?.name ?? config.userId;
+            const m = await session.bot.getGuildMember?.(session.guildId, cfg.userId);
+            holderName = (m as any)?.nickname ?? (m as any)?.name ?? holderName;
           }
-        } catch {
-          // 忽略错误
-        }
-        
+        } catch { /* 忽略 */ }
         await session.send(
-          `👑 当前 ${holderName} ${config.rankType}排名第一！\n` +
-          `🎖️ 小仙授予 ${holderName} 荣誉头衔「${config.name}」\n` +
-          `⏰ 有效期：${durationDays}天`
+          `👑 当前 ${holderName} ${cfg.rankType}本群排名第一！\n` +
+          `🎖️ 小仙授予 ${holderName} 荣誉头衔「${cfg.name}」`
         );
       }
     }
   }
 
-  async grantTitle(
-    userId: string, 
-    titleName: string, 
-    durationDays: number,
-    session?: Session
-  ): Promise<boolean> {
-    const user = await this.getUser(userId);
-    const expire = Date.now() + durationDays * 24 * 60 * 60 * 1000;
-    
-    // 检查是否已有该头衔
-    const hasTitle = user.titles.some(t => t.name === titleName);
-    if (hasTitle) return false;
-    
-    user.titles.push({ name: titleName, expire });
-    await this.ctx.database.set("sudoku_user", { userId }, user);
-    
-    // 播报获得头衔（区分荣誉头衔和普通头衔）
-    if (session) {
-      const honorTitles = ["积分之王", "答题之王", "参与之王", "开局之王", "正确率之王"];
-      const wrapper = honorTitles.includes(titleName) 
-        ? ["「", "」"]  // 荣誉头衔
-        : ["[", "]"];    // 普通头衔
-      
-      await session.send(
-        `🎉 恭喜 @${session.username} 获得头衔${wrapper[0]}${titleName}${wrapper[1]}！`
-      );
-    }
-    
-    return true;
-  }
-
   async exchangeTitle(userId: string, titleName: string): Promise<boolean> {
     const user = await this.getUser(userId);
-    
+
     const titleCatalog: Record<string, { name: string; price: number; duration: number }> = {
       sudoku_apprentice: { name: "数独学徒", price: 100, duration: 7 },
-      problem_solver: { name: "解题高手", price: 500, duration: 30 },
-      endgame_master: { name: "终盘大师", price: 2000, duration: 365 },
+      problem_solver:    { name: "解题高手", price: 500, duration: 30 },
+      endgame_master:    { name: "终盘大师", price: 2000, duration: 365 },
     };
 
-    const titleKey = Object.keys(titleCatalog).find(
-      (key) => titleCatalog[key].name === titleName,
-    );
+    const titleKey = Object.keys(titleCatalog).find(k => titleCatalog[k].name === titleName);
     if (!titleKey) return false;
 
     const titleInfo = titleCatalog[titleKey];
     if (user.score < titleInfo.price) return false;
 
-    user.score -= titleInfo.price;
-    const expire = Date.now() + titleInfo.duration * 24 * 60 * 60 * 1000;
-    user.titles.push({ name: titleName, expire });
+    // 防止重复购买未过期的头衔
+    const now = Date.now();
+    if (user.titles.some(t => t.name === titleInfo.name && t.expire > now)) return false;
 
-    await this.ctx.database.set("sudoku_user", { userId }, user);
+    user.score -= titleInfo.price;
+    user.score = Math.max(0, user.score); // 二次保底
+    const expire = Date.now() + titleInfo.duration * 24 * 60 * 60 * 1000;
+    user.titles.push({ name: titleName, expire, type: "regular" });
+
+    await this.ctx.database.set("sudoku_user", { userId }, this.toUpdateData(user));
     return true;
   }
 
+  /**
+   * 获取展示头衔（带包裹符号）。
+   * 优先级：成就头衔 > 荣誉头衔 > 普通头衔。
+   * 兼容旧数据（无 type 字段时通过名称推断）。
+   */
   getDisplayTitle(user: UserData): string {
     if (user.titles.length === 0) return "";
     const now = Date.now();
     const validTitles = user.titles.filter(t => t.expire > now);
     if (validTitles.length === 0) return "";
-    
-    const firstTitle = validTitles[0].name;
-    
-    // 判断是否为荣誉头衔（自动授予的头衔）
-    const honorTitles = ["积分之王", "答题之王", "参与之王", "开局之王", "正确率之王"];
-    if (honorTitles.includes(firstTitle)) {
-      return `「${firstTitle}」`; // 荣誉头衔用「」
-    }
-    
-    return `[${firstTitle}]`; // 普通头衔用[]
+
+    // 推断头衔类型（兼容旧数据）
+    const inferType = (t: TitleEntry): "achievement" | "honor" | "regular" => {
+      if (t.type) return t.type;
+      if (ACHIEVEMENT_TITLE_NAMES.has(t.name)) return "achievement";
+      if (HONOR_TITLE_NAMES.has(t.name)) return "honor";
+      return "regular";
+    };
+
+    const typePriority: Record<string, number> = { achievement: 0, honor: 1, regular: 2 };
+    const sorted = [...validTitles].sort(
+      (a, b) => (typePriority[inferType(a)] ?? 2) - (typePriority[inferType(b)] ?? 2)
+    );
+
+    const best = sorted[0];
+    const type = inferType(best);
+    if (type === "achievement") return `【${best.name}】`;
+    if (type === "honor") return `「${best.name}」`;
+    return `[${best.name}]`;
   }
 }

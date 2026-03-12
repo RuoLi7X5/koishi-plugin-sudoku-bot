@@ -21,6 +21,7 @@ declare module "koishi" {
 export class ImageRenderer {
   constructor(private ctx: Context) {}
 
+
   async render(puzzle: number[][], difficulty?: string): Promise<Buffer> {
     const cellSize = 50;
     const gridSize = cellSize * 9;
@@ -137,11 +138,11 @@ export class ImageRenderer {
       
       // 绘制难度标注
       if (difficulty) {
-        ctx2d.font = "16px Arial";
+        ctx2d.font = "bold 16px Arial";
         ctx2d.fillStyle = "#666666";
         ctx2d.textAlign = "center";
         ctx2d.textBaseline = "middle";
-        ctx2d.fillText(`难度：${difficulty}`, size / 2, size + bottomSpace / 2);
+        ctx2d.fillText(difficulty, size / 2, size + bottomSpace / 2);
       }
       
       console.log("[Sudoku] Canvas 绘制完成");

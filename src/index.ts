@@ -2,7 +2,6 @@ import { Context, Schema } from "koishi";
 import { SudokuGame } from "./game";
 import { SudokuGenerator } from "./generator";
 import { ImageRenderer } from "./renderer";
-import { UserService } from "./user";
 
 export const name = "sudoku-bot";
 
@@ -52,9 +51,16 @@ export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
     timeout: Schema.number().default(30).min(10).max(120).description("每题超时时间（秒）"),
     rounds: Schema.number().default(8).min(1).max(20).description("每轮题目数量"),
-    difficulty: Schema.union([1, 2, 3, 4, 5, 6, 7] as const)
-      .default(2)
-      .description("默认难度级别（1-7，2为默认）"),
+    difficulty: Schema.union([
+      Schema.union([1, 2, 3, 4, 5, 6, 7] as const),
+      // 兼容旧版字符串配置，自动映射为数字
+      Schema.transform(Schema.string(), (val) => {
+        const legacyMap: Record<string, 1 | 2 | 3 | 4 | 5 | 6 | 7> = {
+          easy: 1, medium: 2, hard: 4, expert: 6,
+        };
+        return (legacyMap[val] ?? 2) as 1 | 2 | 3 | 4 | 5 | 6 | 7;
+      }),
+    ] as const).default(2).description("默认难度级别（1-7，2为默认）"),
   }).description("游戏配置"),
   
   Schema.object({
@@ -69,6 +75,16 @@ export const Config: Schema<Config> = Schema.intersect([
 ]) as Schema<Config>;
 
 export function apply(ctx: Context, config: Config) {
+  // 兼容旧版本配置（如 difficulty 为字符串时，重置为默认值 2）
+  if (!config) {
+    ctx.logger("sudoku").error("插件配置为空，请在控制台重新配置 sudoku-bot 插件并保存");
+    return;
+  }
+  if (typeof config.difficulty !== "number") {
+    ctx.logger("sudoku").warn(`检测到旧版配置 difficulty="${config.difficulty}"，已自动重置为默认值 2，请在控制台重新保存配置`);
+    (config as any).difficulty = 2;
+  }
+
   // 扩展数据库模型，使用 as const 解决类型问题
   ctx.model.extend(
     "sudoku_user" as const,
@@ -90,6 +106,7 @@ export function apply(ctx: Context, config: Config) {
       lastPlaceCount: "integer",
       consecutiveLastPlace: "integer",
       consecutiveMvp: "integer",
+      guilds: "json",
     },
     {
       primary: "id",
@@ -122,14 +139,14 @@ export function apply(ctx: Context, config: Config) {
   });
 
   ctx
-    .command(config.commandExchange, "[title:string]")
+    .command(`${config.commandExchange} [title:string]`)
     .action(({ session }, title) => {
       if (!session) return "无法获取会话信息";
       return game.exchangeTitle(session, title);
     });
 
   ctx
-    .command(config.commandRank, "[type:string]")
+    .command(`${config.commandRank} [type:string]`)
     .action(({ session }, type) => {
       if (!session) return "无法获取会话信息";
       return game.showRank(session, type);
@@ -141,7 +158,7 @@ export function apply(ctx: Context, config: Config) {
   });
 
   ctx
-    .command(config.commandDifficulty, "<level:number>")
+    .command(`${config.commandDifficulty} <level:number>`)
     .action(({ session }, level) => {
       if (!session) return "无法获取会话信息";
       if (level === undefined) {
@@ -159,8 +176,9 @@ export function apply(ctx: Context, config: Config) {
 
   // 监听消息（抢答）—— 先快速检查当前频道是否有游戏，避免处理无关消息
   ctx.middleware(async (session, next) => {
-    if (session.content && /^[1-9]$/.test(session.content) && game.hasGameInChannel(session.channelId)) {
-      await game.handleAnswer(session, parseInt(session.content));
+    const content = session.content?.trim() ?? "";
+    if (/^[1-9]$/.test(content) && game.hasGameInChannel(session.channelId)) {
+      await game.handleAnswer(session, parseInt(content));
     }
     return next();
   });
