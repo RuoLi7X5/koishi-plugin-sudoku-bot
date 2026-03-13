@@ -1079,7 +1079,14 @@ function computeDPCosts(puzzle: number[][], grid: CandGrid): DPTable {
   return dp;
 }
 
-/** 计算单个 (r,c,v) 的最优 DP 代价（四种证明方式取最小值）。 */
+/**
+ * 计算单个 (r,c,v) 的最优 DP 代价（五种证明方式取最小值）。
+ *
+ * 相比旧版新增两项优化：
+ *  - minElim Option B：阻塞格 (er,ec) 可通过自身赋值 u≠v 来自我消除（而非只靠邻格赋值 v）
+ *  - Method 4 数对占位免费排除：若目标格单元中已存在包含干扰候选数 u 的裸数对，
+ *    则排除 u 的代价为 0，路径更短
+ */
 function _dpBestCost(
   r: number, c: number, v: number,
   dp: DPTable, grid: CandGrid, puzzle: number[][],
@@ -1088,12 +1095,23 @@ function _dpBestCost(
   const boxCells = boxCellList(br0, bc0);
   let best = Infinity;
 
-  // 局部函数：从 peers 列表中找代价最小的 "赋值 v" 操作，用于消除 (er,ec) 中的 v
+  /**
+   * 扩展版最小消除代价：求将候选数 v 从阻塞格 (er,ec) 中排除的最低代价。
+   *  Option A（原有）：找同单元某邻格赋值 v，直接将 v 从 (er,ec) 中消除。
+   *  Option B（新增）：将 (er,ec) 自身赋为某个 u≠v，格子已确定，v 自动排除。
+   */
   const minElim = (er: number, ec: number, peers: Array<[number, number]>): number => {
     if (!grid[er][ec].has(v) || puzzle[er][ec] !== 0) return 0;
     let m = Infinity;
+    // Option A: 同单元某格赋值 v → 从 (er,ec) 消除 v
     for (const [pr, pc] of peers) {
       const cv = dp[pr][pc][v - 1];
+      if (cv < m) m = cv;
+    }
+    // Option B: (er,ec) 自身赋为 u≠v → 阻塞格自我消除
+    for (let ui = 0; ui < 9; ui++) {
+      if (ui === v - 1 || !grid[er][ec].has(ui + 1)) continue;
+      const cv = dp[er][ec][ui];
       if (cv < m) m = cv;
     }
     return m;
@@ -1150,15 +1168,41 @@ function _dpBestCost(
     if (cost < best) best = cost;
   }
 
-  // Method 4：显性唯余（naked single）
+  // Method 4：显性唯余（naked single）—— 含数对占位免费排除
   {
+    // 预构建目标格的三个单元列表，用于裸数对检测
+    const unitLists: Array<Array<[number, number]>> = [
+      Array.from({ length: 9 }, (_, c2): [number, number] => [r, c2]),
+      Array.from({ length: 9 }, (_, r2): [number, number] => [r2, c]),
+      boxCells,
+    ];
     let cost = 1;
     for (const u of grid[r][c]) {
       if (u === v) continue;
       let minU = Infinity;
+      // 常规：找代价最低的邻格赋值来排除干扰数 u
       for (let c2 = 0; c2 < 9; c2++) if (c2 !== c) { const cv = dp[r][c2][u - 1]; if (cv < minU) minU = cv; }
       for (let r2 = 0; r2 < 9; r2++) if (r2 !== r) { const cv = dp[r2][c][u - 1]; if (cv < minU) minU = cv; }
       for (const [r2, c2] of boxCells) if (r2 !== r || c2 !== c) { const cv = dp[r2][c2][u - 1]; if (cv < minU) minU = cv; }
+      // 数对占位免费排除：若目标格单元中已存在包含 u 的裸数对（两格均为 size=2 且候选数相同），
+      // 则 u 被锁定在该数对，将被免费从目标格消除，排除代价为 0。
+      if (minU > 0) {
+        outer: for (const unitCells of unitLists) {
+          const pairCands = unitCells.filter(([r2, c2]) =>
+            puzzle[r2][c2] === 0 && !(r2 === r && c2 === c) &&
+            grid[r2][c2].size === 2 && grid[r2][c2].has(u),
+          );
+          for (let i = 0; i < pairCands.length - 1; i++) {
+            const p1v = sortedArr(grid[pairCands[i][0]][pairCands[i][1]]);
+            for (let j = i + 1; j < pairCands.length; j++) {
+              if (arrEqual(sortedArr(grid[pairCands[j][0]][pairCands[j][1]]), p1v)) {
+                minU = 0;   // 裸数对已存在，排除免费
+                break outer;
+              }
+            }
+          }
+        }
+      }
       cost += minU;
       if (cost >= best) break;
     }
@@ -1345,7 +1389,11 @@ function extractProofTree(
 
 /**
  * 根据 DP 代价表，找出推导 (r,c)=v 所需的最优前置格列表。
- * 遍历四种证明方式，返回代价与 targetCost 匹配的那种方式的前置格。
+ * 遍历五种证明方式，返回代价与 targetCost 匹配的那种方式的前置格。
+ *
+ * 相比旧版新增：
+ *  - bestElimPeer Option B：阻塞格自身赋值 u≠v 也是合法的消除前置格
+ *  - Method 4：裸数对已存在时排除代价为 0，无需前置格
  */
 function _findOptimalPrereqs(
   r: number, c: number, v: number,
@@ -1357,17 +1405,29 @@ function _findOptimalPrereqs(
   const [br0, bc0] = boxOrigin(r, c);
   const boxCells = boxCellList(br0, bc0);
 
-  // 为消除格 (er,ec) 的候选数 v，找代价最小的 peer
+  /**
+   * 扩展版最优消除来源：求消除阻塞格 (er,ec) 中候选数 v 的最优前置格。
+   *  Option A（原有）：同单元某邻格赋值 v，直接消除 (er,ec) 的 v。
+   *  Option B（新增）：(er,ec) 自身赋为 u≠v，格子已确定，v 自动排除。
+   * 返回值含 v 字段（Option B 时为 u，Option A 时为原 v）。
+   */
   const bestElimPeer = (
     er: number, ec: number,
     peers: Array<[number, number]>,
-  ): { r: number; c: number; cost: number } | null => {
+  ): { r: number; c: number; v: number; cost: number } | null => {
     if (!grid[er][ec].has(v) || puzzle[er][ec] !== 0) return null;
     let minCost = Infinity;
-    let best: { r: number; c: number } | null = null;
+    let best: { r: number; c: number; v: number } | null = null;
+    // Option A: 同单元某格赋值 v
     for (const [pr, pc] of peers) {
       const cv = dp[pr][pc][v - 1];
-      if (cv < minCost) { minCost = cv; best = { r: pr, c: pc }; }
+      if (cv < minCost) { minCost = cv; best = { r: pr, c: pc, v }; }
+    }
+    // Option B: (er,ec) 自身赋值 u≠v
+    for (let ui = 0; ui < 9; ui++) {
+      if (ui === v - 1 || !grid[er][ec].has(ui + 1)) continue;
+      const cv = dp[er][ec][ui];
+      if (cv < minCost) { minCost = cv; best = { r: er, c: ec, v: ui + 1 }; }
     }
     return best ? { ...best, cost: minCost } : null;
   };
@@ -1383,7 +1443,7 @@ function _findOptimalPrereqs(
       for (let c2 = 0; c2 < 9; c2++) if (Math.floor(c2 / 3) * 3 !== bc0) peers.push([br, c2]);
       for (let r2 = 0; r2 < 9; r2++) if (Math.floor(r2 / 3) * 3 !== br0) peers.push([r2, bc]);
       const ep = bestElimPeer(br, bc, peers);
-      if (ep) { cost += ep.cost; prereqs.push({ r: ep.r, c: ep.c, v }); }
+      if (ep) { cost += ep.cost; prereqs.push({ r: ep.r, c: ep.c, v: ep.v }); }
       else { valid = false; break; }
     }
     if (valid && Math.abs(cost - targetCost) <= 1) return prereqs;
@@ -1403,7 +1463,7 @@ function _findOptimalPrereqs(
         for (let cc = bC2; cc < bC2 + 3; cc++)
           if (rr !== r) peers.push([rr, cc]);
       const ep = bestElimPeer(r, c2, peers);
-      if (ep) { cost += ep.cost; prereqs.push({ r: ep.r, c: ep.c, v }); }
+      if (ep) { cost += ep.cost; prereqs.push({ r: ep.r, c: ep.c, v: ep.v }); }
       else { valid = false; break; }
     }
     if (valid && Math.abs(cost - targetCost) <= 1) return prereqs;
@@ -1423,14 +1483,19 @@ function _findOptimalPrereqs(
         for (let cc = bC2; cc < bC2 + 3; cc++)
           if (cc !== c) peers.push([rr, cc]);
       const ep = bestElimPeer(r2, c, peers);
-      if (ep) { cost += ep.cost; prereqs.push({ r: ep.r, c: ep.c, v }); }
+      if (ep) { cost += ep.cost; prereqs.push({ r: ep.r, c: ep.c, v: ep.v }); }
       else { valid = false; break; }
     }
     if (valid && Math.abs(cost - targetCost) <= 1) return prereqs;
   }
 
-  // Method 4：显性唯余（naked single）
+  // Method 4：显性唯余（naked single）—— 含数对占位免费排除
   {
+    const unitLists: Array<Array<[number, number]>> = [
+      Array.from({ length: 9 }, (_, c2): [number, number] => [r, c2]),
+      Array.from({ length: 9 }, (_, r2): [number, number] => [r2, c]),
+      boxCells,
+    ];
     let cost = 1;
     const prereqs: Array<{ r: number; c: number; v: number }> = [];
     let valid = true;
@@ -1441,8 +1506,36 @@ function _findOptimalPrereqs(
       for (let c2 = 0; c2 < 9; c2++) if (c2 !== c) { const cv = dp[r][c2][u - 1]; if (cv < minCost) { minCost = cv; bestCell = { r, c: c2 }; } }
       for (let r2 = 0; r2 < 9; r2++) if (r2 !== r) { const cv = dp[r2][c][u - 1]; if (cv < minCost) { minCost = cv; bestCell = { r: r2, c }; } }
       for (const [r2, c2] of boxCells) if (r2 !== r || c2 !== c) { const cv = dp[r2][c2][u - 1]; if (cv < minCost) { minCost = cv; bestCell = { r: r2, c: c2 }; } }
-      if (bestCell && isFinite(minCost)) { cost += minCost; prereqs.push({ r: bestCell.r, c: bestCell.c, v: u }); }
-      else { valid = false; break; }
+      // 数对占位免费排除：裸数对已存在则排除代价为 0，无需前置格
+      let nakedPairFree = false;
+      if (minCost > 0) {
+        outer: for (const unitCells of unitLists) {
+          const pairCands = unitCells.filter(([r2, c2]) =>
+            puzzle[r2][c2] === 0 && !(r2 === r && c2 === c) &&
+            grid[r2][c2].size === 2 && grid[r2][c2].has(u),
+          );
+          for (let i = 0; i < pairCands.length - 1; i++) {
+            const p1v = sortedArr(grid[pairCands[i][0]][pairCands[i][1]]);
+            for (let j = i + 1; j < pairCands.length; j++) {
+              if (arrEqual(sortedArr(grid[pairCands[j][0]][pairCands[j][1]]), p1v)) {
+                nakedPairFree = true;
+                minCost = 0;
+                bestCell = null;
+                break outer;
+              }
+            }
+          }
+        }
+      }
+      if (!nakedPairFree) {
+        if (bestCell && isFinite(minCost)) {
+          prereqs.push({ r: bestCell.r, c: bestCell.c, v: u });
+        } else {
+          valid = false; break;
+        }
+      }
+      cost += minCost;
+      if (!isFinite(cost)) { valid = false; break; }
     }
     if (valid && Math.abs(cost - targetCost) <= 1) return prereqs;
   }
@@ -1676,6 +1769,24 @@ export function solve(
 
   const allUnits = getAllUnits();
 
+  // 预计算按目标格相关度排序的单元列表，用于 L3b/L3c 数对/数组优先策略：
+  // 含目标格的单元 > 与目标格同行/列/宫的单元 > 其他单元
+  // 确保找到最短路径所需的数对时，优先选取与目标最相关的那个。
+  const [_bTr, _bTc] = [Math.floor(targetRow / 3) * 3, Math.floor(targetCol / 3) * 3];
+  const allUnitsSortedForPairs = [...allUnits].sort((ua, ub) => {
+    const unitScore = (u: typeof allUnits[0]): number => {
+      for (const [r, c] of u.cells) {
+        if (r === targetRow && c === targetCol) return 3;
+      }
+      for (const [r, c] of u.cells) {
+        if (r === targetRow || c === targetCol ||
+            (Math.floor(r / 3) * 3 === _bTr && Math.floor(c / 3) * 3 === _bTc)) return 1;
+      }
+      return 0;
+    };
+    return unitScore(ub) - unitScore(ua);
+  });
+
   // ========================= 主循环 =========================
   for (let iter = 0; iter < 1000; iter++) {
     const before = getCur();
@@ -1852,7 +1963,8 @@ export function solve(
     if (progress) { if (grid[targetRow][targetCol].size === 1) break; continue; }
 
     // ---- L3b：显性数对/数组（Naked Pair/Triple） ----
-    for (const unit of allUnits) {
+    // 使用按目标格相关度预排序的单元列表，优先选取能直接影响目标格的数对
+    for (const unit of allUnitsSortedForPairs) {
       for (const sz of [2, 3] as const) {
         const np = applyNakedSet(grid, work, unit.cells, sz);
         if (np) {
@@ -1884,7 +1996,8 @@ export function solve(
     if (progress) { if (grid[targetRow][targetCol].size === 1) break; continue; }
 
     // ---- L3c：隐性数对/数组（Hidden Pair/Triple） ----
-    for (const unit of allUnits) {
+    // 同样使用按目标格相关度预排序的单元列表
+    for (const unit of allUnitsSortedForPairs) {
       for (const sz of [2, 3] as const) {
         const hp = applyHiddenSet(grid, work, unit.cells, sz);
         if (hp) {

@@ -711,6 +711,19 @@ export class SudokuGame {
       preSolveText = validation.solveText;
     } else {
       q = emptyCells[Math.floor(Math.random() * emptyCells.length)];
+      // D1-D4：出题时预计算最短路径解法文本，玩家查询提示时直接返回缓存，无需重复计算。
+      // D7（极难）跳过预计算：该难度允许链类技巧，提示请求时实时推导更灵活（可显示部分路径）。
+      if (game.difficulty <= 4) {
+        try {
+          const preResult = solve(puzzle, q.row, q.col);
+          if (preResult.success) {
+            const preLabel = `${String.fromCharCode(65 + q.row)}${q.col + 1}`;
+            preSolveText = formatCompactSteps(preResult, preLabel);
+          }
+        } catch {
+          // 预计算失败不影响出题，玩家查询提示时仍可实时推导
+        }
+      }
     }
 
     // 更新当前题的状态
