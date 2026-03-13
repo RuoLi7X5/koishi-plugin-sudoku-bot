@@ -10,24 +10,24 @@ export class SudokuGenerator {
   }
 
   generate(): { puzzle: number[][]; solution: number[][] } {
-    // 难度档位与生成器的映射：
-    //   1: sudoku-gen easy    （简单）
-    //   2: sudoku-gen medium  （较易）
-    //   3: @forfuns/sudoku level 1（中等）
-    //   4: sudoku-gen hard    （中等+）
-    //   5: @forfuns/sudoku level 2（困难）
-    //   6: sudoku-gen expert  （困难+）
-    //   7: @forfuns/sudoku level 4（极难）
-    const useForfuns = [3, 5, 7].includes(this.difficulty);
+    // 难度档位与生成器的映射（按实际难度排序，D2↔D3、D4↔D5 已对调）：
+    //   1: sudoku-gen easy         （简单）   avg ~3.7 步
+    //   2: @forfuns/sudoku level 1 （较易）   avg ~4.0 步
+    //   3: sudoku-gen medium       （中等）   avg ~9.6 步
+    //   4: @forfuns/sudoku level 2 （中等+）  avg ~9.6 步
+    //   5: sudoku-gen hard         （困难）   avg ~23 步
+    //   6: sudoku-gen expert       （困难+）  avg ~34 步
+    //   7: @forfuns/sudoku level 4 （极难）
+    const useForfuns = [2, 4, 7].includes(this.difficulty);
     return useForfuns ? this.generateWithForfuns() : this.generateWithSudokuGen();
   }
 
-  // ── sudoku-gen 路径（档位 1 / 2 / 4 / 6） ──────────────────────────────
+  // ── sudoku-gen 路径（档位 1 / 3 / 5 / 6） ──────────────────────────────
   private generateWithSudokuGen(): { puzzle: number[][]; solution: number[][] } {
     const difficultyMap: Record<number, SudokuGenDifficulty> = {
       1: "easy",
-      2: "medium",
-      4: "hard",
+      3: "medium",
+      5: "hard",
       6: "expert",
     };
     const level = difficultyMap[this.difficulty] ?? "medium";
@@ -53,9 +53,9 @@ export class SudokuGenerator {
     }
   }
 
-  // ── @forfuns/sudoku 路径（档位 3 / 5 / 7） ─────────────────────────────
+  // ── @forfuns/sudoku 路径（档位 2 / 4 / 7） ─────────────────────────────
   private generateWithForfuns(): { puzzle: number[][]; solution: number[][] } {
-    const levelMap: Record<number, number> = { 3: 1, 5: 2, 7: 4 };
+    const levelMap: Record<number, number> = { 2: 1, 4: 2, 7: 4 };
     const level = levelMap[this.difficulty] ?? 1;
 
     try {

@@ -52,8 +52,8 @@ function renderPuzzle(puzzle) {
 }
 
 /**
- * 紧凑格式化：只显示影响目标格的步骤，每步一行。
- * 直接调用 solver.js 导出的 formatCompactSteps()。
+ * 格式化：调用 solver.js 导出的 formatCompactSteps()，并附加统计信息。
+ * 新版 formatCompactSteps 已包含所有铺垫步骤（▸ 先推导 行），路径完整可追溯。
  */
 function formatFullPath(result, targetRow, targetCol) {
   const tc = cellLabel(targetRow, targetCol);
@@ -63,15 +63,16 @@ function formatFullPath(result, targetRow, targetCol) {
     return compact;
   }
 
-  // 在紧凑结果后附加统计信息（仅写文件，便于调试）
-  const relevant = result.steps.filter(s => s.affectsTarget);
-  const usedTechs = [...new Set(result.steps.filter(s => s.affectsTarget).map(s => s.technique))].join(" · ");
+  // 附加统计信息（仅写文件，便于调试）
+  const affecting = result.steps.filter(s => s.affectsTarget);
+  const nonAffecting = result.steps.filter(s => !s.affectsTarget);
+  const usedTechs = [...new Set(affecting.map(s => s.technique))].join(" · ");
   const extra = [
-    `技巧路径：${usedTechs || "初始消除"}`,
-    `有效步骤：${relevant.length} 步（共 ${result.steps.length} 步内部推理）`,
+    `关键步骤：${affecting.length} 步  铺垫步骤：${nonAffecting.length} 步  共 ${result.steps.length} 步`,
+    `使用技巧：${usedTechs || "基础消除"}`,
   ];
 
-  return compact + "\n" + extra.join("  |  ");
+  return compact + "\n" + extra.join("\n");
 }
 
 // ========================= 测试主流程 =========================

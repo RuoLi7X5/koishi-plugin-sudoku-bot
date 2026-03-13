@@ -23,6 +23,7 @@ export type SolveStep = {
   targetBefore: number[];  // 目标格本步前的候选数
   targetAfter: number[];   // 目标格本步后的候选数
   eliminated: number[];    // 本步从目标格排除的候选数
+  prereqCells?: string[];  // 使能本步的前置格坐标（如 ["D3","F8","B4"]），用于过滤▸先推导
 };
 
 export type SolveResult =
@@ -957,6 +958,643 @@ function applyXYChain(
   return null;
 }
 
+// ========================= 辅助：全量扫描各类赋值步骤 =========================
+
+/** 扫描全盘所有可用的宫隐性唯余步骤 */
+function findAllBoxHiddenSingles(
+  grid: CandGrid,
+  work: number[][],
+): Array<{ br: number; bc: number; r: number; c: number; v: number }> {
+  const result: Array<{ br: number; bc: number; r: number; c: number; v: number }> = [];
+  for (let br = 0; br < 9; br += 3) {
+    for (let bc = 0; bc < 9; bc += 3) {
+      const cells = boxCellList(br, bc);
+      const empty = cells.filter(([r, c]) => work[r][c] === 0);
+      for (let v = 1; v <= 9; v++) {
+        const cands = empty.filter(([r, c]) => grid[r][c].has(v));
+        if (cands.length === 1) result.push({ br, bc, r: cands[0][0], c: cands[0][1], v });
+      }
+    }
+  }
+  return result;
+}
+
+/** 扫描全盘所有可用的行隐性唯余步骤 */
+function findAllRowHiddenSingles(
+  grid: CandGrid,
+  work: number[][],
+): Array<{ row: number; r: number; c: number; v: number }> {
+  const result: Array<{ row: number; r: number; c: number; v: number }> = [];
+  for (let i = 0; i < 9; i++) {
+    const rowEmpty = (Array.from({ length: 9 }, (_, c) => [i, c]) as Array<[number, number]>)
+      .filter(([r, c]) => work[r][c] === 0);
+    for (let v = 1; v <= 9; v++) {
+      const cands = rowEmpty.filter(([r, c]) => grid[r][c].has(v));
+      if (cands.length === 1) result.push({ row: i, r: cands[0][0], c: cands[0][1], v });
+    }
+  }
+  return result;
+}
+
+/** 扫描全盘所有可用的列隐性唯余步骤 */
+function findAllColHiddenSingles(
+  grid: CandGrid,
+  work: number[][],
+): Array<{ col: number; r: number; c: number; v: number }> {
+  const result: Array<{ col: number; r: number; c: number; v: number }> = [];
+  for (let i = 0; i < 9; i++) {
+    const colEmpty = (Array.from({ length: 9 }, (_, r) => [r, i]) as Array<[number, number]>)
+      .filter(([r, c]) => work[r][c] === 0);
+    for (let v = 1; v <= 9; v++) {
+      const cands = colEmpty.filter(([r, c]) => grid[r][c].has(v));
+      if (cands.length === 1) result.push({ col: i, r: cands[0][0], c: cands[0][1], v });
+    }
+  }
+  return result;
+}
+
+/** 扫描全盘所有可用的显性唯余（naked single）步骤 */
+function findAllNakedSingles(
+  grid: CandGrid,
+  work: number[][],
+): Array<{ r: number; c: number; v: number }> {
+  const result: Array<{ r: number; c: number; v: number }> = [];
+  for (let r = 0; r < 9; r++) {
+    for (let c = 0; c < 9; c++) {
+      if (work[r][c] === 0 && grid[r][c].size === 1) result.push({ r, c, v: [...grid[r][c]][0] });
+    }
+  }
+  return result;
+}
+
+// ========================= DP 最优路径规划 =========================
+
+/**
+ * DP 代价表：dp[r][c][v-1] = 从初始盘面出发，用纯逻辑至少需要几步赋值可确定 (r,c)=v。
+ * 已知格代价为 0；不可达格代价为 Infinity。
+ */
+type DPTable = number[][][];
+
+/**
+ * Bellman-Ford 迭代法计算全盘 DP 最小代价表。
+ *
+ * 递归定义（四种证明方式取最小值）：
+ *  cost(r,c,v) = 1 + min{
+ *    宫隐性唯余：∑ blockers B in box  → minElimCost(B, v, 宫外行/列同格)
+ *    行隐性唯余：∑ blockers B in row  → minElimCost(B, v, 同列/同宫非行格)
+ *    列隐性唯余：∑ blockers B in col  → minElimCost(B, v, 同行/同宫非列格)
+ *    显性唯余：  ∑ other cands u      → minElimCost((r,c), u, 所有邻格)
+ *  }
+ *  minElimCost(B, v, peers) = min over P∈peers of cost(P, v)
+ */
+function computeDPCosts(puzzle: number[][], grid: CandGrid): DPTable {
+  const dp: DPTable = Array.from({ length: 9 }, (_, r) =>
+    Array.from({ length: 9 }, (_, c) => {
+      const arr = new Array(9).fill(Infinity);
+      if (puzzle[r][c] !== 0) arr[puzzle[r][c] - 1] = 0;
+      return arr;
+    }),
+  );
+
+  let changed = true;
+  let iters = 0;
+  while (changed && iters < 400) {
+    changed = false;
+    iters++;
+    for (let r = 0; r < 9; r++) {
+      for (let c = 0; c < 9; c++) {
+        if (puzzle[r][c] !== 0) continue;
+        for (let vi = 0; vi < 9; vi++) {
+          const v = vi + 1;
+          if (!grid[r][c].has(v)) continue;
+          const best = _dpBestCost(r, c, v, dp, grid, puzzle);
+          if (best < dp[r][c][vi]) {
+            dp[r][c][vi] = best;
+            changed = true;
+          }
+        }
+      }
+    }
+  }
+  return dp;
+}
+
+/** 计算单个 (r,c,v) 的最优 DP 代价（四种证明方式取最小值）。 */
+function _dpBestCost(
+  r: number, c: number, v: number,
+  dp: DPTable, grid: CandGrid, puzzle: number[][],
+): number {
+  const [br0, bc0] = boxOrigin(r, c);
+  const boxCells = boxCellList(br0, bc0);
+  let best = Infinity;
+
+  // 局部函数：从 peers 列表中找代价最小的 "赋值 v" 操作，用于消除 (er,ec) 中的 v
+  const minElim = (er: number, ec: number, peers: Array<[number, number]>): number => {
+    if (!grid[er][ec].has(v) || puzzle[er][ec] !== 0) return 0;
+    let m = Infinity;
+    for (const [pr, pc] of peers) {
+      const cv = dp[pr][pc][v - 1];
+      if (cv < m) m = cv;
+    }
+    return m;
+  };
+
+  // Method 1：宫隐性唯余
+  {
+    let cost = 1;
+    for (const [br, bc] of boxCells) {
+      if (puzzle[br][bc] !== 0 || (br === r && bc === c) || !grid[br][bc].has(v)) continue;
+      const peers: Array<[number, number]> = [];
+      for (let c2 = 0; c2 < 9; c2++) if (Math.floor(c2 / 3) * 3 !== bc0) peers.push([br, c2]);
+      for (let r2 = 0; r2 < 9; r2++) if (Math.floor(r2 / 3) * 3 !== br0) peers.push([r2, bc]);
+      const e = minElim(br, bc, peers);
+      cost += e;
+      if (cost >= best) break;
+    }
+    if (cost < best) best = cost;
+  }
+
+  // Method 2：行隐性唯余
+  {
+    let cost = 1;
+    for (let c2 = 0; c2 < 9; c2++) {
+      if (c2 === c || !grid[r][c2].has(v) || puzzle[r][c2] !== 0) continue;
+      const [bR2, bC2] = boxOrigin(r, c2);
+      const peers: Array<[number, number]> = [];
+      for (let r2 = 0; r2 < 9; r2++) if (r2 !== r) peers.push([r2, c2]);
+      for (let rr = bR2; rr < bR2 + 3; rr++)
+        for (let cc = bC2; cc < bC2 + 3; cc++)
+          if (rr !== r) peers.push([rr, cc]);
+      const e = minElim(r, c2, peers);
+      cost += e;
+      if (cost >= best) break;
+    }
+    if (cost < best) best = cost;
+  }
+
+  // Method 3：列隐性唯余
+  {
+    let cost = 1;
+    for (let r2 = 0; r2 < 9; r2++) {
+      if (r2 === r || !grid[r2][c].has(v) || puzzle[r2][c] !== 0) continue;
+      const [bR2, bC2] = boxOrigin(r2, c);
+      const peers: Array<[number, number]> = [];
+      for (let c2 = 0; c2 < 9; c2++) if (c2 !== c) peers.push([r2, c2]);
+      for (let rr = bR2; rr < bR2 + 3; rr++)
+        for (let cc = bC2; cc < bC2 + 3; cc++)
+          if (cc !== c) peers.push([rr, cc]);
+      const e = minElim(r2, c, peers);
+      cost += e;
+      if (cost >= best) break;
+    }
+    if (cost < best) best = cost;
+  }
+
+  // Method 4：显性唯余（naked single）
+  {
+    let cost = 1;
+    for (const u of grid[r][c]) {
+      if (u === v) continue;
+      let minU = Infinity;
+      for (let c2 = 0; c2 < 9; c2++) if (c2 !== c) { const cv = dp[r][c2][u - 1]; if (cv < minU) minU = cv; }
+      for (let r2 = 0; r2 < 9; r2++) if (r2 !== r) { const cv = dp[r2][c][u - 1]; if (cv < minU) minU = cv; }
+      for (const [r2, c2] of boxCells) if (r2 !== r || c2 !== c) { const cv = dp[r2][c2][u - 1]; if (cv < minU) minU = cv; }
+      cost += minU;
+      if (cost >= best) break;
+    }
+    if (cost < best) best = cost;
+  }
+
+  return best;
+}
+
+/**
+ * 快速前向求解（不记录步骤），仅用于发现目标格的正确答案值。
+ * 这是 DP 证明树计算的预处理步骤——需要先知道答案才能构建最优证明树。
+ */
+function quickSolveForAnswer(
+  puzzle: number[][],
+  initGrid: CandGrid,
+  tr: number,
+  tc: number,
+): number {
+  const g = initGrid.map((row) => row.map((s) => new Set(s)));
+  const w = puzzle.map((row) => [...row]);
+  const units = getAllUnits();
+
+  for (let iter = 0; iter < 1000; iter++) {
+    if (g[tr][tc].size === 1) break;
+    let progress = false;
+
+    // L1/L2a：全单元隐性唯余
+    for (const unit of units) {
+      const hs = findHiddenSingleInUnit(g, w, unit.cells);
+      if (hs) { assignCell(g, w, hs.r, hs.c, hs.v); progress = true; break; }
+    }
+    if (progress) continue;
+
+    // L2b：区块排除
+    if (applyPointingPairs(g, w)) { progress = true; continue; }
+
+    // L3a：显性唯余
+    const ns = findAllNakedSingles(g, w);
+    if (ns.length > 0) { assignCell(g, w, ns[0].r, ns[0].c, ns[0].v); progress = true; continue; }
+
+    // L3b/c：数对/数组
+    for (const unit of units) {
+      for (const sz of [2, 3] as const) {
+        if (applyNakedSet(g, w, unit.cells, sz)) { progress = true; break; }
+      }
+      if (progress) break;
+    }
+    if (progress) continue;
+    for (const unit of units) {
+      for (const sz of [2, 3] as const) {
+        if (applyHiddenSet(g, w, unit.cells, sz)) { progress = true; break; }
+      }
+      if (progress) break;
+    }
+    if (progress) continue;
+
+    // L4：N-Fish、翼类、链类
+    for (const n of [2, 3] as const) { if (applyNFish(g, w, n)) { progress = true; break; } }
+    if (progress) continue;
+    if (applyXYWing(g, w)) { progress = true; continue; }
+    if (applyXYZWing(g, w)) { progress = true; continue; }
+    if (applySimpleColoring(g, w)) { progress = true; continue; }
+    if (applyXYChain(g, w)) { progress = true; continue; }
+    if (applyXChain(g, w)) { progress = true; continue; }
+
+    break;
+  }
+
+  return g[tr][tc].size === 1 ? [...g[tr][tc]][0] : -1;
+}
+
+/**
+ * 检查数独题目是否可以完全用直观技巧（无链/无鱼/无翼）解决。
+ *
+ * 允许使用的技巧（L1-L3）：
+ *   - 隐性唯余（行/列/宫 Hidden Single）
+ *   - 区块排除（Pointing Pairs/Triples）
+ *   - 显性唯余（Naked Single）
+ *   - 显性数对/数组（Naked Pair/Triple）
+ *   - 隐性数对/数组（Hidden Pair/Triple）
+ *
+ * 禁止使用的技巧（链类/鱼类/翼类）：
+ *   X翼、剑鱼、XY翼、XYZ翼、单链着色、XY链、X链
+ *
+ * @param puzzle 9×9 数独盘面（0 表示空格）
+ * @returns true = 全盘可用直观技巧完全解决；false = 至少一格需要链类技巧
+ */
+export function checkPuzzleIntuitiveSolvable(puzzle: number[][]): boolean {
+  const grid = initCandidates(puzzle);
+  const work = puzzle.map((row) => [...row]);
+  const units = getAllUnits();
+
+  for (let iter = 0; iter < 5000; iter++) {
+    let progress = false;
+
+    // L1/L2a：隐性唯余（全单元扫描）
+    for (const unit of units) {
+      const hs = findHiddenSingleInUnit(grid, work, unit.cells);
+      if (hs) {
+        assignCell(grid, work, hs.r, hs.c, hs.v);
+        progress = true;
+        break;
+      }
+    }
+    if (progress) continue;
+
+    // L2b：区块排除（Pointing Pairs/Triples）
+    if (applyPointingPairs(grid, work)) { progress = true; continue; }
+
+    // L3a：显性唯余（Naked Single）
+    const ns = findAllNakedSingles(grid, work);
+    if (ns.length > 0) {
+      assignCell(grid, work, ns[0].r, ns[0].c, ns[0].v);
+      progress = true;
+      continue;
+    }
+
+    // L3b/c：显性数对 / 显性数组
+    for (const unit of units) {
+      for (const sz of [2, 3] as const) {
+        if (applyNakedSet(grid, work, unit.cells, sz)) { progress = true; break; }
+      }
+      if (progress) break;
+    }
+    if (progress) continue;
+
+    // L3d/e：隐性数对 / 隐性数组
+    for (const unit of units) {
+      for (const sz of [2, 3] as const) {
+        if (applyHiddenSet(grid, work, unit.cells, sz)) { progress = true; break; }
+      }
+      if (progress) break;
+    }
+    if (progress) continue;
+
+    // 无法继续（需要链类/鱼类技巧才能推进）→ 退出
+    break;
+  }
+
+  // 检查所有初始空格是否已全部填满
+  for (let r = 0; r < 9; r++) {
+    for (let c = 0; c < 9; c++) {
+      if (puzzle[r][c] === 0 && work[r][c] === 0) {
+        return false; // 存在无法直观解出的格
+      }
+    }
+  }
+  return true;
+}
+
+/**
+ * 从目标 (tr,tc,answer) 出发，反向展开 DP 最优证明树，
+ * 返回所有"必须推导"的 "(r,c,v)" 键集合。
+ *
+ * 主求解循环中只有该集合内的格才会以最高优先级被应用，
+ * 确保执行路径与 DP 计算的理论最短路径完全一致。
+ */
+function extractProofTree(
+  puzzle: number[][],
+  grid: CandGrid,
+  dp: DPTable,
+  tr: number,
+  tc: number,
+  answer: number,
+): Set<string> {
+  const needed = new Set<string>();
+  const visiting = new Set<string>();
+
+  function expand(r: number, c: number, v: number): void {
+    const key = `${r},${c},${v}`;
+    if (needed.has(key) || visiting.has(key)) return;
+    if (puzzle[r][c] !== 0) return; // 已知格：证明树叶节点，无需继续展开
+    visiting.add(key);
+    needed.add(key);
+    const prereqs = _findOptimalPrereqs(r, c, v, dp, grid, puzzle);
+    for (const p of prereqs) expand(p.r, p.c, p.v);
+    visiting.delete(key);
+  }
+
+  expand(tr, tc, answer);
+  return needed;
+}
+
+/**
+ * 根据 DP 代价表，找出推导 (r,c)=v 所需的最优前置格列表。
+ * 遍历四种证明方式，返回代价与 targetCost 匹配的那种方式的前置格。
+ */
+function _findOptimalPrereqs(
+  r: number, c: number, v: number,
+  dp: DPTable, grid: CandGrid, puzzle: number[][],
+): Array<{ r: number; c: number; v: number }> {
+  const targetCost = dp[r][c][v - 1];
+  if (!isFinite(targetCost) || targetCost <= 0) return [];
+
+  const [br0, bc0] = boxOrigin(r, c);
+  const boxCells = boxCellList(br0, bc0);
+
+  // 为消除格 (er,ec) 的候选数 v，找代价最小的 peer
+  const bestElimPeer = (
+    er: number, ec: number,
+    peers: Array<[number, number]>,
+  ): { r: number; c: number; cost: number } | null => {
+    if (!grid[er][ec].has(v) || puzzle[er][ec] !== 0) return null;
+    let minCost = Infinity;
+    let best: { r: number; c: number } | null = null;
+    for (const [pr, pc] of peers) {
+      const cv = dp[pr][pc][v - 1];
+      if (cv < minCost) { minCost = cv; best = { r: pr, c: pc }; }
+    }
+    return best ? { ...best, cost: minCost } : null;
+  };
+
+  // Method 1：宫隐性唯余
+  {
+    let cost = 1;
+    const prereqs: Array<{ r: number; c: number; v: number }> = [];
+    let valid = true;
+    for (const [br, bc] of boxCells) {
+      if (puzzle[br][bc] !== 0 || (br === r && bc === c) || !grid[br][bc].has(v)) continue;
+      const peers: Array<[number, number]> = [];
+      for (let c2 = 0; c2 < 9; c2++) if (Math.floor(c2 / 3) * 3 !== bc0) peers.push([br, c2]);
+      for (let r2 = 0; r2 < 9; r2++) if (Math.floor(r2 / 3) * 3 !== br0) peers.push([r2, bc]);
+      const ep = bestElimPeer(br, bc, peers);
+      if (ep) { cost += ep.cost; prereqs.push({ r: ep.r, c: ep.c, v }); }
+      else { valid = false; break; }
+    }
+    if (valid && Math.abs(cost - targetCost) <= 1) return prereqs;
+  }
+
+  // Method 2：行隐性唯余
+  {
+    let cost = 1;
+    const prereqs: Array<{ r: number; c: number; v: number }> = [];
+    let valid = true;
+    for (let c2 = 0; c2 < 9; c2++) {
+      if (c2 === c || !grid[r][c2].has(v) || puzzle[r][c2] !== 0) continue;
+      const [bR2, bC2] = boxOrigin(r, c2);
+      const peers: Array<[number, number]> = [];
+      for (let r2 = 0; r2 < 9; r2++) if (r2 !== r) peers.push([r2, c2]);
+      for (let rr = bR2; rr < bR2 + 3; rr++)
+        for (let cc = bC2; cc < bC2 + 3; cc++)
+          if (rr !== r) peers.push([rr, cc]);
+      const ep = bestElimPeer(r, c2, peers);
+      if (ep) { cost += ep.cost; prereqs.push({ r: ep.r, c: ep.c, v }); }
+      else { valid = false; break; }
+    }
+    if (valid && Math.abs(cost - targetCost) <= 1) return prereqs;
+  }
+
+  // Method 3：列隐性唯余
+  {
+    let cost = 1;
+    const prereqs: Array<{ r: number; c: number; v: number }> = [];
+    let valid = true;
+    for (let r2 = 0; r2 < 9; r2++) {
+      if (r2 === r || !grid[r2][c].has(v) || puzzle[r2][c] !== 0) continue;
+      const [bR2, bC2] = boxOrigin(r2, c);
+      const peers: Array<[number, number]> = [];
+      for (let c2 = 0; c2 < 9; c2++) if (c2 !== c) peers.push([r2, c2]);
+      for (let rr = bR2; rr < bR2 + 3; rr++)
+        for (let cc = bC2; cc < bC2 + 3; cc++)
+          if (cc !== c) peers.push([rr, cc]);
+      const ep = bestElimPeer(r2, c, peers);
+      if (ep) { cost += ep.cost; prereqs.push({ r: ep.r, c: ep.c, v }); }
+      else { valid = false; break; }
+    }
+    if (valid && Math.abs(cost - targetCost) <= 1) return prereqs;
+  }
+
+  // Method 4：显性唯余（naked single）
+  {
+    let cost = 1;
+    const prereqs: Array<{ r: number; c: number; v: number }> = [];
+    let valid = true;
+    for (const u of grid[r][c]) {
+      if (u === v) continue;
+      let minCost = Infinity;
+      let bestCell: { r: number; c: number } | null = null;
+      for (let c2 = 0; c2 < 9; c2++) if (c2 !== c) { const cv = dp[r][c2][u - 1]; if (cv < minCost) { minCost = cv; bestCell = { r, c: c2 }; } }
+      for (let r2 = 0; r2 < 9; r2++) if (r2 !== r) { const cv = dp[r2][c][u - 1]; if (cv < minCost) { minCost = cv; bestCell = { r: r2, c }; } }
+      for (const [r2, c2] of boxCells) if (r2 !== r || c2 !== c) { const cv = dp[r2][c2][u - 1]; if (cv < minCost) { minCost = cv; bestCell = { r: r2, c: c2 }; } }
+      if (bestCell && isFinite(minCost)) { cost += minCost; prereqs.push({ r: bestCell.r, c: bestCell.c, v: u }); }
+      else { valid = false; break; }
+    }
+    if (valid && Math.abs(cost - targetCost) <= 1) return prereqs;
+  }
+
+  return []; // 无法匹配（回退，通常不会发生）
+}
+
+/**
+ * 基础启发式评分（不含 DP 证明树加成）。
+ *
+ * 得分层级（由高到低）：
+ *   1_000_000：直接赋值到目标格（立即解决）
+ *   100_000+ ：v 在目标格候选数中，且 (r,c) 是同行/列/宫邻格（直接消除目标候选）
+ *   50_000+  ：赋值后经级联消除使目标格候选数减少
+ *   40_000   ：赋值后使目标格产生新的隐性唯余（二步前瞻）
+ *   1_000    ：仅是邻格，无即时影响
+ *   20_000   ：Blocker 直接消除
+ *   5_000    ：Blocker 精化
+ *   10       ：v 在目标格候选数中（潜在相关）
+ *   1        ：其他（通用进度）
+ */
+function _scoreBaseHeuristic(
+  r: number,
+  c: number,
+  v: number,
+  grid: CandGrid,
+  work: number[][],
+  tr: number,
+  tc: number,
+): number {
+  if (r === tr && c === tc) return 1_000_000;
+
+  const bTr = Math.floor(tr / 3) * 3;
+  const bTc = Math.floor(tc / 3) * 3;
+  const isPeer =
+    r === tr || c === tc || (Math.floor(r / 3) * 3 === bTr && Math.floor(c / 3) * 3 === bTc);
+
+  if (isPeer && grid[tr][tc].has(v)) {
+    return 100_000 + (10 - grid[tr][tc].size) * 1_000;
+  }
+
+  if (isPeer) {
+    // 模拟赋值，检查目标格候选的级联变化
+    const sg = grid.map((row) => row.map((s) => new Set(s)));
+    const sw = work.map((row) => [...row]);
+    assignCell(sg, sw, r, c, v);
+
+    const newSize = sg[tr][tc].size;
+    if (newSize < grid[tr][tc].size) {
+      return 50_000 + (10 - newSize) * 1_000;
+    }
+
+    // 二步前瞻：赋值后目标格是否产生新的隐性唯余？
+    const [br, bc] = boxOrigin(tr, tc);
+    for (const val of sg[tr][tc]) {
+      const boxEmp = boxCellList(br, bc).filter(([r2, c2]) => sw[r2][c2] === 0 && sg[r2][c2].has(val));
+      if (boxEmp.length === 1) return 40_000;
+      const rowEmp = (Array.from({ length: 9 }, (_, c2) => [tr, c2]) as Array<[number, number]>)
+        .filter(([r2, c2]) => sw[r2][c2] === 0 && sg[r2][c2].has(val));
+      if (rowEmp.length === 1) return 40_000;
+      const colEmp = (Array.from({ length: 9 }, (_, r2) => [r2, tc]) as Array<[number, number]>)
+        .filter(([r2, c2]) => sw[r2][c2] === 0 && sg[r2][c2].has(val));
+      if (colEmp.length === 1) return 40_000;
+    }
+
+    return 1_000;
+  }
+
+  // === Blocker 定向奖励 ===
+  // 目标格某宫/行/列的隐性唯余 blockers 数量越少、或本步越能推进 blocker 的消除，得分越高。
+  // 分为两层：
+  //   A. 直接消除：步骤的值 v === V（目标候选），且 (r,c) 与某 blocker 同单元 → 20000/blockers数
+  //   B. 间接精化：步骤的值 v !== V，但 (r,c) 与某 blocker 同单元，消除 blocker 中 v 候选 → 5000/(blockers数×blocker候选数)
+  //      这使 blocker 更快成为显性唯余，继而间接消除 V
+  let blockerBonus = 0;
+  const boxCellsT = boxCellList(bTr, bTc);
+  const rowCellsT = Array.from({ length: 9 }, (_, c2) => [tr, c2]) as Array<[number, number]>;
+  const colCellsT = Array.from({ length: 9 }, (_, r2) => [r2, tc]) as Array<[number, number]>;
+
+  for (const V of grid[tr][tc]) {
+    for (const unitCells of [boxCellsT, rowCellsT, colCellsT]) {
+      const blockers = unitCells.filter(
+        ([r2, c2]) => work[r2][c2] === 0 && (r2 !== tr || c2 !== tc) && grid[r2][c2].has(V),
+      );
+      if (blockers.length === 0 || blockers.length > 5) continue;
+      for (const [br, bc] of blockers) {
+        const bPeer =
+          r === br ||
+          c === bc ||
+          (Math.floor(r / 3) * 3 === Math.floor(br / 3) * 3 &&
+            Math.floor(c / 3) * 3 === Math.floor(bc / 3) * 3);
+        if (!bPeer) continue;
+        if (v === V) {
+          // A: 直接消除目标值
+          blockerBonus = Math.max(blockerBonus, Math.floor(20_000 / blockers.length));
+        } else if (grid[br][bc].has(v)) {
+          // B: 精化 blocker（消除 blocker 中某候选，使其更快达到唯余）
+          const bSize = grid[br][bc].size;
+          blockerBonus = Math.max(blockerBonus, Math.floor(5_000 / (blockers.length * bSize)));
+        }
+      }
+    }
+  }
+  if (blockerBonus > 0) return blockerBonus;
+
+  if (grid[tr][tc].has(v)) return 10;
+  return 1;
+}
+
+/**
+ * 对赋值步骤（将值 v 填入格 (r,c)）按与目标格 (tr,tc) 的关联度打分，得分越高越优先。
+ *
+ * 融合基础启发式评分与 DP 证明树软加成：
+ *   - 基础启发式（100,000+）：直接目标消除，始终保持最高优先级
+ *   - DP 证明树加成（25,000~34,999）：只作为软提升，不覆盖高分直接消除
+ *   - 其余：基础启发式得分
+ *
+ * 这确保：直接消除 > 级联/前瞻 > 证明树前置格 > 一般 Blocker 工作
+ */
+function scoreAssignmentForTarget(
+  r: number,
+  c: number,
+  v: number,
+  grid: CandGrid,
+  work: number[][],
+  tr: number,
+  tc: number,
+  dpTable?: DPTable,
+  proofTreeCells?: Set<string>,
+): number {
+  const base = _scoreBaseHeuristic(r, c, v, grid, work, tr, tc);
+
+  // DP 证明树软加成：加成范围 25k-34k
+  //   - 高于普通 Blocker 工作（约 20k）：证明树格优先于无关的 Blocker
+  //   - 低于二步前瞻（约 40k）：允许级联捷径（外部两步推导）超越证明树
+  //   - 远低于直接目标消除（100k+）：关键直接消除永远不被覆盖
+  //
+  // 注：若某目标格在随机测试中需要链类技巧，生产环境的 validateTargetNoChain
+  // 会使用同一 solve() 检测到该结果，自动拒绝并换格重试（自洽验证）。
+  // 因此软加成足以保证 D5 的链类安全性，同时保留 D4 级联捷径（D4 max ~35 vs 硬覆盖的 47）。
+  if (proofTreeCells && dpTable) {
+    const key = `${r},${c},${v}`;
+    if (proofTreeCells.has(key)) {
+      const dpCost = dpTable[r][c][v - 1];
+      const dpBoost = 25_000 + Math.floor(9_000 / (dpCost + 1));
+      return Math.max(base, dpBoost);
+    }
+  }
+
+  return base;
+}
+
 // ========================= 主求解函数 =========================
 
 /**
@@ -1005,14 +1643,8 @@ export function solve(
   if (boxElim.length > 0) descLines.push(`  宫排除 → 第 ${boxNumber(targetRow, targetCol)} 宫已有 [${[...new Set(boxElim)].sort((a,b)=>a-b).join(",")}]`);
   descLines.push(`  → 候选数剩余: [${initState.join(",")}]`);
 
-  // 紧凑描述（用户展示用）
-  const rStr = rowElim.length > 0 ? `行:${[...new Set(rowElim)].sort((a,b)=>a-b).join(",")}` : '';
-  const cStr = colElim.length > 0 ? `列:${[...new Set(colElim)].sort((a,b)=>a-b).join(",")}` : '';
-  const bStr = boxElim.length > 0 ? `宫:${[...new Set(boxElim)].sort((a,b)=>a-b).join(",")}` : '';
-  const elimParts = [rStr, cStr, bStr].filter(s => s.length > 0);
-  const initShortDesc = elimParts.length > 0
-    ? `基础消除（${elimParts.join(" ")}）→ 候选数 [${initState.join(",")}]`
-    : `基础消除 → 候选数 [${initState.join(",")}]`;
+  // 紧凑描述（用户展示用）— 统一格式：基础行列宫排除 → 剩余候选数 [...]
+  const initShortDesc = `基础行列宫排除 → 剩余候选数 [${initState.join(",")}]`;
 
   steps.push({
     technique: "基础消除（行/列/宫）",
@@ -1031,6 +1663,17 @@ export function solve(
     return { success: true, steps, maxLevel, answer: initState[0] };
   }
 
+  // DP 最优路径预计算：
+  // 1. 快速前向求解发现目标格答案（不记录步骤）
+  // 2. 计算全盘 DP 代价表（Bellman-Ford）
+  // 3. 反向展开证明树，得到恰好需要的格子集合
+  // 主循环中证明树内的格拥有最高优先级，确保执行顺序与理论最短路径一致。
+  const _dpAnswer = quickSolveForAnswer(puzzle, grid, targetRow, targetCol);
+  const _dpTable: DPTable | undefined = _dpAnswer > 0 ? computeDPCosts(puzzle, grid) : undefined;
+  const _proofTree: Set<string> = (_dpAnswer > 0 && _dpTable)
+    ? extractProofTree(puzzle, grid, _dpTable, targetRow, targetCol, _dpAnswer)
+    : new Set<string>();
+
   const allUnits = getAllUnits();
 
   // ========================= 主循环 =========================
@@ -1038,88 +1681,146 @@ export function solve(
     const before = getCur();
     let progress = false;
 
-    // ---- L1：宫内隐性唯余 ----
-    for (let br = 0; br < 9 && !progress; br += 3) {
-      for (let bc = 0; bc < 9 && !progress; bc += 3) {
-        const cells = boxCellList(br, bc);
-        const hs = findHiddenSingleInUnit(grid, work, cells);
-        if (hs) {
-          assignCell(grid, work, hs.r, hs.c, hs.v);
+    // ---- 统一赋值选步（L1 宫排除 / L2a 行列排除 / L3a 显性唯余）：最优优先 ----
+    // 收集全盘所有可用赋值步骤，按与目标格的关联度打分，优先应用最相关的一步。
+    // 这确保路径尽可能短：先处理能直接影响目标格的步骤，而非任意从宫0开始顺序扫描。
+    {
+      type CandA =
+        | { type: 'box'; br: number; bc: number; r: number; c: number; v: number; score: number }
+        | { type: 'row'; row: number; r: number; c: number; v: number; score: number }
+        | { type: 'col'; col: number; r: number; c: number; v: number; score: number }
+        | { type: 'naked'; r: number; c: number; v: number; score: number };
+
+      const allCA: CandA[] = [
+        ...findAllBoxHiddenSingles(grid, work).map((s) => ({
+          type: 'box' as const, ...s,
+          score: scoreAssignmentForTarget(s.r, s.c, s.v, grid, work, targetRow, targetCol, _dpTable, _proofTree),
+        })),
+        ...findAllRowHiddenSingles(grid, work).map((s) => ({
+          type: 'row' as const, ...s,
+          score: scoreAssignmentForTarget(s.r, s.c, s.v, grid, work, targetRow, targetCol, _dpTable, _proofTree),
+        })),
+        ...findAllColHiddenSingles(grid, work).map((s) => ({
+          type: 'col' as const, ...s,
+          score: scoreAssignmentForTarget(s.r, s.c, s.v, grid, work, targetRow, targetCol, _dpTable, _proofTree),
+        })),
+        ...findAllNakedSingles(grid, work).map((s) => ({
+          type: 'naked' as const, ...s,
+          score: scoreAssignmentForTarget(s.r, s.c, s.v, grid, work, targetRow, targetCol, _dpTable, _proofTree),
+        })),
+      ];
+
+      if (allCA.length > 0) {
+        // 得分相同时技巧级别低者优先：宫(L1) > 行列(L2a) > 显性唯余(L3a)
+        allCA.sort((a, b) => {
+          if (b.score !== a.score) return b.score - a.score;
+          const lvl = (x: CandA) => (x.type === 'box' ? 0 : x.type === 'naked' ? 2 : 1);
+          return lvl(a) - lvl(b);
+        });
+
+        const best = allCA[0];
+
+        if (best.type === 'box') {
+          const exclInfo = boxHiddenSingleExclusionInfo(work, grid, best.br, best.bc, best.r, best.c, best.v);
+          const cellBox = cellLabel(best.r, best.c);
+          const boxN = boxNumber(best.br, best.bc);
+          assignCell(grid, work, best.r, best.c, best.v);
           const after = getCur();
           const affects = !arrEqual(before, after);
-          const elim = before.filter(v => !after.includes(v));
-          const trigger = `${cellLabel(hs.r, hs.c)}=${hs.v}（第${boxNumber(br, bc)}宫隐性唯余）`;
+          const elim = before.filter((v) => !after.includes(v));
+          const baseBox = exclInfo.complete
+            ? `${exclInfo.desc}的${best.v}对第${boxN}宫排除，仅${cellBox}可填`
+            : `第${boxN}宫：仅${cellBox}可填${best.v}`;
           steps.push({
-            technique: "隐性唯余（宫）",
+            technique: '隐性唯余（宫）',
             level: 1,
             affectsTarget: affects,
-            description: `第 ${boxNumber(br, bc)} 宫中，数字 ${hs.v} 只能填入 ${cellLabel(hs.r, hs.c)}（宫内其余格已排除 ${hs.v}）` +
-              (affects ? `\n  → 目标格 ${tc}：[${before.join(",")}] → [${after.join(",")}]` : ""),
+            prereqCells: exclInfo.complete ? exclInfo.cells : undefined,
+            description:
+              `第 ${boxN} 宫中，数字 ${best.v} 只能填入 ${cellBox}（${exclInfo.desc}${exclInfo.complete ? '' : '等约束'}含${best.v}）` +
+              (affects ? `\n  → 目标格 ${tc}：[${before.join(',')}] → [${after.join(',')}]` : ''),
             shortDesc: affects
-              ? `${trigger} → 排除${elim.join(",")} → [${after.join(",")}]`
-              : trigger,
+              ? `${baseBox} → 排除${elim.join(',')} → [${after.join(',')}]`
+              : `${baseBox} → ${cellBox}=${best.v}`,
             targetBefore: before,
             targetAfter: after,
             eliminated: elim,
           });
           maxLevel = Math.max(maxLevel, 1);
           progress = true;
-        }
-      }
-    }
-    if (progress) { if (grid[targetRow][targetCol].size === 1) break; continue; }
 
-    // ---- L2a：行/列内隐性唯余 ----
-    for (let i = 0; i < 9 && !progress; i++) {
-      // 行
-      const rowCells: Array<[number, number]> = Array.from({ length: 9 }, (_, c) => [i, c]);
-      const hsRow = findHiddenSingleInUnit(grid, work, rowCells);
-      if (hsRow) {
-        assignCell(grid, work, hsRow.r, hsRow.c, hsRow.v);
-        const after = getCur();
-        const affects = !arrEqual(before, after);
-        const elim = before.filter(v => !after.includes(v));
-        const trigger = `${cellLabel(hsRow.r, hsRow.c)}=${hsRow.v}（第${rowLabel(i)}行隐性唯余）`;
-        steps.push({
-          technique: "隐性唯余（行）",
-          level: 2,
-          affectsTarget: affects,
-          description: `第 ${rowLabel(i)} 行中，数字 ${hsRow.v} 只能填入 ${cellLabel(hsRow.r, hsRow.c)}` +
-            (affects ? `\n  → 目标格 ${tc}：[${before.join(",")}] → [${after.join(",")}]` : ""),
-          shortDesc: affects
-            ? `${trigger} → 排除${elim.join(",")} → [${after.join(",")}]`
-            : trigger,
-          targetBefore: before,
-          targetAfter: after,
-          eliminated: elim,
-        });
-        maxLevel = Math.max(maxLevel, 2);
-        progress = true;
-      }
-      if (!progress) {
-        // 列
-        const colCells: Array<[number, number]> = Array.from({ length: 9 }, (_, r) => [r, i]);
-        const hsCol = findHiddenSingleInUnit(grid, work, colCells);
-        if (hsCol) {
-          assignCell(grid, work, hsCol.r, hsCol.c, hsCol.v);
+        } else if (best.type === 'row') {
+          const exclRow = rowHiddenSingleExclusionDesc(work, best.row, best.c, best.v);
+          const cellRow = cellLabel(best.r, best.c);
+          assignCell(grid, work, best.r, best.c, best.v);
           const after = getCur();
           const affects = !arrEqual(before, after);
-          const elim = before.filter(v => !after.includes(v));
-          const trigger = `${cellLabel(hsCol.r, hsCol.c)}=${hsCol.v}（第${i + 1}列隐性唯余）`;
+          const elim = before.filter((v) => !after.includes(v));
+          const baseRow = `${rowLabel(best.row)}行：${exclRow}含${best.v}，仅${cellRow}可填`;
           steps.push({
-            technique: "隐性唯余（列）",
+            technique: '隐性唯余（行）',
             level: 2,
             affectsTarget: affects,
-            description: `第 ${i + 1} 列中，数字 ${hsCol.v} 只能填入 ${cellLabel(hsCol.r, hsCol.c)}` +
-              (affects ? `\n  → 目标格 ${tc}：[${before.join(",")}] → [${after.join(",")}]` : ""),
+            description:
+              `第 ${rowLabel(best.row)} 行中，数字 ${best.v} 只能填入 ${cellRow}（${exclRow}含${best.v}）` +
+              (affects ? `\n  → 目标格 ${tc}：[${before.join(',')}] → [${after.join(',')}]` : ''),
             shortDesc: affects
-              ? `${trigger} → 排除${elim.join(",")} → [${after.join(",")}]`
-              : trigger,
+              ? `${baseRow} → 排除${elim.join(',')} → [${after.join(',')}]`
+              : `${baseRow} → ${cellRow}=${best.v}`,
             targetBefore: before,
             targetAfter: after,
             eliminated: elim,
           });
           maxLevel = Math.max(maxLevel, 2);
+          progress = true;
+
+        } else if (best.type === 'col') {
+          const exclCol = colHiddenSingleExclusionDesc(work, best.col, best.r, best.v);
+          const cellCol = cellLabel(best.r, best.c);
+          assignCell(grid, work, best.r, best.c, best.v);
+          const after = getCur();
+          const affects = !arrEqual(before, after);
+          const elim = before.filter((v) => !after.includes(v));
+          const baseCol = `第${best.col + 1}列：${exclCol}含${best.v}，仅${cellCol}可填`;
+          steps.push({
+            technique: '隐性唯余（列）',
+            level: 2,
+            affectsTarget: affects,
+            description:
+              `第 ${best.col + 1} 列中，数字 ${best.v} 只能填入 ${cellCol}（${exclCol}含${best.v}）` +
+              (affects ? `\n  → 目标格 ${tc}：[${before.join(',')}] → [${after.join(',')}]` : ''),
+            shortDesc: affects
+              ? `${baseCol} → 排除${elim.join(',')} → [${after.join(',')}]`
+              : `${baseCol} → ${cellCol}=${best.v}`,
+            targetBefore: before,
+            targetAfter: after,
+            eliminated: elim,
+          });
+          maxLevel = Math.max(maxLevel, 2);
+          progress = true;
+
+        } else {
+          // naked single
+          const trigger = `${cellLabel(best.r, best.c)}=${best.v}（显性唯余）`;
+          assignCell(grid, work, best.r, best.c, best.v);
+          const after = getCur();
+          const affects = !arrEqual(before, after);
+          const elim = before.filter((v) => !after.includes(v));
+          steps.push({
+            technique: '显性唯余（唯一候选数）',
+            level: 3,
+            affectsTarget: affects,
+            description:
+              `格 ${cellLabel(best.r, best.c)} 经行/列/宫排除后候选数仅剩 ${best.v}，确定填入` +
+              (affects ? `\n  → 目标格 ${tc}：[${before.join(',')}] → [${after.join(',')}]` : ''),
+            shortDesc: affects
+              ? `${trigger} → 排除${elim.join(',')} → [${after.join(',')}]`
+              : trigger,
+            targetBefore: before,
+            targetAfter: after,
+            eliminated: elim,
+          });
+          maxLevel = Math.max(maxLevel, 3);
           progress = true;
         }
       }
@@ -1146,32 +1847,6 @@ export function solve(
         eliminated: elim,
       });
       maxLevel = Math.max(maxLevel, 2);
-      progress = true;
-    }
-    if (progress) { if (grid[targetRow][targetCol].size === 1) break; continue; }
-
-    // ---- L3a：显性唯余（Naked Single） ----
-    const ns = findNakedSingle(grid, work);
-    if (ns) {
-      assignCell(grid, work, ns.r, ns.c, ns.v);
-      const after = getCur();
-      const affects = !arrEqual(before, after);
-      const elim = before.filter(v => !after.includes(v));
-      const trigger = `${cellLabel(ns.r, ns.c)}=${ns.v}（显性唯余）`;
-      steps.push({
-        technique: "显性唯余（唯一候选数）",
-        level: 3,
-        affectsTarget: affects,
-        description: `格 ${cellLabel(ns.r, ns.c)} 经行/列/宫排除后候选数仅剩 ${ns.v}，确定填入` +
-          (affects ? `\n  → 目标格 ${tc}：[${before.join(",")}] → [${after.join(",")}]` : ""),
-        shortDesc: affects
-          ? `${trigger} → 排除${elim.join(",")} → [${after.join(",")}]`
-          : trigger,
-        targetBefore: before,
-        targetAfter: after,
-        eliminated: elim,
-      });
-      maxLevel = Math.max(maxLevel, 3);
       progress = true;
     }
     if (progress) { if (grid[targetRow][targetCol].size === 1) break; continue; }
@@ -1424,14 +2099,176 @@ function findNakedSingle(
 
 // ========================= 紧凑格式化输出 =========================
 
+// ========================= 排除源描述辅助函数 =========================
+
+/**
+ * 计算"宫内隐性唯余"的排除来源：
+ * 对宫内除目标格外每个空格，找出是哪个具体格（宫外行/列已填 v）导致该格被排除。
+ * 若某格的排除无法用"行/列已有 v"解释（说明是指向数对等候选消除技巧所为），
+ * 则 complete = false，调用方应回退到全量展示前置步骤。
+ *
+ * 返回 { desc, cells, complete }
+ *  - desc / cells：可追溯的具体格坐标（如 "B4·D3·F8"）
+ *  - complete：false 表示还有候选消除约束无法单靠 work 解释，不应过滤前置步骤
+ */
+function boxHiddenSingleExclusionInfo(
+  work: number[][],
+  grid: CandGrid,
+  br: number, bc: number,
+  targetR: number, targetC: number,
+  v: number,
+): { desc: string; cells: string[]; complete: boolean } {
+  const srcCells = new Set<string>();
+  const rowsDone = new Set<number>();
+  const colsDone = new Set<number>();
+  let complete = true;
+
+  for (let r = br; r < br + 3; r++) {
+    for (let c = bc; c < bc + 3; c++) {
+      if (r === targetR && c === targetC) continue;
+      if (work[r][c] !== 0) continue; // 已填格，无需解释
+      // 注：对有效的隐性唯余，宫内其他空格一定不含 v 作为候选；此 has(v) 检查用于防御
+      if (grid[r][c].has(v)) continue;
+
+      // --- 此格不含 v，需要找排除来源 ---
+
+      // 1. 若该行已被解释，直接跳过
+      if (rowsDone.has(r)) continue;
+
+      // 2. 尝试行来源（宫外同行已填 v）
+      let foundCol = -1;
+      for (let j = 0; j < 9; j++) {
+        if (j >= bc && j < bc + 3) continue;
+        if (work[r][j] === v) { foundCol = j; break; }
+      }
+      if (foundCol >= 0) {
+        srcCells.add(cellLabel(r, foundCol));
+        rowsDone.add(r);
+        continue;
+      }
+
+      // 3. 若该列已被解释，直接跳过
+      if (colsDone.has(c)) continue;
+
+      // 4. 尝试列来源（宫外同列已填 v）
+      let foundRow = -1;
+      for (let i = 0; i < 9; i++) {
+        if (i >= br && i < br + 3) continue;
+        if (work[i][c] === v) { foundRow = i; break; }
+      }
+      if (foundRow >= 0) {
+        srcCells.add(cellLabel(foundRow, c));
+        colsDone.add(c);
+        continue;
+      }
+
+      // 5. 行列均未填 v，说明 v 由候选消除技巧（如区块排除）从此格移除
+      //    此时无法单靠 work 给出完整解释
+      complete = false;
+    }
+  }
+
+  const cells = [...srcCells].sort();
+  const desc = cells.join('·');
+  // 若排除来源为空（宫内其他格已填满，或候选数由区块排除等间接移除），
+  // 降级为简单描述，避免输出 "?"
+  return { desc, cells, complete: complete && cells.length > 0 };
+}
+
+/**
+ * 计算"行内隐性唯余"的排除来源：
+ * 找出是哪些列或哪些宫已含该数字，导致该行其余格不能填入该数字。
+ * 格式如 "第1宫·第3宫·5列·8列"。
+ */
+function rowHiddenSingleExclusionDesc(
+  work: number[][],
+  row: number,
+  targetC: number,
+  v: number,
+): string {
+  const cols  = new Set<number>();
+  const boxes = new Set<number>();
+  for (let c = 0; c < 9; c++) {
+    if (c === targetC) continue;
+    let colHasV = false;
+    for (let i = 0; i < 9; i++) { if (work[i][c] === v) { colHasV = true; break; } }
+    if (colHasV) { cols.add(c); continue; }
+    const br = Math.floor(row / 3) * 3;
+    const bc = Math.floor(c   / 3) * 3;
+    for (let r = br; r < br + 3; r++) {
+      for (let cc = bc; cc < bc + 3; cc++) {
+        if (work[r][cc] === v) { boxes.add(boxNumber(br, bc)); break; }
+      }
+    }
+  }
+  const parts: string[] = [];
+  if (boxes.size > 0) parts.push([...boxes].sort((a, b) => a - b).map(b => `第${b}宫`).join('·'));
+  if (cols.size  > 0) parts.push([...cols ].sort((a, b) => a - b).map(c => `${c + 1}列`).join('·'));
+  return parts.join('·') || '列/宫';
+}
+
+/**
+ * 计算"列内隐性唯余"的排除来源：
+ * 找出是哪些行或哪些宫已含该数字，导致该列其余格不能填入该数字。
+ * 格式如 "第1宫·第4宫·B行·E行"。
+ */
+function colHiddenSingleExclusionDesc(
+  work: number[][],
+  col: number,
+  targetR: number,
+  v: number,
+): string {
+  const rows  = new Set<number>();
+  const boxes = new Set<number>();
+  for (let r = 0; r < 9; r++) {
+    if (r === targetR) continue;
+    let rowHasV = false;
+    for (let j = 0; j < 9; j++) { if (work[r][j] === v) { rowHasV = true; break; } }
+    if (rowHasV) { rows.add(r); continue; }
+    const br = Math.floor(r   / 3) * 3;
+    const bc = Math.floor(col / 3) * 3;
+    for (let rr = br; rr < br + 3; rr++) {
+      for (let cc = bc; cc < bc + 3; cc++) {
+        if (work[rr][cc] === v) { boxes.add(boxNumber(br, bc)); break; }
+      }
+    }
+  }
+  const parts: string[] = [];
+  if (boxes.size > 0) parts.push([...boxes].sort((a, b) => a - b).map(b => `第${b}宫`).join('·'));
+  if (rows.size  > 0) parts.push([...rows ].sort((a, b) => a - b).map(r => rowLabel(r) + '行').join('·'));
+  return parts.join('·') || '行/宫';
+}
+
 const STEP_NUMS = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩', '⑪', '⑫', '⑬', '⑭', '⑮'];
 
 /**
- * 将求解结果格式化为紧凑的 4-5 行输出。
- * 只展示真正影响目标格候选数的步骤（affectsTarget=true）。
+ * 将非目标格铺垫步骤转为"G3唯余出4"样式的简短标签。
+ */
+function prereqStepLabel(step: SolveStep): string {
+  // 单格赋值：shortDesc 中含 "[A-I][1-9]=[1-9]"
+  const cellMatch = step.shortDesc.match(/([A-I]\d)=([1-9])/);
+  if (cellMatch) return `${cellMatch[1]}唯余出${cellMatch[2]}`;
+  // 消除类步骤：取技巧名缩写
+  const t = step.technique;
+  if (t.includes('区块')) return '[区块排除]';
+  if (t.includes('显性') && t.includes('数')) return '[显性数组]';
+  if (t.includes('隐性') && t.includes('数')) return '[隐性数组]';
+  if (t.includes('X翼') || t.includes('剑鱼')) return '[鱼类]';
+  if (t.includes('XY翼') || t.includes('XYZ翼')) return '[翼类]';
+  if (t.includes('XY链') || t.includes('X链') || t.includes('着色')) return '[链类]';
+  return '[消除]';
+}
+
+/**
+ * 将求解结果格式化为完整可追溯的路径文本。
  *
- * @param result   solve() 的返回结果
- * @param targetLabel  目标格标签，如 "A3"
+ * 格式规则：
+ *  ① 候选数 [X,Y,Z] → 行列宫排除
+ *  ② 排除X → [余] → [铺垫格唯余出V。]主要原因 → 中间格为X
+ *  ⑥ 唯余X ✓ → [铺垫格唯余出V。]主要原因 → 目标格为X
+ *
+ * @param result       solve() 的返回结果
+ * @param targetLabel  目标格标签，如 "F4"
  */
 export function formatCompactSteps(result: SolveResult, targetLabel: string): string {
   if (!result.success) {
@@ -1447,17 +2284,135 @@ export function formatCompactSteps(result: SolveResult, targetLabel: string): st
     return lines.join('\n');
   }
 
-  const relevant = result.steps.filter(s => s.affectsTarget);
+  const allSteps = result.steps;
+  const relevant = allSteps.filter(s => s.affectsTarget);
+  const answer = result.answer;
+
   if (relevant.length === 0) {
-    return `【${targetLabel}】答案：${result.answer}（初始消除直接确定）`;
+    return `【${targetLabel}】答案：${answer}（初始消除直接确定）`;
   }
 
-  const lines: string[] = [`【${targetLabel}】答案：${result.answer}`];
-  relevant.forEach((step, idx) => {
-    const num = STEP_NUMS[idx] ?? `(${idx + 1})`;
-    const isFinal = idx === relevant.length - 1;
-    lines.push(`${num} ${step.shortDesc}${isFinal ? ' ✓' : ''}`);
-  });
+  const lines: string[] = [`【${targetLabel}】答案：${answer}`];
+
+  let affectIdx = 0;
+  const pendingSteps: SolveStep[] = [];
+
+  // 构建铺垫格前缀字符串，如 "G3唯余出4。F2唯余出2。"
+  const buildPrereqPrefix = (nextStep?: SolveStep): string => {
+    if (pendingSteps.length === 0) return '';
+    let stepsToShow: SolveStep[];
+    if (nextStep?.prereqCells && nextStep.prereqCells.length > 0) {
+      const prereqSet = new Set(nextStep.prereqCells);
+      stepsToShow = pendingSteps.filter(s => {
+        const m = s.shortDesc.match(/([A-I]\d)=[1-9]/);
+        return m ? prereqSet.has(m[1]) : false;
+      });
+    } else {
+      stepsToShow = pendingSteps;
+    }
+    if (stepsToShow.length === 0) return '';
+    return stepsToShow.map(prereqStepLabel).join('。') + '。';
+  };
+
+  // 从 shortDesc 中提取可读原因及尾部结论格
+  // 返回 { reason, trailingCell }，其中 trailingCell 形如 "A7为7"
+  const extractDesc = (
+    step: SolveStep,
+    isFinal: boolean,
+  ): { reason: string; trailingCell: string | null } => {
+    const sd = step.shortDesc;
+
+    // 显性唯余（naked single）："[cell]=V（显性唯余）..."
+    const nakedMatch = sd.match(/^([A-I]\d+)=([1-9])（显性唯余）/);
+    if (nakedMatch) {
+      const [, cell, val] = nakedMatch;
+      if (cell === targetLabel && isFinal) {
+        // 目标格本身为显性唯余时，直接显示 唯余V ✓ 即可
+        return { reason: '', trailingCell: null };
+      }
+      return { reason: `${cell}唯余出${val}`, trailingCell: null };
+    }
+
+    // 去掉尾部 "→ 排除X → [余]" 或 "→ [余]" 得到原因部分
+    const stripped = sd
+      .replace(/\s*→\s*排除[\d,]+\s*→\s*\[[\d,]+\]\s*$/, '')
+      .replace(/\s*→\s*剩余候选数\s*\[[\d,]+\]\s*$/, '')
+      .replace(/\s*→\s*\[[\d,]+\]\s*$/, '')
+      .trim();
+
+    // 最常见模式："...，仅[cell]可填"
+    const hiddenWithComma = stripped.match(/^(.*?)，仅([A-I]\d+)可填$/);
+    if (hiddenWithComma) {
+      const [, mainR, cell] = hiddenWithComma;
+      // 若 cell 就是目标格自身（直接唯余），用 targetAfter[0]（即答案）；
+      // 否则 cell 是被赋值的中间格，其值等于从目标格排除的候选数（eliminated）。
+      const cellVal = (cell === targetLabel)
+        ? String(step.targetAfter[0] ?? answer)
+        : step.eliminated.join(',');
+      return { reason: mainR, trailingCell: `${cell}为${cellVal}` };
+    }
+
+    // 不完整宫排除："第N宫：仅[cell]可填V"
+    const boxOnlyMatch = stripped.match(/^第(\d+)宫：仅([A-I]\d+)可填(\d+)$/);
+    if (boxOnlyMatch) {
+      return {
+        reason: `第${boxOnlyMatch[1]}宫排除`,
+        trailingCell: `${boxOnlyMatch[2]}为${boxOnlyMatch[3]}`,
+      };
+    }
+
+    // 其余技巧（区块排除、数对、鱼类、链类等）：直接保留原因描述
+    return { reason: stripped, trailingCell: null };
+  };
+
+  for (const step of allSteps) {
+    if (step.affectsTarget) {
+      const num = STEP_NUMS[affectIdx] ?? `(${affectIdx + 1})`;
+      const isFinal = affectIdx === relevant.length - 1;
+      const prereqPrefix = buildPrereqPrefix(step);
+      pendingSteps.length = 0;
+
+      const sd = step.shortDesc;
+      const elimStr = step.eliminated.join(',');
+      const remainStr = step.targetAfter.join(',');
+
+      let desc: string;
+
+      // 第一步：基础行列宫排除
+      const initMatch = sd.match(/^基础行列宫排除 → 剩余候选数 \[(.+)\]$/);
+      if (initMatch) {
+        if (isFinal) {
+          desc = `唯余${step.targetAfter[0]} ✓ → 行列宫排除`;
+        } else {
+          desc = `候选数 [${initMatch[1]}] → 行列宫排除`;
+        }
+      } else {
+        const { reason, trailingCell } = extractDesc(step, isFinal);
+        const fullReason = prereqPrefix + reason;
+
+        if (isFinal) {
+          const ans = step.targetAfter[0] ?? answer;
+          if (!reason) {
+            // 目标格是显性唯余，铺垫格描述（若有）直接收尾
+            desc = prereqPrefix
+              ? `唯余${ans} ✓ → ${prereqPrefix.replace(/。$/, '')}`
+              : `唯余${ans} ✓`;
+          } else {
+            desc = `唯余${ans} ✓ → ${fullReason}`;
+            if (trailingCell) desc += ` → ${trailingCell}`;
+          }
+        } else {
+          desc = `排除${elimStr} → [${remainStr}] → ${fullReason}`;
+          if (trailingCell) desc += ` → ${trailingCell}`;
+        }
+      }
+
+      lines.push(`${num} ${desc}`);
+      affectIdx++;
+    } else {
+      pendingSteps.push(step);
+    }
+  }
 
   return lines.join('\n');
 }

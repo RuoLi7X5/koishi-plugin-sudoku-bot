@@ -5,7 +5,7 @@ import { ImageRenderer } from "./renderer";
 import { UserService } from "./user";
 import { MOCK_MESSAGES } from "./mockMessages";
 import { HintManager } from "./hint";
-import { solve, formatCompactSteps } from "./solver";
+import { solve, formatCompactSteps, checkPuzzleIntuitiveSolvable } from "./solver";
 
 // ─── 目标格验证：非直观技巧集合（难度5-6出题格禁止出现）───────────────────
 //
@@ -687,34 +687,28 @@ export class SudokuGame {
 
     // ── 目标格选取 ────────────────────────────────────────────────────────
     // 难度 1-4 和 7：直接随机选取
-    // 难度 5-6：打乱后逐个验证，确保解法路径不含链/着色类技巧（直观可解）
+    // 难度 5-6：严格全盘验证 — 必须所有空格均可用直观技巧解出，否则废弃整道题重生成
     let q: { row: number; col: number };
     let preSolveText: string | undefined;
 
     if (game.difficulty === 5 || game.difficulty === 6) {
-      const candidates = shuffleArray([...emptyCells]);
-      let found = false;
-      for (const cell of candidates) {
-        const { valid, solveText } = validateTargetNoChain(puzzle, cell.row, cell.col);
-        if (valid) {
-          q = cell;
-          preSolveText = solveText;
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
-        // 极少数情况：本盘面所有空格均需链类技巧，重新生成盘面
-        logger.warn(`难度${game.difficulty}：本盘面所有空格均需链类技巧，重新生成（第${retryCount + 1}次）`);
-        if (retryCount >= 5) {
-          // 超过重试上限，降级：随机选一格（不保证直观可解，但保证游戏不卡住）
-          logger.warn(`难度${game.difficulty}：超过重试上限，降级随机选格`);
-          q = emptyCells[Math.floor(Math.random() * emptyCells.length)];
-        } else {
+      // 全盘验证：全部空格必须直观可解，一旦发现任意一格需要链类技巧 → 废弃整题
+      if (!checkPuzzleIntuitiveSolvable(puzzle)) {
+        logger.warn(
+          `难度${game.difficulty}：盘面含链类技巧，废弃整题重生成（第${retryCount + 1}次）`,
+        );
+        if (retryCount < 30) {
           await this.askNextQuestion(session, game, retryCount + 1);
           return;
         }
+        // 极罕见：超过30次重试上限，降级继续使用当前盘面
+        logger.warn(`难度${game.difficulty}：超过30次重试上限，降级使用当前盘面`);
       }
+      // 全直观可解的盘面中，任意空格均无链，直接随机选格
+      q = emptyCells[Math.floor(Math.random() * emptyCells.length)];
+      // 预计算本格的求解路径（供玩家提示缓存用，全直观题保证成功）
+      const validation = validateTargetNoChain(puzzle, q.row, q.col);
+      preSolveText = validation.solveText;
     } else {
       q = emptyCells[Math.floor(Math.random() * emptyCells.length)];
     }
