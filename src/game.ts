@@ -5,6 +5,50 @@ import { ImageRenderer } from "./renderer";
 import { UserService } from "./user";
 import { MOCK_MESSAGES } from "./mockMessages";
 import { HintManager } from "./hint";
+import { solve, formatCompactSteps } from "./solver";
+
+// ─── 目标格验证：非直观技巧集合（难度5-6出题格禁止出现）───────────────────
+//
+// 直观技巧（允许）：行/列/宫排除、隐性唯余（宫/行/列）、显性唯余、
+//                  区块排除（指向数对）、显性/隐性数对、显性/隐性数组
+//
+// 非直观技巧（禁止）：鱼类（X翼/剑鱼）、翼类（XY翼/XYZ翼）、
+//                    链/着色类（单链着色/XY链/X链）
+const CHAIN_TECHNIQUE_NAMES = new Set([
+  "X翼",       // X-Wing（N-Fish n=2）
+  "剑鱼",      // Swordfish（N-Fish n=3）
+  "XY翼",      // XY-Wing
+  "XYZ翼",     // XYZ-Wing
+  "单链着色",  // Simple Coloring
+  "XY链",      // XY-Chain
+  "X链",       // X-Chain
+]);
+
+/**
+ * 验证目标格是否可以不依赖链类技巧解出。
+ * @returns `{ valid: true, solveText }` 或 `{ valid: false }`
+ */
+function validateTargetNoChain(
+  puzzle: number[][],
+  row: number,
+  col: number,
+): { valid: boolean; solveText?: string } {
+  const result = solve(puzzle, row, col);
+  if (!result.success) return { valid: false };
+  const usedChain = result.steps.some((s) => CHAIN_TECHNIQUE_NAMES.has(s.technique));
+  if (usedChain) return { valid: false };
+  const label = `${String.fromCharCode(65 + row)}${col + 1}`;
+  return { valid: true, solveText: formatCompactSteps(result, label) };
+}
+
+/** Fisher-Yates 随机打乱数组（原地），返回原数组 */
+function shuffleArray<T>(arr: T[]): T[] {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
 
 // 每个频道独立的游戏状态
 type GameState = {
@@ -395,40 +439,21 @@ export class SudokuGame {
       return;
     }
 
-    // 调用求解（第一期：占位回复）
+    // 调用求解
     const result = this.hintManager.solveHint(record);
     if (!result.success) {
-      if (result.reason === "not_implemented") {
-        await session.send("求解功能正在开发中，敬请期待！");
+      if (result.reason === "unsolvable") {
+        await session.send("题目数据异常，无法解析。");
       } else {
+        // beyond_l3：仍有部分推导文本可展示
         await session.send(
-          "此题超出当前支持的逻辑技巧范围，无法生成推理路径。",
+          result.text ?? "此题超出当前支持的逻辑技巧范围（L4+），无法生成完整推理路径。",
         );
       }
       return;
     }
 
-    // 格式化推理路径输出（第二期才会到达这里）
-    const coord = this.formatCoord(record.targetRow, record.targetCol);
-    const levelNames = ["", "入门", "基础", "中级", "进阶", "高阶"];
-    const lines: string[] = [
-      `【${coord} 格推理路径】目标答案：${record.targetAnswer}`,
-      "",
-    ];
-    for (let i = 0; i < result.steps.length; i++) {
-      const step = result.steps[i];
-      lines.push(`步骤 ${i + 1} → ${step.technique} [L${step.level}]`);
-      lines.push(`  ${step.description}`);
-      lines.push(`  ${coord} 候选数剩余：${step.remaining.join(", ")}`);
-      lines.push("");
-    }
-    lines.push(
-      `使用技巧：${result.steps.map((s) => s.technique).join(" → ")}`,
-    );
-    lines.push(
-      `最高层级：L${result.maxLevel}（${levelNames[result.maxLevel] ?? ""}）`,
-    );
-    await session.send(lines.join("\n"));
+    await session.send(result.text);
   }
 
   async showRank(session: Session, type: string = "积分", scope?: string) {
@@ -635,8 +660,7 @@ export class SudokuGame {
     const gen = new SudokuGenerator(game.difficulty);
     const { puzzle, solution } = gen.generate();
 
-    // 随机挑选一个空格（puzzle 中值为 0 的格子）作为本题答案位置
-    // 正常情况下 solution 所有格子均为 1-9；solution[r][c] !== 0 作为生成器异常的最后兜底
+    // 收集所有有效空格
     const emptyCells: { row: number; col: number }[] = [];
     for (let r = 0; r < 9; r++) {
       for (let c = 0; c < 9; c++) {
@@ -650,12 +674,40 @@ export class SudokuGame {
       await this.askNextQuestion(session, game);
       return;
     }
-    const q = emptyCells[Math.floor(Math.random() * emptyCells.length)];
+
+    // ── 目标格选取 ────────────────────────────────────────────────────────
+    // 难度 1-4 和 7：直接随机选取
+    // 难度 5-6：打乱后逐个验证，确保解法路径不含链/着色类技巧（直观可解）
+    let q: { row: number; col: number };
+    let preSolveText: string | undefined;
+
+    if (game.difficulty === 5 || game.difficulty === 6) {
+      const logger = this.ctx.logger("sudoku");
+      const candidates = shuffleArray([...emptyCells]);
+      let found = false;
+      for (const cell of candidates) {
+        const { valid, solveText } = validateTargetNoChain(puzzle, cell.row, cell.col);
+        if (valid) {
+          q = cell;
+          preSolveText = solveText;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        // 极少数情况：本盘面所有空格均需链类技巧，重新生成盘面
+        logger.warn(`难度${game.difficulty}：本盘面所有空格均需链类技巧，重新生成`);
+        await this.askNextQuestion(session, game);
+        return;
+      }
+    } else {
+      q = emptyCells[Math.floor(Math.random() * emptyCells.length)];
+    }
 
     // 更新当前题的状态
     game.currentPuzzle = puzzle;
     game.currentSolution = solution;
-    game.currentQuestion = q;
+    game.currentQuestion = q!;
 
     // 生成本题编号并注册到 HintManager 缓存
     game.currentQuestionIdx++;
@@ -663,30 +715,31 @@ export class SudokuGame {
     this.hintManager.registerQuestion(game.channelId, questionId, {
       puzzle: puzzle.map((row) => [...row]),
       solution: solution.map((row) => [...row]),
-      targetRow: q.row,
-      targetCol: q.col,
-      targetAnswer: solution[q.row][q.col],
+      targetRow: q!.row,
+      targetCol: q!.col,
+      targetAnswer: solution[q!.row][q!.col],
       createdAt: Date.now(),
+      solveText: preSolveText, // 难度5-6验证时预计算，直接缓存
     });
 
     // 发送本题盘面图片
     const difficultyLabel = `level ${game.difficulty}`;
-    const logger = this.ctx.logger("sudoku");
+    const logger2 = this.ctx.logger("sudoku");
     try {
-      const image = await this.renderer.render(puzzle, difficultyLabel, q, questionId);
+      const image = await this.renderer.render(puzzle, difficultyLabel, q!, questionId);
       if (!image || image.length === 0) {
-        logger.error("Canvas 返回空 Buffer，图片生成失败");
+        logger2.error("Canvas 返回空 Buffer，图片生成失败");
         await session.send("⚠️ 图片生成失败，但游戏继续。");
       } else {
         await session.send(h.image(`data:image/png;base64,${image.toString("base64")}`));
-        logger.info(`第 ${game.currentRound + 1} 题盘面发送（${image.length} bytes）编号：${questionId}`);
+        logger2.info(`第 ${game.currentRound + 1} 题盘面发送（${image.length} bytes）编号：${questionId}`);
       }
     } catch (error: any) {
-      logger.error("图片渲染失败：", error);
+      logger2.error("图片渲染失败：", error);
       await session.send(`⚠️ 图片渲染失败：${error.message}\n游戏继续，请根据坐标答题。`);
     }
 
-    const coord = this.formatCoord(q.row, q.col);
+    const coord = this.formatCoord(q!.row, q!.col);
     await session.send(`第${game.currentRound + 1}题：${coord}格应该填什么？`);
 
     game.answered = false;

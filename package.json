@@ -18,7 +18,9 @@
     "game"
   ],
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "test:solver": "npm run build && node scripts/test-solver.js",
+    "test:difficulty": "npm run build && node scripts/test-difficulty.js"
   },
   "koishi": {
     "description": {

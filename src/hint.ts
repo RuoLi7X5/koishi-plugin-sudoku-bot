@@ -4,8 +4,10 @@
  * 职责：
  *  1. 前缀分配器：每轮游戏分配唯一轮次前缀（a/b/.../z/aa/ab/...），24小时后回收复用
  *  2. QuestionRecord 缓存：记录每道题的盘面、答案、目标格，24小时后自动过期
- *  3. solveHint：求解占位（第一期返回 not_implemented，第二期替换为真实算法）
+ *  3. solveHint：调用 solver.ts 完成真实逻辑推理，返回紧凑格式化结果
  */
+
+import { solve, formatCompactSteps } from "./solver";
 
 const EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 小时
 
@@ -17,21 +19,14 @@ export type QuestionRecord = {
   targetCol: number;
   targetAnswer: number;
   createdAt: number; // 毫秒时间戳
+  /** 出题时预先计算好的求解路径文本（难度5-6验证通过的格子会填入，避免玩家查询时重复计算） */
+  solveText?: string;
 };
 
-/** 单步推理记录（第二期求解算法填充） */
-export type HintStep = {
-  technique: string;  // 技巧名，如"宫排除"
-  level: number;      // 1~5
-  description: string;
-  eliminated: number[];
-  remaining: number[]; // 目标格当前剩余候选数
-};
-
-/** 求解结果 */
+/** 求解结果：直接返回格式化文本 */
 export type HintResult =
-  | { success: true; steps: HintStep[]; maxLevel: number }
-  | { success: false; reason: "unsolvable" | "not_implemented" };
+  | { success: true; text: string }
+  | { success: false; reason: "unsolvable" | "beyond_l3"; text?: string };
 
 /** 前缀注册条目 */
 type PrefixEntry = {
@@ -158,16 +153,32 @@ export class HintManager {
     return { prefix: match[1], index };
   }
 
-  // ==================== 求解（第一期占位） ====================
+  // ==================== 求解 ====================
 
   /**
-   * 求解入口。
-   * 第一期：直接返回 not_implemented，不执行任何计算。
-   * 第二期：替换为真实的 L1~L5 逻辑推理算法。
+   * 求解入口：返回格式化推理路径文本。
+   * - 若记录中已有预计算的 solveText（难度5-6出题时验证过），直接返回缓存文本，避免重复计算。
+   * - 否则（难度1-4或难度7）实时调用 solver.ts 计算。
    */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  solveHint(_record: QuestionRecord): HintResult {
-    return { success: false, reason: "not_implemented" };
+  solveHint(record: QuestionRecord): HintResult {
+    // 优先使用预计算缓存
+    if (record.solveText) {
+      return { success: true, text: record.solveText };
+    }
+
+    const targetLabel = `${String.fromCharCode(65 + record.targetRow)}${record.targetCol + 1}`;
+    const result = solve(record.puzzle, record.targetRow, record.targetCol);
+
+    if (!result.success && result.reason === "invalid_puzzle") {
+      return { success: false, reason: "unsolvable" };
+    }
+
+    const text = formatCompactSteps(result, targetLabel);
+
+    if (!result.success) {
+      return { success: false, reason: "beyond_l3", text };
+    }
+    return { success: true, text };
   }
 }
 
