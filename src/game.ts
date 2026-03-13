@@ -27,18 +27,23 @@ const CHAIN_TECHNIQUE_NAMES = new Set([
 /**
  * 验证目标格是否可以不依赖链类技巧解出。
  * @returns `{ valid: true, solveText }` 或 `{ valid: false }`
+ * 内部包含 try/catch，任何意外异常均视为"不可用格"，避免游戏卡死。
  */
 function validateTargetNoChain(
   puzzle: number[][],
   row: number,
   col: number,
 ): { valid: boolean; solveText?: string } {
-  const result = solve(puzzle, row, col);
-  if (!result.success) return { valid: false };
-  const usedChain = result.steps.some((s) => CHAIN_TECHNIQUE_NAMES.has(s.technique));
-  if (usedChain) return { valid: false };
-  const label = `${String.fromCharCode(65 + row)}${col + 1}`;
-  return { valid: true, solveText: formatCompactSteps(result, label) };
+  try {
+    const result = solve(puzzle, row, col);
+    if (!result.success) return { valid: false };
+    const usedChain = result.steps.some((s) => CHAIN_TECHNIQUE_NAMES.has(s.technique));
+    if (usedChain) return { valid: false };
+    const label = `${String.fromCharCode(65 + row)}${col + 1}`;
+    return { valid: true, solveText: formatCompactSteps(result, label) };
+  } catch {
+    return { valid: false };
+  }
 }
 
 /** Fisher-Yates 随机打乱数组（原地），返回原数组 */
@@ -89,7 +94,6 @@ type GameState = {
 export class SudokuGame {
   private ctx: Context;
   private config: Config;
-  private generator: SudokuGenerator;
   private renderer: ImageRenderer;
   private userService: UserService;
   private currentDifficulty: number;   // 全局默认难度（来自插件配置，作为兜底）
@@ -114,12 +118,10 @@ export class SudokuGame {
   constructor(
     ctx: Context,
     config: Config,
-    generator: SudokuGenerator,
     renderer: ImageRenderer,
   ) {
     this.ctx = ctx;
     this.config = config;
-    this.generator = generator;
     this.renderer = renderer;
     this.userService = new UserService(ctx);
     this.currentDifficulty = config.difficulty;
@@ -447,7 +449,7 @@ export class SudokuGame {
       } else {
         // beyond_l3：仍有部分推导文本可展示
         await session.send(
-          result.text ?? "此题超出当前支持的逻辑技巧范围（L4+），无法生成完整推理路径。",
+          result.text ?? "此题超出当前支持的推理范围，无法生成完整推理路径。",
         );
       }
       return;
@@ -516,7 +518,7 @@ export class SudokuGame {
     const title = selected.name;
 
     if (normalizedType === "rate") {
-      users = users.filter((u) => u.totalCorrect + u.totalWrong >= 5);
+      users = users.filter((u) => u.totalCorrect + u.totalWrong >= 20);
       const usersWithRate = users.map((u) => ({
         ...u,
         rate: u.totalCorrect / (u.totalCorrect + u.totalWrong) || 0,
@@ -645,7 +647,7 @@ export class SudokuGame {
 
   // ==================== 内部游戏流程 ====================
 
-  private async askNextQuestion(session: Session, game: GameState) {
+  private async askNextQuestion(session: Session, game: GameState, retryCount = 0) {
     // 确认游戏仍存在（可能被 stop 提前终止）
     if (!this.games.has(game.channelId)) return;
 
@@ -655,6 +657,8 @@ export class SudokuGame {
       await this.endGame(session, game);
       return;
     }
+
+    const logger = this.ctx.logger("sudoku");
 
     // 每道题生成一道全新盘面
     const gen = new SudokuGenerator(game.difficulty);
@@ -670,8 +674,14 @@ export class SudokuGame {
       }
     }
     if (emptyCells.length === 0) {
-      this.ctx.logger("sudoku").warn("生成题目异常：无有效空格，重新生成本轮盘面");
-      await this.askNextQuestion(session, game);
+      logger.warn("生成题目异常：无有效空格，重新生成本轮盘面");
+      if (retryCount >= 5) {
+        logger.error("连续5次生成空盘面，强制跳过本题");
+        game.currentRound++;
+        await this.askNextQuestion(session, game, 0);
+        return;
+      }
+      await this.askNextQuestion(session, game, retryCount + 1);
       return;
     }
 
@@ -682,7 +692,6 @@ export class SudokuGame {
     let preSolveText: string | undefined;
 
     if (game.difficulty === 5 || game.difficulty === 6) {
-      const logger = this.ctx.logger("sudoku");
       const candidates = shuffleArray([...emptyCells]);
       let found = false;
       for (const cell of candidates) {
@@ -696,9 +705,15 @@ export class SudokuGame {
       }
       if (!found) {
         // 极少数情况：本盘面所有空格均需链类技巧，重新生成盘面
-        logger.warn(`难度${game.difficulty}：本盘面所有空格均需链类技巧，重新生成`);
-        await this.askNextQuestion(session, game);
-        return;
+        logger.warn(`难度${game.difficulty}：本盘面所有空格均需链类技巧，重新生成（第${retryCount + 1}次）`);
+        if (retryCount >= 5) {
+          // 超过重试上限，降级：随机选一格（不保证直观可解，但保证游戏不卡住）
+          logger.warn(`难度${game.difficulty}：超过重试上限，降级随机选格`);
+          q = emptyCells[Math.floor(Math.random() * emptyCells.length)];
+        } else {
+          await this.askNextQuestion(session, game, retryCount + 1);
+          return;
+        }
       }
     } else {
       q = emptyCells[Math.floor(Math.random() * emptyCells.length)];
@@ -724,18 +739,17 @@ export class SudokuGame {
 
     // 发送本题盘面图片
     const difficultyLabel = `level ${game.difficulty}`;
-    const logger2 = this.ctx.logger("sudoku");
     try {
       const image = await this.renderer.render(puzzle, difficultyLabel, q!, questionId);
       if (!image || image.length === 0) {
-        logger2.error("Canvas 返回空 Buffer，图片生成失败");
+        logger.error("Canvas 返回空 Buffer，图片生成失败");
         await session.send("⚠️ 图片生成失败，但游戏继续。");
       } else {
         await session.send(h.image(`data:image/png;base64,${image.toString("base64")}`));
-        logger2.info(`第 ${game.currentRound + 1} 题盘面发送（${image.length} bytes）编号：${questionId}`);
+        logger.info(`第 ${game.currentRound + 1} 题盘面发送（${image.length} bytes）编号：${questionId}`);
       }
     } catch (error: any) {
-      logger2.error("图片渲染失败：", error);
+      logger.error("图片渲染失败：", error);
       await session.send(`⚠️ 图片渲染失败：${error.message}\n游戏继续，请根据坐标答题。`);
     }
 
@@ -823,7 +837,11 @@ export class SudokuGame {
     }
     const atMention = h.at(session.userId);
     const displayName = titlePrefix ? `${titlePrefix}${atMention}` : `${atMention}`;
-    await session.send(`恭喜 ${displayName} 答对！+${earned} 分（连续${participant.streak}次）。`);
+    // 格式化用时：< 60 秒显示秒数，>= 60 秒显示分秒
+    const timeStr = answerTime < 60
+      ? `${answerTime}秒`
+      : `${Math.floor(answerTime / 60)}分${answerTime % 60}秒`;
+    await session.send(`恭喜 ${displayName} 答对！+${earned} 分（连击${participant.streak}次），用时 ${timeStr}。`);
 
     game.currentRound++;
     await this.askNextQuestion(session, game);
@@ -952,11 +970,12 @@ export class SudokuGame {
 
       await session.send(message);
 
-      // ─── 提前结束：仅记录参与次数和答对次数，不计积分/成就/荣誉头衔 ───
+      // ─── 提前结束：记录参与次数、答对次数、答错次数，不计积分/成就/荣誉头衔 ───
       if (!isComplete) {
         for (const [uid, data] of participants) {
           await this.userService.updateUser(uid, {
             correctDelta: data.correct,
+            wrongDelta: data.wrong,
             roundsDelta: 1,
             guildId: game.guildId,
             username: nicknameMap.get(uid) || game.usernameCache.get(uid) || "",

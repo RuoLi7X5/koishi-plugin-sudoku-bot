@@ -57,6 +57,15 @@ export class HintManager {
     }
     const entries = this.channelPrefixes.get(channelId)!;
 
+    // 清理超过 48 小时的条目（远超 24h 过期窗口，防止 Map 无限增长）
+    const cutoff = now - EXPIRY_MS * 2;
+    const kept = entries.filter((e) => e.createdAt > cutoff);
+    if (kept.length < entries.length) {
+      this.channelPrefixes.set(channelId, kept);
+      entries.length = 0;
+      kept.forEach((e) => entries.push(e));
+    }
+
     // 找出所有已过期（可回收）条目，按字典序排序取最小
     const recyclable = entries
       .filter((e) => now - e.createdAt > EXPIRY_MS)

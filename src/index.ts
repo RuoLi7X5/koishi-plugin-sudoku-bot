@@ -1,6 +1,5 @@
 import { Context, Schema } from "koishi";
 import { SudokuGame } from "./game";
-import { SudokuGenerator } from "./generator";
 import { ImageRenderer } from "./renderer";
 
 export const name = "sudoku-bot";
@@ -136,9 +135,8 @@ export function apply(ctx: Context, config: Config) {
   );
 
   // 初始化组件
-  const generator = new SudokuGenerator(config.difficulty);
   const renderer = new ImageRenderer(ctx);
-  const game = new SudokuGame(ctx, config, generator, renderer);
+  const game = new SudokuGame(ctx, config, renderer);
 
   // 注册命令，处理 session 可能为 undefined 的情况
   // 开始游戏命令，支持可选的难度参数
