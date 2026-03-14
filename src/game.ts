@@ -273,9 +273,22 @@ export class SudokuGame {
     return this.games.has(channelId);
   }
 
-  hasTrainingInChannel(channelId?: string): boolean {
-    if (!channelId) return false;
-    return this.trainings.has(channelId);
+  hasTrainingInChannel(channelId?: string, userId?: string): boolean {
+    if (channelId && this.trainings.has(channelId)) return true;
+    if (userId && this.trainings.has(`private:${userId}`)) return true;
+    return false;
+  }
+
+  /**
+   * 返回本次会话对应的训练频道 key。
+   * 群聊：使用 channelId；私聊（channelId 为空）：若配置允许则使用 "private:{userId}"，否则返回 null。
+   */
+  private getTrainingChannelKey(session: Session): string | null {
+    if (session.channelId) return session.channelId;
+    if (this.config.trainingAllowPrivate && session.userId) {
+      return `private:${session.userId}`;
+    }
+    return null;
   }
 
   async start(session: Session, difficulty?: number) {
@@ -872,7 +885,15 @@ export class SudokuGame {
       solveText: preSolveText, // 各难度均在目标格选取时预计算，直接缓存；D7 为 undefined（实时计算）
     });
 
-    // 发送本题盘面图片
+    // ── 标记题目为"待作答"（防止发图失败时游戏卡死），须在 send 之前完成 ────────
+    game.answered = false;
+
+    // 每次出题重置无人参与超时计时器（无需等待图片发出）
+    this.resetInactivityTimer(session, game);
+
+    // ── 发送本题盘面图片 ───────────────────────────────────────────────────
+    // questionStartTime 和倒计时定时器在 finally 中（图片发出后）设置，
+    // 确保计时从玩家实际看到题目的时刻开始，答题时长和剩余倒计时更准确。
     const difficultyLabel = `level ${game.difficulty}`;
     try {
       const image = await this.renderer.render(puzzle, difficultyLabel, q!, questionId);
@@ -884,36 +905,38 @@ export class SudokuGame {
         logger.info(`第 ${game.currentRound + 1} 题盘面发送（${image.length} bytes）编号：${questionId}`);
       }
     } catch (error: any) {
-      logger.error("图片渲染失败：", error);
-      await session.send(`⚠️ 图片渲染失败：${error.message}\n游戏继续，请根据坐标答题。`);
-    }
-
-    game.answered = false;
-    game.questionStartTime = Date.now();
-
-    // 每次出题重置无人参与超时计时器
-    this.resetInactivityTimer(session, game);
-
-    if (game.currentTimeout > 0) {
-      // 有时间限制：倒计时结束后公布答案并进入下一题
-      game.timer = setTimeout(async () => {
-        const currentGame = this.games.get(game.channelId);
-        if (!currentGame || currentGame !== game) return;
-        if (!game.answered) {
-          const answer = game.currentSolution[game.currentQuestion!.row][game.currentQuestion!.col];
-          if (game.participants.size >= 2) {
-            const mockMsg = this.getRandomMock("groupMock", { answer });
-            await session.send(mockMsg);
-          } else {
-            await session.send(`时间到！答案是 ${answer}。`);
+      logger.error("图片渲染/发送失败：", error);
+      try {
+        await session.send(`⚠️ 图片发送失败，游戏继续，请根据编号 ${questionId} 继续作答。`);
+      } catch {
+        // 降级通知也失败时静默处理
+      }
+    } finally {
+      // 图片发送完成（成功或确认失败）后，开始计时并启动倒计时
+      game.questionStartTime = Date.now();
+      if (game.currentTimeout > 0) {
+        // 有时间限制：倒计时到期后公布答案并进入下一题
+        game.timer = setTimeout(async () => {
+          const currentGame = this.games.get(game.channelId);
+          if (!currentGame || currentGame !== game) return;
+          if (!game.answered) {
+            // 立即锁定，防止在 await 挂起期间玩家抢答导致 currentRound 双重递增
+            game.answered = true;
+            const answer = game.currentSolution[game.currentQuestion!.row][game.currentQuestion!.col];
+            if (game.participants.size >= 2) {
+              const mockMsg = this.getRandomMock("groupMock", { answer });
+              await session.send(mockMsg);
+            } else {
+              await session.send(`时间到！答案是 ${answer}。`);
+            }
+            game.currentRound++;
+            await this.askNextQuestion(session, game);
           }
-          game.currentRound++;
-          await this.askNextQuestion(session, game);
-        }
-      }, game.currentTimeout * 1000);
-    } else {
-      // 无时间限制：不设定时器，等待有人答对才进入下一题
-      game.timer = null;
+        }, game.currentTimeout * 1000);
+      } else {
+        // 无时间限制：不设定时器，等待玩家答对才进入下一题
+        game.timer = null;
+      }
     }
   }
 
@@ -1426,28 +1449,29 @@ export class SudokuGame {
 
   /** 开始唯余训练（指令入口） */
   async startTraining(session: Session): Promise<void> {
-    if (!session.channelId) {
-      await session.send("无法在私聊中开始唯余训练。");
+    const key = this.getTrainingChannelKey(session);
+    if (!key) {
+      await session.send("唯余训练暂不支持私聊，请在群组中使用。");
       return;
     }
-    if (this.games.has(session.channelId)) {
+    if (this.games.has(key)) {
       await session.send(`当前频道有正在进行的游戏，请先输入「${this.config.commandStop}」结束游戏后再开始唯余训练。`);
       return;
     }
-    if (this.trainings.has(session.channelId)) {
+    if (this.trainings.has(key)) {
       await session.send(`唯余训练已在进行中，输入「${this.config.commandTrainingStop}」可结束本轮训练。`);
       return;
     }
 
     const ts: TrainingSession = {
-      channelId: session.channelId,
+      channelId: key,
       startTime: Date.now(),
       currentQuestion: null,
       currentQuestionIndex: 0,
       finishedQuestions: 0,
       participants: new Map(),
     };
-    this.trainings.set(session.channelId, ts);
+    this.trainings.set(key, ts);
 
     await session.send(
       "🎯 唯余训练开始！\n盘面中恰好有一格可以用「唯余法」填入数字，输入 1-9 作答。\n输入「" +
@@ -1459,22 +1483,25 @@ export class SudokuGame {
 
   /** 结束唯余训练（指令入口） */
   async stopTraining(session: Session): Promise<void> {
-    if (!session.channelId) return;
-    const ts = this.trainings.get(session.channelId);
+    const key = this.getTrainingChannelKey(session);
+    if (!key) return;
+    const ts = this.trainings.get(key);
     if (!ts) {
       await session.send("当前没有正在进行的唯余训练。");
       return;
     }
     // 先从 map 中删除，阻止后续 handleTrainingAnswer 继续处理
-    this.trainings.delete(session.channelId);
+    this.trainings.delete(key);
     await session.send("🏁 训练结束，正在生成报告……");
     await this.finishTraining(session, ts);
   }
 
   /** 处理训练阶段的用户答案 */
   async handleTrainingAnswer(session: Session, num: number): Promise<void> {
-    if (!session.channelId || !session.userId) return;
-    const ts = this.trainings.get(session.channelId);
+    if (!session.userId) return;
+    const key = this.getTrainingChannelKey(session);
+    if (!key) return;
+    const ts = this.trainings.get(key);
     if (!ts || !ts.currentQuestion) return;
 
     const cq = ts.currentQuestion;

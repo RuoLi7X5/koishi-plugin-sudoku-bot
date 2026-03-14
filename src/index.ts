@@ -25,6 +25,7 @@ export interface Config {
   commandHint: string;
   commandTrainingStart: string;
   commandTrainingStop: string;
+  trainingAllowPrivate: boolean;
   timeout: number;
   inactivityTimeout: number;
   rounds: number;
@@ -70,6 +71,10 @@ export const Config: Schema<Config> = Schema.intersect([
     commandTrainingStart: Schema.string().default("唯余训练").description("开始唯余训练指令"),
     commandTrainingStop: Schema.string().default("结束训练").description("结束唯余训练指令"),
   }).description("命令配置"),
+
+  Schema.object({
+    trainingAllowPrivate: Schema.boolean().default(true).description("唯余训练是否允许在私聊中使用（默认开启）"),
+  }).description("唯余训练配置"),
   
   Schema.object({
     timeout: Schema.number().default(0).min(0).max(120).description("每题超时时间（秒），0 = 无时间限制"),
@@ -266,7 +271,7 @@ export function apply(ctx: Context, config: Config) {
     if (/^[1-9]$/.test(content)) {
       if (game.hasGameInChannel(session.channelId)) {
         await game.handleAnswer(session, parseInt(content));
-      } else if (game.hasTrainingInChannel(session.channelId)) {
+      } else if (game.hasTrainingInChannel(session.channelId, session.userId)) {
         await game.handleTrainingAnswer(session, parseInt(content));
       }
     }
