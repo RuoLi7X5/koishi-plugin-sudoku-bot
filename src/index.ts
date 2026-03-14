@@ -23,6 +23,8 @@ export interface Config {
   commandWear: string;
   commandUnwear: string;
   commandHint: string;
+  commandTrainingStart: string;
+  commandTrainingStop: string;
   timeout: number;
   inactivityTimeout: number;
   rounds: number;
@@ -65,6 +67,8 @@ export const Config: Schema<Config> = Schema.intersect([
     commandWear: Schema.string().default("佩戴").description("佩戴头衔命令"),
     commandUnwear: Schema.string().default("卸下").description("卸下头衔命令"),
     commandHint: Schema.string().default("获取答案").description("查询题目求解路径的指令名"),
+    commandTrainingStart: Schema.string().default("唯余训练").description("开始唯余训练指令"),
+    commandTrainingStop: Schema.string().default("结束训练").description("结束唯余训练指令"),
   }).description("命令配置"),
   
   Schema.object({
@@ -243,11 +247,28 @@ export function apply(ctx: Context, config: Config) {
       return game.showHint(session, questionId);
     });
 
-  // 监听消息（抢答）—— 先快速检查当前频道是否有游戏，避免处理无关消息
+  ctx.command(config.commandTrainingStart).action(({ session }) => {
+    if (!session) return "无法获取会话信息";
+    return game.startTraining(session);
+  });
+
+  ctx.command(config.commandTrainingStop).action(({ session }) => {
+    if (!session) return "无法获取会话信息";
+    return game.stopTraining(session);
+  });
+
+  // 监听消息（抢答 / 训练答题）—— 先快速检查当前频道是否有游戏，避免处理无关消息
   ctx.middleware(async (session, next) => {
-    const content = session.content?.trim() ?? "";
-    if (/^[1-9]$/.test(content) && game.hasGameInChannel(session.channelId)) {
-      await game.handleAnswer(session, parseInt(content));
+    // 去除首尾空白，并剥离移动端输入法常见的尾部自动标点（句号、叹号、问号等），
+    // 确保用户输入 "5。" 或 "5." 也能被正确识别为答案 "5"。
+    const raw = session.content?.trim() ?? "";
+    const content = raw.replace(/[。.！!？?，,、～~]+$/, "");
+    if (/^[1-9]$/.test(content)) {
+      if (game.hasGameInChannel(session.channelId)) {
+        await game.handleAnswer(session, parseInt(content));
+      } else if (game.hasTrainingInChannel(session.channelId)) {
+        await game.handleTrainingAnswer(session, parseInt(content));
+      }
     }
     return next();
   });

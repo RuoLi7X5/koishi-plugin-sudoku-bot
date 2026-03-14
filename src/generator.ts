@@ -19,7 +19,24 @@ export class SudokuGenerator {
     //   6: sudoku-gen expert       （困难+）  avg ~34 步
     //   7: @forfuns/sudoku level 4 （极难）
     const useForfuns = [2, 4, 7].includes(this.difficulty);
-    return useForfuns ? this.generateWithForfuns() : this.generateWithSudokuGen();
+
+    // 生成并验证：要求至少 20 个空格（正常谜题 30-65 个，20 作为安全下限）。
+    // 极个别情况下第三方库会返回全填满盘面或极少空格盘面，直接拒绝并重试。
+    const MIN_EMPTY = 20;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const result = useForfuns ? this.generateWithForfuns() : this.generateWithSudokuGen();
+        const emptyCount = result.puzzle.flat().filter(v => v === 0).length;
+        if (emptyCount >= MIN_EMPTY) return result;
+        console.warn(`[Sudoku] 盘面空格数不足（${emptyCount} 格），第 ${attempt + 1} 次重试`);
+      } catch (err) {
+        console.warn(`[Sudoku] 生成器异常，第 ${attempt + 1} 次重试:`, err);
+      }
+    }
+
+    // 5 次重试均不满足要求，降级到 dachev/sudoku 兜底（不支持难度，但保证有效）
+    console.error("[Sudoku] 主生成器多次失败，降级到 dachev/sudoku");
+    return this.generateWithDachev();
   }
 
   // ── sudoku-gen 路径（档位 1 / 3 / 5 / 6） ──────────────────────────────

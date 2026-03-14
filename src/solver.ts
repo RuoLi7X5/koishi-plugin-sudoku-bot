@@ -7,7 +7,8 @@
  *       区块排除（Pointing Pairs/Triples）
  *  L3：显性唯余（Naked Single）、显性数对/数组（Naked Pair/Triple）、
  *       隐性数对/数组（Hidden Pair/Triple）
- *  L4/L5：预留，当前返回 unsolvable
+ *  L4：N-Fish（X翼/剑鱼）、XY翼、XYZ翼、单链着色（Simple Coloring）
+ *  L5：X链（X-Chain）、XY链（XY-Chain）
  *
  * 不使用回溯/试探法，只进行纯逻辑推导。
  */

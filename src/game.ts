@@ -1,7 +1,7 @@
 import { Context, Session, h } from "koishi";
 import { Config } from "./index";
 import { SudokuGenerator } from "./generator";
-import { ImageRenderer } from "./renderer";
+import { ImageRenderer, TrainingRenderData } from "./renderer";
 import { UserService } from "./user";
 import { MOCK_MESSAGES } from "./mockMessages";
 import { HintManager } from "./hint";
@@ -55,6 +55,72 @@ function shuffleArray<T>(arr: T[]): T[] {
   return arr;
 }
 
+// ─── 目标格难度筛选标准 ──────────────────────────────────────────────────────
+//
+// 仅靠盘面整体难度（生成器等级）无法保证目标格的体感难度符合标注，
+// 因为同一张盘面中不同格的推导复杂度差异悬殊。
+// 此处根据求解器的最短路径长度（pathLength）和是否包含 L3 技巧，
+// 在目标格选取阶段增加一层精细筛选，确保玩家感受到的难度符合预期。
+//
+// minSteps / maxSteps：确定该格所需的最少步骤数范围（含最终填数步）
+// requireL3         ：路径中是否必须至少含一个 L3 技巧步骤（数对/数组/显性唯余）
+const DIFFICULTY_TARGET_CRITERIA: Record<
+  number,
+  { minSteps: number; maxSteps: number; requireL3: boolean }
+> = {
+  1: { minSteps: 1, maxSteps: 2,        requireL3: false }, // 简单：1-2步，直观可见
+  2: { minSteps: 2, maxSteps: 4,        requireL3: false }, // 较易：2-4步
+  3: { minSteps: 3, maxSteps: 6,        requireL3: false }, // 中等：3-6步
+  4: { minSteps: 5, maxSteps: 9,        requireL3: false }, // 中等+：5-9步
+  5: { minSteps: 7, maxSteps: 13,       requireL3: true  }, // 困难：7-13步，至少1个L3
+  6: { minSteps: 10, maxSteps: Infinity, requireL3: true  }, // 困难+：10步+，至少1个L3
+};
+
+/**
+ * 严格检查目标格的求解路径是否符合指定难度标准。
+ * D7 不受限制，始终返回 true。
+ */
+function checkTargetDifficultyMatch(
+  steps: Array<{ level: number; technique: string }>,
+  difficulty: number,
+): boolean {
+  const criteria = DIFFICULTY_TARGET_CRITERIA[difficulty];
+  if (!criteria) return true;
+  const len = steps.length;
+  if (len < criteria.minSteps || len > criteria.maxSteps) return false;
+  if (criteria.requireL3 && !steps.some((s) => s.level >= 3)) return false;
+  return true;
+}
+
+// ─── 唯余训练相关类型 ──────────────────────────────────────────────────────────
+
+/** 单道训练题的运行状态 */
+type TrainingQuestion = {
+  answer: number;
+  questionStartTime: number;          // 出题时间戳
+  wrongAttempts: Map<string, number>; // userId → 本题错误次数
+};
+
+/** 每个参与训练玩家的累计数据 */
+type TrainingParticipant = {
+  userId: string;
+  username: string;
+  correct: number;  // 答对题数
+  wrong: number;    // 答错总次数
+  /** 每道答对题的 { 题号, 用时(ms) } */
+  correctAnswers: Array<{ questionIndex: number; elapsedMs: number }>;
+};
+
+/** 唯余训练会话 */
+type TrainingSession = {
+  channelId: string;
+  startTime: number;
+  currentQuestion: TrainingQuestion | null;
+  currentQuestionIndex: number;       // 已出题序号（1-based）
+  finishedQuestions: number;          // 已正确作答的题目总数
+  participants: Map<string, TrainingParticipant>;
+};
+
 // 每个频道独立的游戏状态
 type GameState = {
   channelId: string;
@@ -106,6 +172,9 @@ export class SudokuGame {
 
   // 多频道游戏状态表（key = channelId）
   private games: Map<string, GameState> = new Map();
+
+  // 多频道唯余训练状态表（key = channelId）
+  private trainings: Map<string, TrainingSession> = new Map();
 
   // 难度名称映射
   private static readonly DIFFICULTY_NAMES = [
@@ -191,6 +260,10 @@ export class SudokuGame {
       "",
       "🔍 求解指引",
       `  ${c.commandHint} a1 - 查询题目 a1 的推理解法（游戏结束后可用，24小时内有效）`,
+    "",
+    "🎯 唯余训练",
+    `  ${c.commandTrainingStart} - 开始唯余训练（无限模式，找出盘面中唯一的缺失数字）`,
+    `  ${c.commandTrainingStop} - 结束本轮训练并查看统计报告`,
     ].join("\n");
     await session.send(message);
   }
@@ -198,6 +271,11 @@ export class SudokuGame {
   hasGameInChannel(channelId?: string): boolean {
     if (!channelId) return false;
     return this.games.has(channelId);
+  }
+
+  hasTrainingInChannel(channelId?: string): boolean {
+    if (!channelId) return false;
+    return this.trainings.has(channelId);
   }
 
   async start(session: Session, difficulty?: number) {
@@ -209,6 +287,11 @@ export class SudokuGame {
 
     if (this.games.has(session.channelId)) {
       await session.send("当前已有游戏在进行中，请稍后。");
+      return;
+    }
+
+    if (this.trainings.has(session.channelId)) {
+      await session.send(`当前频道正在进行唯余训练，请先输入「${this.config.commandTrainingStop}」结束训练后再开始游戏。`);
       return;
     }
 
@@ -420,15 +503,19 @@ export class SudokuGame {
 
     const { prefix } = parsed;
 
-    // 游戏进行中时，禁止查询当前轮次的题目（历史轮次不受限）
+    // 统一小写（提前计算，供后续封锁判断和缓存查找共用）
+    const normalizedId = rawId.trim().toLowerCase();
+
+    // 游戏进行中时，仅禁止查询「当前正在作答、尚未揭晓答案」的题目。
+    // 本局已经出过并公布答案的历史题（如第 1~4 题），允许正常查询推理路径。
     const game = this.games.get(session.channelId);
     if (game && game.currentPrefix === prefix) {
-      await session.send("本轮游戏尚未结束，无法查询当前题目答案。");
-      return;
+      const currentQuestionId = `${game.currentPrefix}${game.currentQuestionIdx}`.toLowerCase();
+      if (normalizedId === currentQuestionId) {
+        await session.send("当前题目尚未揭晓，无法提前查询答案。");
+        return;
+      }
     }
-
-    // 统一小写再查缓存
-    const normalizedId = rawId.trim().toLowerCase();
     const record = this.hintManager.getQuestion(session.channelId, normalizedId);
 
     if (!record) {
@@ -677,6 +764,7 @@ export class SudokuGame {
       logger.warn("生成题目异常：无有效空格，重新生成本轮盘面");
       if (retryCount >= 5) {
         logger.error("连续5次生成空盘面，强制跳过本题");
+        await session.send("⚠️ 本题盘面生成异常，已自动跳过，进入下一题。");
         game.currentRound++;
         await this.askNextQuestion(session, game, 0);
         return;
@@ -685,14 +773,20 @@ export class SudokuGame {
       return;
     }
 
-    // ── 目标格选取 ────────────────────────────────────────────────────────
-    // 难度 1-4 和 7：直接随机选取
-    // 难度 5-6：严格全盘验证 — 必须所有空格均可用直观技巧解出，否则废弃整道题重生成
-    let q: { row: number; col: number };
+    // ── 目标格选取（含难度适配筛选）────────────────────────────────────────────
+    //
+    // 核心逻辑：通过 pickTargetCell 对目标格施加路径步骤数约束，
+    // 确保不同难度的目标格实际体感与难度标注一致。
+    //
+    // D1-D3：严格模式——无符合格则重新生成整道题（最多重试20次）
+    // D4   ：严格优先——无严格匹配时方案C兜底（最接近目标步骤数的格）
+    // D5-D6：先验证整题无链，再精选步骤数符合标准的目标格；无严格匹配时方案C兜底
+    // D7   ：不限制步骤，直接随机选格
+    let q: { row: number; col: number } | undefined;
     let preSolveText: string | undefined;
 
     if (game.difficulty === 5 || game.difficulty === 6) {
-      // 全盘验证：全部空格必须直观可解，一旦发现任意一格需要链类技巧 → 废弃整题
+      // D5/D6：先确保整题可用直观技巧解（无链类技巧格），再精选目标格
       if (!checkPuzzleIntuitiveSolvable(puzzle)) {
         logger.warn(
           `难度${game.difficulty}：盘面含链类技巧，废弃整题重生成（第${retryCount + 1}次）`,
@@ -701,29 +795,63 @@ export class SudokuGame {
           await this.askNextQuestion(session, game, retryCount + 1);
           return;
         }
-        // 极罕见：超过30次重试上限，降级继续使用当前盘面
         logger.warn(`难度${game.difficulty}：超过30次重试上限，降级使用当前盘面`);
       }
-      // 全直观可解的盘面中，任意空格均无链，直接随机选格
-      q = emptyCells[Math.floor(Math.random() * emptyCells.length)];
-      // 预计算本格的求解路径（供玩家提示缓存用，全直观题保证成功）
-      const validation = validateTargetNoChain(puzzle, q.row, q.col);
-      preSolveText = validation.solveText;
-    } else {
-      q = emptyCells[Math.floor(Math.random() * emptyCells.length)];
-      // D1-D4：出题时预计算最短路径解法文本，玩家查询提示时直接返回缓存，无需重复计算。
-      // D7（极难）跳过预计算：该难度允许链类技巧，提示请求时实时推导更灵活（可显示部分路径）。
-      if (game.difficulty <= 4) {
-        try {
-          const preResult = solve(puzzle, q.row, q.col);
-          if (preResult.success) {
-            const preLabel = `${String.fromCharCode(65 + q.row)}${q.col + 1}`;
-            preSolveText = formatCompactSteps(preResult, preLabel);
-          }
-        } catch {
-          // 预计算失败不影响出题，玩家查询提示时仍可实时推导
+
+      // 扫描所有空格，按步骤难度标准筛选目标格；无严格匹配时方案C兜底
+      const r56 = this.pickTargetCell(puzzle, emptyCells, game.difficulty);
+      if (r56.q) {
+        q = r56.q;
+        preSolveText = r56.preSolveText;
+        if (!r56.matched) {
+          logger.warn(`难度${game.difficulty}：无严格匹配格，已使用方案C兜底（步骤最接近格）`);
         }
+      } else {
+        // pickTargetCell 返回无格（极罕见），随机取格并预计算
+        q = emptyCells[Math.floor(Math.random() * emptyCells.length)];
+        const fv = validateTargetNoChain(puzzle, q.row, q.col);
+        preSolveText = fv.solveText;
       }
+
+    } else if (game.difficulty >= 1 && game.difficulty <= 4) {
+      // D1-D4：按步骤难度精选目标格
+      const rDiff = this.pickTargetCell(puzzle, emptyCells, game.difficulty);
+
+      if (rDiff.matched) {
+        // 严格匹配
+        q = rDiff.q!;
+        preSolveText = rDiff.preSolveText;
+
+      } else if (game.difficulty >= 4 && rDiff.q) {
+        // D4 方案C：无严格匹配但有近似格，降级使用
+        logger.warn(`难度4：无严格匹配格，使用方案C兜底（步骤最接近目标区间中点的格）`);
+        q = rDiff.q;
+        preSolveText = rDiff.preSolveText;
+
+      } else {
+        // D1-D3：无严格匹配 → 重生成
+        // D4：连近似格也没有（全为链类技巧格，极罕见）→ 重生成
+        if (retryCount < 20) {
+          logger.warn(
+            `难度${game.difficulty}：${rDiff.q ? "无符合步骤要求的目标格" : "无有效目标格（全链）"}，重生成（第${retryCount + 1}次）`,
+          );
+          await this.askNextQuestion(session, game, retryCount + 1);
+          return;
+        }
+        // 超限降级（极罕见）
+        logger.warn(`难度${game.difficulty}：超过20次重试，降级随机选格`);
+        q = rDiff.q ?? emptyCells[Math.floor(Math.random() * emptyCells.length)];
+        preSolveText = rDiff.preSolveText;
+      }
+
+    } else {
+      // D7：不限制步骤和技巧，直接随机选格
+      q = emptyCells[Math.floor(Math.random() * emptyCells.length)];
+    }
+
+    // 最终兜底（极端情况，正常流程不应到达此处）
+    if (!q) {
+      q = emptyCells[Math.floor(Math.random() * emptyCells.length)];
     }
 
     // 更新当前题的状态
@@ -741,7 +869,7 @@ export class SudokuGame {
       targetCol: q!.col,
       targetAnswer: solution[q!.row][q!.col],
       createdAt: Date.now(),
-      solveText: preSolveText, // 难度5-6验证时预计算，直接缓存
+      solveText: preSolveText, // 各难度均在目标格选取时预计算，直接缓存；D7 为 undefined（实时计算）
     });
 
     // 发送本题盘面图片
@@ -759,9 +887,6 @@ export class SudokuGame {
       logger.error("图片渲染失败：", error);
       await session.send(`⚠️ 图片渲染失败：${error.message}\n游戏继续，请根据坐标答题。`);
     }
-
-    const coord = this.formatCoord(q!.row, q!.col);
-    await session.send(`第${game.currentRound + 1}题：${coord}格应该填什么？`);
 
     game.answered = false;
     game.questionStartTime = Date.now();
@@ -904,14 +1029,22 @@ export class SudokuGame {
    *   - false（提前结束）：仅记录参与次数和答对次数，不结算积分/成就/荣誉头衔。
    */
   private async endGame(session: Session, game: GameState, isComplete = true) {
-    if (game.timer) clearTimeout(game.timer);
+    if (game.timer) { clearTimeout(game.timer); game.timer = null; }
     if (game.inactivityTimer) clearTimeout(game.inactivityTimer);
     game.inactivityTimer = null;
     this.games.delete(game.channelId);
 
     const participants = Array.from(game.participants.entries());
     if (participants.length > 0) {
-      const sorted = participants.sort((a, b) => b[1].score - a[1].score);
+      // 三级排序：① 积分高者靠前 ② 同分时答对数多者靠前 ③ 再同时答错数少者靠前
+      // 三级标准大幅消除并列情况，使垫底判定更精确
+      const sorted = participants.sort((a, b) => {
+        const scoreDiff = b[1].score - a[1].score;
+        if (scoreDiff !== 0) return scoreDiff;
+        const correctDiff = b[1].correct - a[1].correct;
+        if (correctDiff !== 0) return correctDiff;
+        return a[1].wrong - b[1].wrong;
+      });
 
       // ── 1. 预加载用户数据（单次 DB 读取，供排行榜头衔展示 + 昵称兜底 + prevConsecutiveLastPlaces）──
       const preUpdateUsers = new Map<string, any>();
@@ -993,11 +1126,17 @@ export class SudokuGame {
 
       // 以下仅完整完成时执行 ↓↓↓
 
-      // 垫底判定
+      // 垫底判定：以三级排序末名的综合表现为基准，精确区分"唯一垫底"与"并列垫底"
       const isMultiPlayer = participants.length > 1;
-      const lowestScore = sorted[sorted.length - 1][1].score;
+      const lastData = isMultiPlayer ? sorted[sorted.length - 1][1] : null;
+      // 三级标准完全相同才视为"与末名并列"
+      const isCompositeLastPlace = (d: typeof sorted[0][1]): boolean =>
+        lastData !== null &&
+        d.score === lastData.score &&
+        d.correct === lastData.correct &&
+        d.wrong === lastData.wrong;
       const lowestCount = isMultiPlayer
-        ? sorted.filter(([, d]) => d.score === lowestScore).length
+        ? sorted.filter(([, d]) => isCompositeLastPlace(d)).length
         : 0;
 
       // 从预加载数据取 prevConsecutiveLastPlaces（无额外 DB 查询）
@@ -1014,11 +1153,12 @@ export class SudokuGame {
         const isMVP = uid === mvpUserId;
         let isLastPlace: boolean | undefined;
         if (isMultiPlayer) {
-          if (data.score === lowestScore && lowestCount === 1) {
-            isLastPlace = true;
-          } else if (data.score > lowestScore) {
-            isLastPlace = false;
+          if (isCompositeLastPlace(data) && lowestCount === 1) {
+            isLastPlace = true;   // 三级标准均最差且唯一
+          } else if (!isCompositeLastPlace(data)) {
+            isLastPlace = false;  // 三级标准至少有一项优于末名
           }
+          // isCompositeLastPlace(data) && lowestCount > 1：三级标准完全相同（极罕见），不计入连续垫底
         }
         const updated = await this.userService.updateUser(uid, {
           scoreDelta: data.score,
@@ -1070,7 +1210,13 @@ export class SudokuGame {
           ...session,
           userId: uid,
           username,
-          send: (msg: string) => session.bot.sendMessage(game.channelId, msg),
+          send: async (msg: string) => {
+            try {
+              await session.bot.sendMessage(game.channelId, msg);
+            } catch (err) {
+              this.ctx.logger("sudoku").warn(`成就通知发送失败（uid=${uid}）：${err}`);
+            }
+          },
         } as any;
 
         await this.userService.checkAchievements(uid, {
@@ -1185,17 +1331,373 @@ export class SudokuGame {
     ) ?? "";
   }
 
-  private getRandomMock(type: "groupMock" | "singleMock", params: Record<string, any>): string {
+  private getRandomMock(type: "groupMock" | "singleMock" | "trainingMock", params: Record<string, any>): string {
     const messages = this.mockMessages[type];
     const template = messages[Math.floor(Math.random() * messages.length)];
     return template.replace(/\{(\w+)\}/g, (_, key) => params[key] || "");
   }
 
-  private formatCoord(row: number, col: number): string {
-    // 行用字母（A=第1行，从上往下），列用数字（1=第1列，从左往右）
-    // 与玩家直觉一致：A6 = 第A行第6列
-    const rowLetter = String.fromCharCode(65 + row); // A-I（行，从上到下）
-    return `${rowLetter}${col + 1}`; // 列 1-9（从左到右）
+  /**
+   * 从空格列表中按难度标准筛选最合适的目标格。
+   *
+   * 返回值说明：
+   *   matched=true,  q=格  → 严格符合当前难度的目标格
+   *   matched=false, q=格  → 无严格匹配，返回步骤数最接近目标区间的格（方案C兜底）
+   *   matched=false, q=undefined → 无任何有效格（全部需要链类技巧，D1-D4 极罕见）
+   *
+   * 扫描策略：
+   *   D1-D3：找到首个严格匹配即停止（减少计算量，盘面通常有大量符合格）
+   *   D4-D6：累积至多3个严格匹配后停止（保留随机性），无严格匹配则方案C兜底
+   */
+  private pickTargetCell(
+    puzzle: number[][],
+    emptyCells: Array<{ row: number; col: number }>,
+    difficulty: number,
+  ): { q?: { row: number; col: number }; preSolveText?: string; matched: boolean } {
+    const shuffled = shuffleArray([...emptyCells]);
+
+    const strictMatches: Array<{ cell: { row: number; col: number }; solveText: string }> = [];
+    const fallbackCells: Array<{
+      cell: { row: number; col: number };
+      solveText: string;
+      pathLen: number;
+    }> = [];
+
+    for (const cell of shuffled) {
+      let result: ReturnType<typeof solve>;
+      try {
+        result = solve(puzzle, cell.row, cell.col);
+      } catch {
+        continue;
+      }
+      if (!result.success) continue;
+
+      // D1-D4：逐格排查链类技巧（D5-D6 由整题 checkPuzzleIntuitiveSolvable 保证无链）
+      if (difficulty <= 4) {
+        if ((result.steps as any[]).some((s) => CHAIN_TECHNIQUE_NAMES.has(s.technique))) {
+          continue;
+        }
+      }
+
+      const label = `${String.fromCharCode(65 + cell.row)}${cell.col + 1}`;
+      const solveText = formatCompactSteps(result, label);
+      const pathLen = result.steps.length;
+
+      if (checkTargetDifficultyMatch(result.steps as any, difficulty)) {
+        strictMatches.push({ cell, solveText });
+        // D1-D3：首个匹配即停；D4-D6：积累3个后停（兼顾随机性与性能）
+        const threshold = difficulty <= 3 ? 1 : 3;
+        if (strictMatches.length >= threshold) break;
+      } else {
+        fallbackCells.push({ cell, solveText, pathLen });
+      }
+    }
+
+    // ── 有严格匹配：随机取一个 ────────────────────────────────────────────────
+    if (strictMatches.length > 0) {
+      const chosen = strictMatches[Math.floor(Math.random() * strictMatches.length)];
+      return { q: chosen.cell, preSolveText: chosen.solveText, matched: true };
+    }
+
+    // ── 无严格匹配：方案C——步骤数最接近目标区间的格 ─────────────────────────
+    if (fallbackCells.length === 0) {
+      return { matched: false }; // 无任何有效格（D1-D4 中极罕见）
+    }
+
+    const criteria = DIFFICULTY_TARGET_CRITERIA[difficulty];
+    if (criteria) {
+      if (difficulty === 6) {
+        // D6 倾向步骤数越多越好
+        fallbackCells.sort((a, b) => b.pathLen - a.pathLen);
+      } else {
+        // 其余难度向区间中点靠近
+        const mid = (criteria.minSteps + Math.min(criteria.maxSteps, criteria.minSteps + 10)) / 2;
+        fallbackCells.sort((a, b) => Math.abs(a.pathLen - mid) - Math.abs(b.pathLen - mid));
+      }
+    }
+
+    const best = fallbackCells[0];
+    return { q: best.cell, preSolveText: best.solveText, matched: false };
+  }
+
+  // ══════════════════════════════════════════════════════
+  // 唯余训练模式
+  // ══════════════════════════════════════════════════════
+
+  /** 开始唯余训练（指令入口） */
+  async startTraining(session: Session): Promise<void> {
+    if (!session.channelId) {
+      await session.send("无法在私聊中开始唯余训练。");
+      return;
+    }
+    if (this.games.has(session.channelId)) {
+      await session.send(`当前频道有正在进行的游戏，请先输入「${this.config.commandStop}」结束游戏后再开始唯余训练。`);
+      return;
+    }
+    if (this.trainings.has(session.channelId)) {
+      await session.send(`唯余训练已在进行中，输入「${this.config.commandTrainingStop}」可结束本轮训练。`);
+      return;
+    }
+
+    const ts: TrainingSession = {
+      channelId: session.channelId,
+      startTime: Date.now(),
+      currentQuestion: null,
+      currentQuestionIndex: 0,
+      finishedQuestions: 0,
+      participants: new Map(),
+    };
+    this.trainings.set(session.channelId, ts);
+
+    await session.send(
+      "🎯 唯余训练开始！\n盘面中恰好有一格可以用「唯余法」填入数字，输入 1-9 作答。\n输入「" +
+      this.config.commandTrainingStop +
+      "」可结束本轮训练并查看报告。",
+    );
+    await this.nextTrainingQuestion(session, ts);
+  }
+
+  /** 结束唯余训练（指令入口） */
+  async stopTraining(session: Session): Promise<void> {
+    if (!session.channelId) return;
+    const ts = this.trainings.get(session.channelId);
+    if (!ts) {
+      await session.send("当前没有正在进行的唯余训练。");
+      return;
+    }
+    // 先从 map 中删除，阻止后续 handleTrainingAnswer 继续处理
+    this.trainings.delete(session.channelId);
+    await session.send("🏁 训练结束，正在生成报告……");
+    await this.finishTraining(session, ts);
+  }
+
+  /** 处理训练阶段的用户答案 */
+  async handleTrainingAnswer(session: Session, num: number): Promise<void> {
+    if (!session.channelId || !session.userId) return;
+    const ts = this.trainings.get(session.channelId);
+    if (!ts || !ts.currentQuestion) return;
+
+    const cq = ts.currentQuestion;
+    const username = this.captureUsername(session) || session.userId;
+
+    // 确保参与者记录存在
+    if (!ts.participants.has(session.userId)) {
+      ts.participants.set(session.userId, {
+        userId: session.userId,
+        username,
+        correct: 0,
+        wrong: 0,
+        correctAnswers: [],
+      });
+    }
+    const participant = ts.participants.get(session.userId)!;
+    // 更新昵称（可能改过）
+    participant.username = username;
+
+    if (num !== cq.answer) {
+      // 答错：记录，嘲讽，继续等待
+      cq.wrongAttempts.set(session.userId, (cq.wrongAttempts.get(session.userId) ?? 0) + 1);
+      participant.wrong++;
+      const mockMsg = this.getRandomMock("trainingMock", { user: username });
+      await session.send(mockMsg);
+      return;
+    }
+
+    // 答对
+    const elapsed = Date.now() - cq.questionStartTime;
+    participant.correct++;
+    participant.correctAnswers.push({
+      questionIndex: ts.currentQuestionIndex,
+      elapsedMs: elapsed,
+    });
+    ts.finishedQuestions++;
+    ts.currentQuestion = null;
+
+    // 简短反馈
+    await session.send(`✅ 答对了！（${(elapsed / 1000).toFixed(1)}s）`);
+
+    // 检查训练是否已被停止（stopTraining 可能在 await 期间调用）
+    if (!this.trainings.has(ts.channelId)) return;
+
+    // 出下一题
+    await this.nextTrainingQuestion(session, ts);
+  }
+
+  /**
+   * 统计盘面中"唯余格"（仅剩1个候选数的空格）的数量。
+   * 用于验证训练盘面中有且仅有1个格子可以被直接排除确定。
+   */
+  private countSoleCandidateCells(puzzle: number[][]): number {
+    let count = 0;
+    for (let r = 0; r < 9; r++) {
+      for (let c = 0; c < 9; c++) {
+        if (puzzle[r][c] !== 0) continue;
+        const seen = new Set<number>();
+        for (let cc = 0; cc < 9; cc++) if (puzzle[r][cc] !== 0) seen.add(puzzle[r][cc]);
+        for (let rr = 0; rr < 9; rr++) if (puzzle[rr][c] !== 0) seen.add(puzzle[rr][c]);
+        const br = Math.floor(r / 3) * 3;
+        const bc = Math.floor(c / 3) * 3;
+        for (let rr = br; rr < br + 3; rr++)
+          for (let cc = bc; cc < bc + 3; cc++)
+            if (puzzle[rr][cc] !== 0) seen.add(puzzle[rr][cc]);
+        // 9 - seen.size === 候选数数量
+        if (9 - seen.size === 1) count++;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * 生成一道唯余训练盘面（单次）。
+   * 随机选取目标格和答案，将其余8个数字放入同行/同列/同宫的8个随机peer格，
+   * 保证目标格候选数恰好只剩答案。
+   */
+  private buildTrainingPuzzleOnce(): {
+    puzzle: number[][];
+    targetRow: number;
+    targetCol: number;
+    answer: number;
+  } {
+    const targetRow = Math.floor(Math.random() * 9);
+    const targetCol = Math.floor(Math.random() * 9);
+    const answer = Math.floor(Math.random() * 9) + 1;
+
+    const peerSet = new Set<string>();
+    const peers: Array<[number, number]> = [];
+    const addPeer = (r: number, c: number) => {
+      const key = `${r},${c}`;
+      if ((r !== targetRow || c !== targetCol) && !peerSet.has(key)) {
+        peerSet.add(key);
+        peers.push([r, c]);
+      }
+    };
+    for (let c = 0; c < 9; c++) addPeer(targetRow, c);   // 同行
+    for (let r = 0; r < 9; r++) addPeer(r, targetCol);   // 同列
+    const br = Math.floor(targetRow / 3) * 3;
+    const bc = Math.floor(targetCol / 3) * 3;
+    for (let r = br; r < br + 3; r++)                    // 同宫
+      for (let c = bc; c < bc + 3; c++) addPeer(r, c);
+
+    shuffleArray(peers);
+    const selectedPeers = peers.slice(0, 8);
+    const otherDigits = shuffleArray([1, 2, 3, 4, 5, 6, 7, 8, 9].filter((d) => d !== answer));
+
+    const puzzle: number[][] = Array.from({ length: 9 }, () => Array(9).fill(0));
+    for (let i = 0; i < 8; i++) {
+      puzzle[selectedPeers[i][0]][selectedPeers[i][1]] = otherDigits[i];
+    }
+    return { puzzle, targetRow, targetCol, answer };
+  }
+
+  /**
+   * 生成一道唯余训练盘面，保证整张盘面有且仅有 1 个唯余格（即目标格）。
+   * 避免玩家找到其他格的正确答案却被误判为答错。
+   * 最多重试 30 次；极端情况（30次均失败）直接使用最后生成的盘面。
+   */
+  private generateTrainingPuzzle(): ReturnType<typeof this.buildTrainingPuzzleOnce> {
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const result = this.buildTrainingPuzzleOnce();
+      if (this.countSoleCandidateCells(result.puzzle) === 1) {
+        return result;
+      }
+    }
+    // 极端兜底：直接使用（目标格本身一定是唯余的，极少出现其他唯余格）
+    return this.buildTrainingPuzzleOnce();
+  }
+
+  /** 发送下一道训练题 */
+  private async nextTrainingQuestion(session: Session, ts: TrainingSession): Promise<void> {
+    // 检查训练是否仍在运行（stopTraining 可能在 await 期间调用）
+    if (!this.trainings.has(ts.channelId)) return;
+
+    const { puzzle, answer } = this.generateTrainingPuzzle();
+    ts.currentQuestionIndex++;
+
+    const cq: TrainingQuestion = {
+      answer,
+      questionStartTime: Date.now(),
+      wrongAttempts: new Map(),
+    };
+    ts.currentQuestion = cq;
+
+    // 渲染盘面图片（不标记目标格，底部显示「唯余训练 · 第N题」）
+    const label = `唯余训练 · 第${ts.currentQuestionIndex}题`;
+    try {
+      const imgBuf = await this.renderer.render(puzzle, label, undefined, undefined);
+      // 渲染期间若训练已被结束（stopTraining 删除了 map 项），则不再发图
+      if (!this.trainings.has(ts.channelId)) return;
+      const b64 = imgBuf.toString("base64");
+      await session.send(h.image(`data:image/png;base64,${b64}`));
+    } catch (err: any) {
+      if (!this.trainings.has(ts.channelId)) return;
+      // 图片失败降级为文字提示，继续训练
+      this.ctx.logger("sudoku").warn("唯余训练图片渲染失败：", err);
+      await session.send(`📋 ${label}（图片渲染失败，请输入 1-9 作答）`);
+    }
+  }
+
+  /** 生成训练报告并发送 */
+  private async finishTraining(session: Session, ts: TrainingSession): Promise<void> {
+    if (ts.participants.size === 0) {
+      await session.send("本轮训练无人参与，不生成报告。");
+      return;
+    }
+    if (ts.finishedQuestions === 0) {
+      await session.send("本轮训练无人答对任何题目，不生成报告。");
+      return;
+    }
+
+    const endTime = Date.now();
+    const participants = Array.from(ts.participants.values());
+
+    // 标题
+    const title =
+      participants.length === 1
+        ? `「${participants[0].username}」唯余训练报告`
+        : participants.map((p) => `「${p.username}」`).join("") + "唯余训练报告";
+
+    // 时间范围
+    const fmt = (d: Date) =>
+      `${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}:${d.getSeconds().toString().padStart(2, "0")}`;
+    const timeRange = `${fmt(new Date(ts.startTime))} - ${fmt(new Date(endTime))}`;
+
+    const renderData: TrainingRenderData = {
+      title,
+      timeRange,
+      totalQuestions: ts.finishedQuestions,
+      participants: participants.map((p) => ({
+        username: p.username,
+        correct: p.correct,
+        wrong: p.wrong,
+        correctTimesMs: p.correctAnswers.map((a) => a.elapsedMs),
+        questionIndices: p.correctAnswers.map((a) => a.questionIndex),
+      })),
+    };
+
+    try {
+      const imgBuf = await this.renderer.renderTrainingStats(renderData);
+      const b64 = imgBuf.toString("base64");
+      await session.send(h.image(`data:image/png;base64,${b64}`));
+    } catch (err: any) {
+      this.ctx.logger("sudoku").warn("训练报告渲染失败，降级为文字：", err);
+      // 文字降级报告
+      const lines = [
+        "📊 唯余训练报告",
+        `训练时间：${timeRange}`,
+        `共完成 ${ts.finishedQuestions} 题`,
+        "",
+        ...participants.map((p) => {
+          const total = p.correct + p.wrong;
+          const acc = total === 0 ? "0%" : `${((p.correct / total) * 100).toFixed(1)}%`;
+          const avgMs =
+            p.correctAnswers.length > 0
+              ? p.correctAnswers.reduce((s, a) => s + a.elapsedMs, 0) / p.correctAnswers.length
+              : 0;
+          return `${p.username}：✅${p.correct} ❌${p.wrong} 正确率${acc} 均${(avgMs / 1000).toFixed(1)}s`;
+        }),
+      ];
+      await session.send(lines.join("\n"));
+    }
   }
 
 }
