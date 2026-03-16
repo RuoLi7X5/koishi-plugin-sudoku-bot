@@ -252,9 +252,10 @@ export function apply(ctx: Context, config: Config) {
       return game.showHint(session, questionId);
     });
 
-  ctx.command(config.commandTrainingStart).action(({ session }) => {
+  ctx.command(`${config.commandTrainingStart} [mode]`).action(({ session, args }) => {
     if (!session) return "无法获取会话信息";
-    return game.startTraining(session);
+    const mode = args?.[0] === '进阶' ? 'advanced' : 'basic';
+    return game.startTraining(session, mode);
   });
 
   ctx.command(config.commandTrainingStop).action(({ session }) => {

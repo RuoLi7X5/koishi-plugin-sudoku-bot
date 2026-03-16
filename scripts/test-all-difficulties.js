@@ -21,6 +21,27 @@ const { solve, formatCompactSteps, checkPuzzleIntuitiveSolvable } =
   require("../lib/solver.js");
 const { SudokuGenerator } = require("../lib/generator.js");
 
+// ─── 难度标准（与 game.ts DIFFICULTY_TARGET_CRITERIA 保持同步） ───────────────
+
+const DIFFICULTY_CRITERIA = {
+  1: { minSteps: 1,  maxSteps: 2,  requireL3: false },
+  2: { minSteps: 2,  maxSteps: 4,  requireL3: false },
+  3: { minSteps: 3,  maxSteps: 6,  requireL3: false },
+  4: { minSteps: 5,  maxSteps: 9,  requireL3: false },
+  5: { minSteps: 7,  maxSteps: 13, requireL3: true  },
+  6: { minSteps: 10, maxSteps: 20, requireL3: true  },
+};
+
+/** 判断目标格的求解路径是否符合难度标准（复现 game.ts checkTargetDifficultyMatch） */
+function checkCriteria(steps, diff) {
+  const c = DIFFICULTY_CRITERIA[diff];
+  if (!c) return true;
+  const len = steps.length;
+  if (len < c.minSteps || len > c.maxSteps) return false;
+  if (c.requireL3 && !steps.some(s => s.level >= 3)) return false;
+  return true;
+}
+
 // ─── 工具函数 ─────────────────────────────────────────────────────────────────
 
 function rowLabel(r) { return String.fromCharCode(65 + r); }
@@ -119,19 +140,42 @@ for (let diff = 1; diff <= 6; diff++) {
   let maxKey      = 0;
   let successCount = 0;
   const stepDist  = {};
+  // 难度过滤后的统计（模拟 pickTargetCell 严格匹配）
+  let filteredCount = 0;   // 单题中符合难度标准的格子数
+  let filteredTotal = 0;   // 累计符合标准的格子数
+  let filteredMaxSteps = 0;
+  const filteredStepDist = {};
 
   for (let i = 0; i < EVAL_COUNT; i++) {
     const { puzzle, solution, attempts } = generateIntuitiveFullPuzzle(diff);
     totalAttempts += attempts;
 
-    // 空格计数
+    // 空格计数 + 遍历全部空格统计过滤后分布
     let empty = 0;
-    for (let r = 0; r < 9; r++)
-      for (let c = 0; c < 9; c++)
-        if (!puzzle[r][c]) empty++;
+    let puzzleFilteredCount = 0;
+    for (let r = 0; r < 9; r++) {
+      for (let c = 0; c < 9; c++) {
+        if (!puzzle[r][c]) {
+          empty++;
+          const res = solve(puzzle, r, c);
+          if (res.success) {
+            // 记录全体分布（随机格）
+            if (i === 0) { /* 全体分布只在随机格中采样一次（下面solveRandomTarget负责） */ }
+            // 难度过滤后分布
+            if (checkCriteria(res.steps, diff)) {
+              filteredTotal++;
+              puzzleFilteredCount++;
+              filteredMaxSteps = Math.max(filteredMaxSteps, res.steps.length);
+              filteredStepDist[res.steps.length] = (filteredStepDist[res.steps.length] || 0) + 1;
+            }
+          }
+        }
+      }
+    }
     totalEmpty += empty;
+    filteredCount += puzzleFilteredCount;
 
-    // 随机目标格求解
+    // 随机目标格求解（全体分布用）
     const rec = solveRandomTarget(puzzle, solution);
     if (rec && rec.result.success) {
       successCount++;
@@ -148,15 +192,17 @@ for (let diff = 1; diff <= 6; diff++) {
   const avgEmpty    = (totalEmpty / EVAL_COUNT).toFixed(1);
   const avgSteps    = successCount > 0 ? (totalSteps / successCount).toFixed(1) : "N/A";
   const avgKey      = successCount > 0 ? (totalKey   / successCount).toFixed(1) : "N/A";
+  const avgFiltered = (filteredCount / EVAL_COUNT).toFixed(1); // 每题平均符合标准的格数
 
   evalResults[diff] = {
     rejectCount, rejectPct, avgEmpty,
     avgSteps, maxSteps, avgKey, maxKey,
     successCount, stepDist,
+    filteredCount, filteredTotal, filteredMaxSteps, filteredStepDist, avgFiltered,
   };
 }
 
-// 输出评估表格
+// 输出评估表格（随机格全体分布）
 print("  档位 | 名称                              | 弃题  |空格数| 均步 | 峰步 | 均关键 | 峰关键");
 print("  ─────┼───────────────────────────────────┼───────┼──────┼──────┼──────┼────────┼───────");
 for (let diff = 1; diff <= 6; diff++) {
@@ -170,15 +216,31 @@ for (let diff = 1; diff <= 6; diff++) {
   const maxk  = String(d.maxKey).padStart(5);
   print(`  D${diff}   | ${name} | ${rej} | ${empty} | ${avgs} | ${maxs} | ${avgk} | ${maxk}`);
 }
-
 print(LINE);
 print("  说明：弃题 = 含链被废弃的题目数/总生成数  空格数 = 平均未给定格数量");
 print("        均步 = 随机目标格求解平均总步骤     峰步 = 最大总步骤数");
 print("        均关键/峰关键 = 直接影响目标格候选数的关键步骤");
 
+// 输出过滤后评估表格（模拟 pickTargetCell 严格匹配）
+print();
+print("  ── 经难度标准过滤后（模拟 pickTargetCell 严格匹配） ──");
+print("  档位 | 步骤区间          | 每题可选格均值 | 过滤后峰值步骤 | 结论");
+print("  ─────┼───────────────────┼───────────────┼───────────────┼──────────────────────");
+for (let diff = 1; diff <= 6; diff++) {
+  const d = evalResults[diff];
+  const c = DIFFICULTY_CRITERIA[diff];
+  const range = `[${c.minSteps}, ${c.maxSteps === Infinity ? "∞" : c.maxSteps}]`.padEnd(17);
+  const avgF  = String(d.avgFiltered).padStart(13);
+  const peakF = String(d.filteredMaxSteps).padStart(13);
+  const ok    = d.filteredMaxSteps <= c.maxSteps ? "✅ 峰值合规" : `❌ 峰值 ${d.filteredMaxSteps} 超标`;
+  const noCell = d.avgFiltered < 1 ? "  ⚠️ 平均<1格/题，需关注" : "";
+  print(`  D${diff}   | ${range} | ${avgF} | ${peakF} | ${ok}${noCell}`);
+}
+print(LINE);
+
 // 步骤分布详情（写入文件）
 fileOnly(`\n${"─".repeat(72)}`);
-fileOnly("第一部分 — 各难度步骤分布详情");
+fileOnly("第一部分a — 各难度步骤分布（随机格）");
 fileOnly("─".repeat(72));
 for (let diff = 1; diff <= 6; diff++) {
   const d = evalResults[diff];
@@ -190,6 +252,27 @@ for (let diff = 1; diff <= 6; diff++) {
     const cnt = d.stepDist[n];
     const bar = "█".repeat(Math.ceil(cnt / maxBar * 20));
     fileOnly(`     ${String(n).padStart(3)} 步：${String(cnt).padStart(3)} 题  ${bar}`);
+  }
+}
+
+fileOnly(`\n${"─".repeat(72)}`);
+fileOnly("第一部分b — 各难度步骤分布（经难度标准过滤后，模拟 pickTargetCell）");
+fileOnly("─".repeat(72));
+for (let diff = 1; diff <= 6; diff++) {
+  const d = evalResults[diff];
+  const c = DIFFICULTY_CRITERIA[diff];
+  fileOnly(`\n  ${DIFF_NAMES[diff]}  区间 [${c.minSteps}, ${c.maxSteps}]  每题均可选 ${d.avgFiltered} 格  峰值 ${d.filteredMaxSteps} 步`);
+  const distKeys = Object.keys(d.filteredStepDist).map(Number).sort((a, b) => a - b);
+  if (distKeys.length === 0) {
+    fileOnly("  （无符合标准的格）");
+  } else {
+    const maxBar = Math.max(...Object.values(d.filteredStepDist));
+    for (const n of distKeys) {
+      const cnt = d.filteredStepDist[n];
+      const bar = "█".repeat(Math.ceil(cnt / maxBar * 20));
+      const flag = n > c.maxSteps ? " ← ⚠️超标" : (n < c.minSteps ? " ← ⚠️过低" : "");
+      fileOnly(`     ${String(n).padStart(3)} 步：${String(cnt).padStart(4)} 格  ${bar}${flag}`);
+    }
   }
 }
 

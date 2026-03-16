@@ -12,6 +12,68 @@ try {
   }
 }
 
+// ── 中文字体初始化 ──────────────────────────────────────────────────────────
+//
+// Canvas 在 Node.js 环境中默认不包含 CJK 字体，中文会渲染成方块。
+// 此处在模块加载时，尝试将系统已安装的中文字体注册到 Canvas 的全局字体库。
+//
+// @napi-rs/canvas：通过 GlobalFonts.loadSystemFonts() + loadFontsFromDir() 批量加载。
+// node-canvas    ：通过 registerFont() 按文件路径逐个注册。
+
+/** Canvas 字体族字符串——所有 ctx2d.font 均使用此常量，确保中文可渲染 */
+export const CJK_FONT_STACK = [
+  '"Microsoft YaHei"',       // Windows / 微软雅黑
+  '"WenQuanYi Zen Hei"',     // Linux / 文泉驿正黑（dnf install wqy-zenhei-fonts）
+  '"WenQuanYi Micro Hei"',   // Linux / 文泉驿微米黑
+  '"Noto Sans CJK SC"',      // Linux / Noto CJK
+  '"Source Han Sans SC"',    // Linux / 思源黑体
+  '"PingFang SC"',           // macOS / 苹方
+  '"Droid Sans"',            // Linux / DroidSansFallback（阿里云默认已装）
+  "Arial",                   // 西文兜底
+  "sans-serif",
+].join(", ");
+
+if (NativeCanvas?.GlobalFonts) {
+  // @napi-rs/canvas：加载系统字体目录（含已安装的中文字体）
+  try {
+    NativeCanvas.GlobalFonts.loadSystemFonts?.();
+  } catch {}
+  // 补充扫描常见 Linux/macOS 字体目录（部分发行版 loadSystemFonts 覆盖不全）
+  for (const dir of [
+    "/usr/share/fonts",
+    "/usr/local/share/fonts",
+    "/Library/Fonts",
+    "/System/Library/Fonts",
+  ]) {
+    try { NativeCanvas.GlobalFonts.loadFontsFromDir?.(dir); } catch {}
+  }
+} else if (NativeCanvas?.registerFont) {
+  // node-canvas：按路径注册具体字体文件
+  const { existsSync } = require("fs");
+  const candidates: Array<[string, string]> = [
+    // Linux WQY
+    ["/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",   "WenQuanYi Zen Hei"],
+    ["/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", "WenQuanYi Micro Hei"],
+    // Linux Noto CJK
+    ["/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", "Noto Sans CJK SC"],
+    ["/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",      "Noto Sans CJK SC"],
+    // Linux Droid（阿里云 / CentOS 默认）
+    ["/usr/share/fonts/google-droid/DroidSansFallback.ttf", "Droid Sans"],
+    ["/usr/share/fonts/gdouros-symbola/Symbola.ttf",        "Symbola"],
+    // Windows
+    ["C:\\Windows\\Fonts\\msyh.ttc",   "Microsoft YaHei"],
+    ["C:\\Windows\\Fonts\\simsun.ttc", "SimSun"],
+    // macOS
+    ["/System/Library/Fonts/PingFang.ttc",    "PingFang SC"],
+    ["/Library/Fonts/Arial Unicode MS.ttf",   "Arial Unicode MS"],
+  ];
+  for (const [path, family] of candidates) {
+    try {
+      if (existsSync(path)) NativeCanvas.registerFont(path, { family });
+    } catch {}
+  }
+}
+
 declare module "koishi" {
   interface Context {
     canvas?: any;
@@ -157,7 +219,7 @@ export class ImageRenderer {
       }
 
       // 数字
-      ctx2d.font = "30px Arial";
+      ctx2d.font = `30px ${CJK_FONT_STACK}`;
       ctx2d.fillStyle = "#000000";
       ctx2d.textAlign = "center";
       ctx2d.textBaseline = "middle";
@@ -176,7 +238,7 @@ export class ImageRenderer {
 
       // 底部：难度居中，题目编号右对齐
       const bottomY = size + bottomSpace / 2;
-      ctx2d.font = "bold 16px Arial";
+      ctx2d.font = `bold 16px ${CJK_FONT_STACK}`;
       ctx2d.fillStyle = "#666666";
       ctx2d.textBaseline = "middle";
 
@@ -239,13 +301,13 @@ export class ImageRenderer {
 
     // ── 标题区 ──────────────────────────────────
     ctx2d.fillStyle = "#2c3e50";
-    ctx2d.font = "bold 22px Arial";
+    ctx2d.font = `bold 22px ${CJK_FONT_STACK}`;
     ctx2d.textAlign = "center";
     ctx2d.textBaseline = "middle";
     ctx2d.fillText(data.title, W / 2, y + 28);
 
     ctx2d.fillStyle = "#7f8c8d";
-    ctx2d.font = "13px Arial";
+    ctx2d.font = `13px ${CJK_FONT_STACK}`;
     ctx2d.fillText(
       `${data.timeRange}  ·  共 ${data.totalQuestions} 题`,
       W / 2,
@@ -274,13 +336,13 @@ export class ImageRenderer {
 
       // 玩家名
       ctx2d.fillStyle = "#2c3e50";
-      ctx2d.font = "bold 15px Arial";
+      ctx2d.font = `bold 15px ${CJK_FONT_STACK}`;
       ctx2d.textAlign = "left";
       ctx2d.textBaseline = "top";
       ctx2d.fillText(p.username, PAD + 14, rowY + 12);
 
       // 统计数据
-      ctx2d.font = "13px Arial";
+      ctx2d.font = `13px ${CJK_FONT_STACK}`;
       const stats = [
         { color: "#27ae60", text: `✅ ${p.correct}` },
         { color: "#e74c3c", text: `❌ ${p.wrong}` },
@@ -305,7 +367,7 @@ export class ImageRenderer {
 
     // ── 图表1：时间分布直方图 ─────────────────────
     ctx2d.fillStyle = "#2c3e50";
-    ctx2d.font = "bold 14px Arial";
+    ctx2d.font = `bold 14px ${CJK_FONT_STACK}`;
     ctx2d.textAlign = "left";
     ctx2d.textBaseline = "middle";
     ctx2d.fillText("时间分布（答对用时）", PAD + AXIS_W, y + 14);
@@ -328,7 +390,7 @@ export class ImageRenderer {
 
     // ── 图表2：答题节奏折线图 ──────────────────────
     ctx2d.fillStyle = "#2c3e50";
-    ctx2d.font = "bold 14px Arial";
+    ctx2d.font = `bold 14px ${CJK_FONT_STACK}`;
     ctx2d.textAlign = "left";
     ctx2d.textBaseline = "middle";
     ctx2d.fillText("答题节奏（每题用时）", PAD + AXIS_W, y + 14);
@@ -337,7 +399,7 @@ export class ImageRenderer {
       let lx = W - PAD;
       for (let i = nPlayers - 1; i >= 0; i--) {
         const lbl = data.participants[i].username;
-        ctx2d.font = "12px Arial";
+        ctx2d.font = `12px ${CJK_FONT_STACK}`;
         const tw = ctx2d.measureText(lbl).width;
         lx -= tw;
         ctx2d.fillStyle = "#2c3e50";
@@ -427,7 +489,7 @@ export class ImageRenderer {
       ctx2d.stroke();
 
       ctx2d.fillStyle = "#999";
-      ctx2d.font = "11px Arial";
+      ctx2d.font = `11px ${CJK_FONT_STACK}`;
       ctx2d.textAlign = "right";
       ctx2d.textBaseline = "middle";
       ctx2d.fillText(cnt.toString(), chartX - 4, gy);
@@ -446,7 +508,7 @@ export class ImageRenderer {
 
       // X 轴标签
       ctx2d.fillStyle = "#555";
-      ctx2d.font = "11px Arial";
+      ctx2d.font = `11px ${CJK_FONT_STACK}`;
       ctx2d.textAlign = "center";
       ctx2d.textBaseline = "top";
       ctx2d.fillText(BUCKET_LABELS[bi], labelX, chartY + barAreaH + 4);
@@ -463,7 +525,7 @@ export class ImageRenderer {
         // 柱顶数字（仅单玩家或柱子够宽时）
         if (nPlayers === 1 || barW >= 18) {
           ctx2d.fillStyle = "#2c3e50";
-          ctx2d.font = "11px Arial";
+          ctx2d.font = `11px ${CJK_FONT_STACK}`;
           ctx2d.textAlign = "center";
           ctx2d.textBaseline = "bottom";
           ctx2d.fillText(cnt.toString(), bx + barW / 2, by - 1);
@@ -513,7 +575,7 @@ export class ImageRenderer {
       ctx2d.stroke();
 
       ctx2d.fillStyle = "#999";
-      ctx2d.font = "11px Arial";
+      ctx2d.font = `11px ${CJK_FONT_STACK}`;
       ctx2d.textAlign = "right";
       ctx2d.textBaseline = "middle";
       ctx2d.fillText(`${s.toFixed(0)}s`, chartX - 4, gy);
@@ -524,7 +586,7 @@ export class ImageRenderer {
     for (let qi = 1; qi <= maxQi; qi += labelStep) {
       const px = chartX + ((qi - 1) / Math.max(maxQi - 1, 1)) * chartW;
       ctx2d.fillStyle = "#555";
-      ctx2d.font = "11px Arial";
+      ctx2d.font = `11px ${CJK_FONT_STACK}`;
       ctx2d.textAlign = "center";
       ctx2d.textBaseline = "top";
       ctx2d.fillText(qi.toString(), px, chartY + lineAreaH + 4);

@@ -1833,7 +1833,7 @@ export function solve(
         const best = allCA[0];
 
         if (best.type === 'box') {
-          const exclInfo = boxHiddenSingleExclusionInfo(work, grid, best.br, best.bc, best.r, best.c, best.v);
+          const exclInfo = boxHiddenSingleExclusionInfo(puzzle, work, grid, best.br, best.bc, best.r, best.c, best.v);
           const cellBox = cellLabel(best.r, best.c);
           const boxN = boxNumber(best.br, best.bc);
           assignCell(grid, work, best.r, best.c, best.v);
@@ -2226,6 +2226,7 @@ function findNakedSingle(
  *  - complete：false 表示还有候选消除约束无法单靠 work 解释，不应过滤前置步骤
  */
 function boxHiddenSingleExclusionInfo(
+  puzzle: number[][],
   work: number[][],
   grid: CandGrid,
   br: number, bc: number,
@@ -2240,7 +2241,9 @@ function boxHiddenSingleExclusionInfo(
   for (let r = br; r < br + 3; r++) {
     for (let c = bc; c < bc + 3; c++) {
       if (r === targetR && c === targetC) continue;
-      if (work[r][c] !== 0) continue; // 已填格，无需解释
+      // 只跳过初始盘面中已填入的格。若该格是求解器中间步骤填入的（初始为空），
+      // 则仍需尝试寻找直接行/列来源；找不到时设 complete=false，避免说明不完整。
+      if (puzzle[r][c] !== 0) continue;
       // 注：对有效的隐性唯余，宫内其他空格一定不含 v 作为候选；此 has(v) 检查用于防御
       if (grid[r][c].has(v)) continue;
 
@@ -2444,7 +2447,8 @@ export function formatCompactSteps(result: SolveResult, targetLabel: string): st
         // 目标格本身为显性唯余时，直接显示 唯余V ✓ 即可
         return { reason: '', trailingCell: null };
       }
-      return { reason: `${cell}唯余出${val}`, trailingCell: null };
+      // 非末步：将"XY唯余出V"改为尾部结论格式"→ XY为V"，明确因果关系
+      return { reason: '', trailingCell: `${cell}为${val}` };
     }
 
     // 去掉尾部 "→ 排除X → [余]" 或 "→ [余]" 得到原因部分
@@ -2516,7 +2520,11 @@ export function formatCompactSteps(result: SolveResult, targetLabel: string): st
             if (trailingCell) desc += ` → ${trailingCell}`;
           }
         } else {
-          desc = `排除${elimStr} → [${remainStr}] → ${fullReason}`;
+          // 有尾部结论格时，去掉 fullReason 末尾的。，避免"。 → XY为V"视觉噪音
+          const reasonPart = trailingCell ? fullReason.replace(/。$/, '') : fullReason;
+          desc = reasonPart
+            ? `排除${elimStr} → [${remainStr}] → ${reasonPart}`
+            : `排除${elimStr} → [${remainStr}]`;
           if (trailingCell) desc += ` → ${trailingCell}`;
         }
       }
