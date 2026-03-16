@@ -1,173 +1,168 @@
 import { Context, Logger } from "koishi";
 import { join } from "path";
 
-// 尝试导入多个可能的 canvas 库
-let NativeCanvas: any;
-try {
-  NativeCanvas = require("@napi-rs/canvas");
-} catch {
+// ── Canvas 模块发现 ──────────────────────────────────────────────────────────
+// 按优先级逐一尝试，直到找到可用的模块实例。
+//
+// 底层模块对应关系：
+//   koishi-plugin-skia-canvas  →  @ahdg/canvas  （当前使用）
+//   koishi-plugin-canvas       →  @napi-rs/canvas（已废弃）
+//   旧版                       →  canvas
+//
+// @ahdg/canvas 是 @napi-rs/canvas 的 Skia 分支，GlobalFonts API 完全兼容。
+let NativeCanvas: any = null;
+
+(function discoverCanvasModule() {
+  // 1. @ahdg/canvas 直接 require（koishi-plugin-skia-canvas 的底层库）
+  try { NativeCanvas = require("@ahdg/canvas"); if (NativeCanvas) return; } catch {}
+
+  // 2. 经由 koishi-plugin-skia-canvas 定位（@ahdg/canvas 嵌套在其 node_modules 下时）
   try {
-    NativeCanvas = require("canvas");
-  } catch {
-    NativeCanvas = null;
-  }
-}
+    const { dirname } = require("path") as typeof import("path");
+    const skiaEntry = require.resolve("koishi-plugin-skia-canvas");
+    const nativePath = require.resolve("@ahdg/canvas", {
+      paths: [dirname(skiaEntry), dirname(dirname(skiaEntry))],
+    });
+    NativeCanvas = require(nativePath);
+    if (NativeCanvas) return;
+  } catch {}
+
+  // 3. 兜底：@napi-rs/canvas（旧版 koishi-plugin-canvas 用户）
+  try { NativeCanvas = require("@napi-rs/canvas"); if (NativeCanvas) return; } catch {}
+
+  // 4. 经由 koishi-plugin-canvas 定位（已废弃插件，仅做兼容）
+  try {
+    const { dirname } = require("path") as typeof import("path");
+    const canvasEntry = require.resolve("koishi-plugin-canvas");
+    const nativePath = require.resolve("@napi-rs/canvas", {
+      paths: [dirname(canvasEntry), dirname(dirname(canvasEntry))],
+    });
+    NativeCanvas = require(nativePath);
+    if (NativeCanvas) return;
+  } catch {}
+
+  // 5. 最终降级：legacy node-canvas
+  try { NativeCanvas = require("canvas"); } catch {}
+})();
 
 // ── 中文字体候选文件表 ────────────────────────────────────────────────────────
-// 每条记录：[字体文件绝对路径, 注册到 Canvas 的字族名]
-// 覆盖 Debian/Ubuntu、CentOS/RHEL、Arch、Alpine、macOS、Windows 常见路径。
+// 每条记录：[字体文件绝对路径, 注册到 Canvas 的字族名（与 CJK_FONT_STACK 对应）]
 const CJK_FONT_FILES: Array<[string, string]> = [
-  // ── Debian / Ubuntu ──────────────────────────────────────────────────────
-  ["/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",        "WenQuanYi Zen Hei"],
-  ["/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",      "WenQuanYi Micro Hei"],
-  ["/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",  "Noto Sans CJK SC"],
-  ["/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc", "Noto Serif CJK SC"],
-  ["/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf","Droid Sans"],
-  ["/usr/share/fonts/truetype/droid/DroidSansFallback.ttf",   "Droid Sans"],
-  // ── CentOS / RHEL / Fedora ───────────────────────────────────────────────
-  ["/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",          "WenQuanYi Zen Hei"],
-  ["/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",      "WenQuanYi Micro Hei"],
+  // ── CentOS / RHEL / Aliyun ───────────────────────────────────────────────
+  ["/usr/share/fonts/google-droid/DroidSansFallback.ttf",      "Droid Sans"],
+  ["/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",              "WenQuanYi Zen Hei"],
+  ["/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",          "WenQuanYi Micro Hei"],
   ["/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc","Noto Sans CJK SC"],
-  ["/usr/share/fonts/google-droid/DroidSansFallback.ttf",  "Droid Sans"],
-  // ── 通用 noto-cjk 目录（多发行版）───────────────────────────────────────
-  ["/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",   "Noto Sans CJK SC"],
-  ["/usr/share/fonts/noto/NotoSansCJKsc-Regular.otf",      "Noto Sans CJK SC"],
-  // ── Alpine ───────────────────────────────────────────────────────────────
-  ["/usr/share/fonts/noto/NotoSans-Regular.ttf",           "Noto Sans"],
+  // ── Debian / Ubuntu ──────────────────────────────────────────────────────
+  ["/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",            "WenQuanYi Zen Hei"],
+  ["/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",          "WenQuanYi Micro Hei"],
+  ["/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",  "Noto Sans CJK SC"],
+  ["/usr/share/fonts/truetype/droid/DroidSansFallback.ttf",   "Droid Sans"],
+  // ── 通用路径 ─────────────────────────────────────────────────────────────
+  ["/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",       "Noto Sans CJK SC"],
+  ["/usr/local/share/fonts/wqy-zenhei.ttc",                   "WenQuanYi Zen Hei"],
   // ── macOS ────────────────────────────────────────────────────────────────
-  ["/System/Library/Fonts/PingFang.ttc",                   "PingFang SC"],
-  ["/Library/Fonts/Arial Unicode MS.ttf",                  "Arial Unicode MS"],
+  ["/System/Library/Fonts/PingFang.ttc",                      "PingFang SC"],
   // ── Windows ──────────────────────────────────────────────────────────────
-  ["C:\\Windows\\Fonts\\msyh.ttc",                         "Microsoft YaHei"],
-  ["C:\\Windows\\Fonts\\msyhbd.ttc",                       "Microsoft YaHei"],
-  ["C:\\Windows\\Fonts\\simsun.ttc",                       "SimSun"],
+  ["C:\\Windows\\Fonts\\msyh.ttc",                            "Microsoft YaHei"],
+  ["C:\\Windows\\Fonts\\simsun.ttc",                          "SimSun"],
 ];
 
-// @napi-rs/canvas 需要扫描的目录（loadFontsFromDir 不递归，需列出子目录）
-const CJK_FONT_DIRS = [
-  "/usr/share/fonts",
-  "/usr/share/fonts/truetype",
-  "/usr/share/fonts/truetype/wqy",
-  "/usr/share/fonts/opentype",
-  "/usr/share/fonts/opentype/noto",
-  "/usr/share/fonts/noto-cjk",
-  "/usr/share/fonts/noto",
-  "/usr/share/fonts/google-noto-cjk",
-  "/usr/share/fonts/google-droid",
-  "/usr/share/fonts/truetype/droid",
-  "/usr/share/fonts/wqy-zenhei",
-  "/usr/share/fonts/wqy-microhei",
-  "/usr/local/share/fonts",
-  "/Library/Fonts",
-  "/System/Library/Fonts",
-];
-
-/** Canvas 字体族字符串——所有 ctx2d.font 均使用此常量，确保中文可渲染 */
+/** Canvas font-family 字符串，ctx2d.font 全部使用此值确保中文可渲染 */
 export const CJK_FONT_STACK = [
   '"Microsoft YaHei"',
   '"WenQuanYi Zen Hei"',
   '"WenQuanYi Micro Hei"',
   '"Noto Sans CJK SC"',
-  '"Source Han Sans SC"',
   '"PingFang SC"',
   '"Droid Sans"',
-  '"Noto Sans"',
   "Arial",
   "sans-serif",
 ].join(", ");
 
 /**
- * 向 Canvas 注册 CJK 字体，返回成功注册的文件数。
- *
- * 优先级：koishiCanvas.GlobalFonts（与画布创建使用同一模块实例）> NativeCanvas.GlobalFonts > NativeCanvas.registerFont
- *
- * @param extraDirs    额外扫描目录（Koishi 数据目录 fonts 子目录等）
- * @param logger       日志器
- * @param koishiCanvas ctx.canvas，用于访问与画布同一模块实例的 GlobalFonts
+ * 向 Canvas 注册 CJK 字体。
+ * - 优先用与 createCanvas 同一模块实例的 GlobalFonts（ctx.canvas）
+ * - 回退到直接 require 的 NativeCanvas.GlobalFonts
+ * - 返回成功注册的文件数；输出详细诊断日志便于排查
  */
 function loadCJKFonts(
   extraDirs: string[] = [],
   logger?: Logger,
   koishiCanvas?: any,
 ): number {
-  const { existsSync, readFileSync, readdirSync } = require("fs");
+  const { existsSync, readFileSync, readdirSync } = require("fs") as typeof import("fs");
 
-  // 获取 GlobalFonts：优先从 Koishi canvas 服务（与 createCanvas 同实例），
-  // 兜底用直接 require 到的 NativeCanvas
-  const gf: any =
-    koishiCanvas?.GlobalFonts ??
-    NativeCanvas?.GlobalFonts ??
-    null;
+  const gf: any = koishiCanvas?.GlobalFonts ?? NativeCanvas?.GlobalFonts ?? null;
+  const hasRegisterFromPath = typeof gf?.registerFromPath === "function";
 
-  const legacyRegisterFont: ((path: string, options: { family: string }) => void) | null =
-    NativeCanvas?.registerFont ?? koishiCanvas?.registerFont ?? null;
+  // 每次启动输出一行诊断，便于快速定位问题
+  logger?.info(
+    `[字体] canvas=${NativeCanvas ? "✓" : "✗"}  ` +
+    `GlobalFonts=${gf ? "✓" : "✗"}  ` +
+    `registerFromPath=${hasRegisterFromPath ? "✓" : "✗"}`
+  );
 
-  if (!gf && !legacyRegisterFont) {
+  if (!gf) {
     logger?.warn(
-      "Canvas 字体注册 API 不可用（GlobalFonts / registerFont 均未找到），中文将显示为方块。\n" +
-      "  请确认 @napi-rs/canvas 或 canvas 已正确安装。"
+      "[字体] GlobalFonts API 不可用，中文将显示为方块。\n" +
+      `  NativeCanvas: ${NativeCanvas ? "已加载但无 GlobalFonts 属性" : "require('@ahdg/canvas') 失败"}\n` +
+      `  ctx.canvas:   ${koishiCanvas ? "已注入但无 GlobalFonts 属性" : "未注入（canvas 服务未就绪？）"}`
     );
     return 0;
   }
 
   let loaded = 0;
+  const registered: string[] = [];
 
-  if (gf) {
-    // ── @napi-rs/canvas GlobalFonts ────────────────────────────────────
-    try { gf.loadSystemFonts?.(); } catch {}
+  // ── 1. 逐文件显式注册（family 名由我们控制，最可靠）────────────────────────
+  for (const [filePath, family] of CJK_FONT_FILES) {
+    try {
+      if (!existsSync(filePath)) continue;
+      const ok: boolean = hasRegisterFromPath
+        ? (gf.registerFromPath(filePath, family) as boolean)
+        : (gf.register(readFileSync(filePath), family), true);
+      if (ok !== false) { loaded++; registered.push(family); }
+    } catch {}
+  }
 
-    for (const dir of [...CJK_FONT_DIRS, ...extraDirs]) {
-      try { gf.loadFontsFromDir?.(dir); } catch {}
-    }
+  // ── 2. 扫描用户自定义目录（支持手动放置任意字体）────────────────────────────
+  for (const dir of extraDirs) {
+    try {
+      if (!existsSync(dir)) continue;
+      for (const file of readdirSync(dir) as string[]) {
+        if (!/\.(ttf|otf|ttc|woff|woff2)$/i.test(file)) continue;
+        const fullPath = join(dir, file);
+        const alias = file.replace(/\.[^.]+$/, "");
+        try {
+          const ok: boolean = hasRegisterFromPath
+            ? (gf.registerFromPath(fullPath, alias) as boolean)
+            : (gf.register(readFileSync(fullPath), alias), true);
+          if (ok !== false) { loaded++; registered.push(alias); }
+        } catch {}
+      }
+    } catch {}
+  }
 
-    // 逐文件显式注册
-    for (const [filePath, family] of CJK_FONT_FILES) {
-      try {
-        if (existsSync(filePath)) {
-          gf.register(readFileSync(filePath) as Buffer, family);
-          loaded++;
-        }
-      } catch {}
-    }
-
-    // 扫描用户自定义目录
-    for (const dir of extraDirs) {
-      try {
-        if (!existsSync(dir)) continue;
-        for (const file of readdirSync(dir) as string[]) {
-          if (!/\.(ttf|otf|ttc|woff|woff2)$/i.test(file)) continue;
-          try {
-            gf.register(
-              readFileSync(join(dir, file)) as Buffer,
-              file.replace(/\.[^.]+$/, ""),
-            );
-            loaded++;
-          } catch {}
-        }
-      } catch {}
-    }
-  } else if (legacyRegisterFont) {
-    // ── node-canvas registerFont ───────────────────────────────────────
-    for (const [filePath, family] of CJK_FONT_FILES) {
-      try {
-        if (existsSync(filePath)) {
-          legacyRegisterFont(filePath, { family });
-          loaded++;
-        }
-      } catch {}
-    }
-
-    for (const dir of extraDirs) {
-      try {
-        if (!existsSync(dir)) continue;
-        for (const file of readdirSync(dir) as string[]) {
-          if (!/\.(ttf|otf|ttc)$/i.test(file)) continue;
-          try {
-            legacyRegisterFont(join(dir, file), { family: file.replace(/\.[^.]+$/, "") });
-            loaded++;
-          } catch {}
-        }
-      } catch {}
+  // ── 结果汇报 ────────────────────────────────────────────────────────────
+  if (loaded > 0) {
+    logger?.info(`[字体] 注册成功 ${loaded} 个：${[...new Set(registered)].join("、")}`);
+  } else {
+    const foundFiles = CJK_FONT_FILES.filter(([p]) => existsSync(p)).map(([p]) => p);
+    if (foundFiles.length > 0) {
+      logger?.warn(
+        `[字体] 发现 ${foundFiles.length} 个候选文件但全部注册失败：\n` +
+        foundFiles.map(p => `  ${p}`).join("\n") + "\n" +
+        "  可能原因：registerFromPath 返回 false，或字体文件损坏。"
+      );
+    } else {
+      logger?.warn(
+        "[字体] 未发现任何 CJK 字体文件，中文将显示为方块。\n" +
+        "  修复方法（任选其一）：\n" +
+        "    ① yum install google-droid-sans-fonts   （CentOS/RHEL/Aliyun）\n" +
+        "    ② apt-get install fonts-wqy-zenhei       （Debian/Ubuntu）\n" +
+        "    ③ 将 .ttf/.otf 文件放入 Koishi 数据目录下的 fonts/ 子目录"
+      );
     }
   }
 
@@ -175,41 +170,47 @@ function loadCJKFonts(
 }
 
 /**
- * 当系统无任何 CJK 字体时，从 CDN 下载 Noto Sans SC 简体子集（约 1.2 MB）并缓存。
- * 下载成功后立即注册到 GlobalFonts；下次启动直接从缓存加载，无需再次下载。
+ * 兜底方案：当系统无任何 CJK 字体时，自动从 CDN 下载 Noto Sans SC 简体子集
+ * （约 1.2 MB）并缓存到本地。下次启动直接读缓存，无需重复下载。
+ *
+ * 下载成功后立即注册，当次渲染即可生效。
  */
 async function downloadAndCacheCJKFont(
   cacheDir: string,
   gf: any,
   logger?: Logger,
 ): Promise<void> {
-  const fsp = require("fs").promises;
-  const https = require("https");
-  const http = require("http");
+  const fsp = require("fs").promises as typeof import("fs").promises;
   const cachedPath = join(cacheDir, "NotoSansSC-Regular.woff2");
 
-  // 已缓存则直接注册
+  // 已缓存则直接注册，无需下载
   try {
     const buf = await fsp.readFile(cachedPath);
     gf.register(buf, "Noto Sans CJK SC");
-    logger?.info(`CJK 字体从缓存加载：${cachedPath}`);
+    logger?.info(`[字体] 从缓存加载 Noto Sans SC：${cachedPath}`);
     return;
   } catch {}
 
-  // 尝试多个 CDN（按优先级）
+  // CDN 列表（优先 jsDelivr，备用 unpkg）
   const FONT_URLS = [
-    // jsDelivr 上的 @fontsource/noto-sans-sc 简体子集 woff2，约 1.2 MB
     "https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-sc@5/files/noto-sans-sc-chinese-simplified-400-normal.woff2",
-    // 备用：unpkg
     "https://unpkg.com/@fontsource/noto-sans-sc@5/files/noto-sans-sc-chinese-simplified-400-normal.woff2",
   ];
 
   for (const url of FONT_URLS) {
+    logger?.info(`[字体] 尝试从 CDN 下载：${url}`);
     try {
       const buf = await new Promise<Buffer>((resolve, reject) => {
-        const lib = url.startsWith("https") ? https : http;
-        lib.get(url, { timeout: 30_000 }, (res: any) => {
+        const lib: typeof import("https") = url.startsWith("https") ? require("https") : require("http");
+        const req = lib.get(url, { timeout: 30_000 } as any, (res: any) => {
+          // 跟随重定向（最多 3 次）
+          if (res.statusCode >= 301 && res.statusCode <= 303 && res.headers.location) {
+            res.resume();
+            reject(new Error(`REDIRECT:${res.headers.location}`));
+            return;
+          }
           if (res.statusCode !== 200) {
+            res.resume();
             reject(new Error(`HTTP ${res.statusCode}`));
             return;
           }
@@ -217,24 +218,25 @@ async function downloadAndCacheCJKFont(
           res.on("data", (c: Buffer) => chunks.push(c));
           res.on("end", () => resolve(Buffer.concat(chunks)));
           res.on("error", reject);
-        }).on("error", reject).on("timeout", () => reject(new Error("timeout")));
+        });
+        req.on("error", reject);
+        req.on("timeout", () => { req.destroy(); reject(new Error("超时")); });
       });
 
       await fsp.mkdir(cacheDir, { recursive: true });
       await fsp.writeFile(cachedPath, buf);
       gf.register(buf, "Noto Sans CJK SC");
-      logger?.info(`CJK 字体下载并缓存成功（${(buf.length / 1024).toFixed(0)} KB）：${cachedPath}`);
+      logger?.info(`[字体] 下载并缓存成功（${(buf.length / 1024).toFixed(0)} KB），中文字体已生效`);
       return;
     } catch (err: any) {
-      logger?.warn(`CJK 字体从 ${url} 下载失败：${err?.message}`);
+      logger?.warn(`[字体] CDN 下载失败（${url.replace(/.*npm\//, "")}）：${err?.message}`);
     }
   }
 
   logger?.warn(
-    "CJK 字体自动下载失败，中文将显示为方块。\n" +
-    "  请手动将 .ttf/.otf 字体文件放入 Koishi 数据目录下的 fonts/ 子目录，或安装系统字体：\n" +
-    "    yum install google-droid-sans-fonts  （CentOS/RHEL）\n" +
-    "    apt-get install fonts-wqy-zenhei      （Debian/Ubuntu）"
+    "[字体] 自动下载失败，中文将持续显示为方块。\n" +
+    "  手动解决：yum install google-droid-sans-fonts  （CentOS/RHEL/Aliyun）\n" +
+    "  或将字体文件放入 Koishi 数据目录下的 fonts/ 子目录后重启 Koishi。"
   );
 }
 

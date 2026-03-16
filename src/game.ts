@@ -1940,9 +1940,17 @@ export class SudokuGame {
       poolEntry = ts.questionPool.shift()!;
       logger.info(`命中训练题目池（第${expectedIndex}题，池剩余 ${ts.questionPool.length} 道）`);
     } else if (ts.questionPool.length > 0) {
-      logger.warn(
-        `训练题目池题号不匹配（池头=${ts.questionPool[0].questionIndex}，期望=${expectedIndex}），丢弃并实时生成`,
-      );
+      const poolHead = ts.questionPool[0].questionIndex;
+      if (poolHead > expectedIndex) {
+        // 池超前（最常见：第1题由实时生成，池从第2题起填充），属正常流程，实时生成当前题
+        logger.info(`训练题目池超前（池头=${poolHead}，期望=${expectedIndex}），实时生成第${expectedIndex}题`);
+      } else {
+        // 池落后或题号跳跃，属真正异常，记录警告
+        logger.warn(
+          `训练题目池题号异常（池头=${poolHead}，期望=${expectedIndex}），丢弃并实时生成`,
+        );
+        ts.questionPool.shift(); // 丢弃错误条目
+      }
     }
 
     // 题目从池中取走后立即触发补充，维持池的饱满度
