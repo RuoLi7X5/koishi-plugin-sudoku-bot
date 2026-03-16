@@ -178,7 +178,6 @@ export type TrainingRenderData = {
     username: string;
     correct: number;
     wrong: number;
-    penaltyPoints: number;  // 本场答错累计扣分
     /** 每道答对题的用时（ms），与 questionIndices 一一对应 */
     correctTimesMs: number[];
     /** 每道答对题对应的题号（1-based） */
@@ -482,12 +481,9 @@ export class ImageRenderer {
 
       // 统计数据
       ctx2d.font = `13px ${CJK_FONT_STACK}`;
-      const stats: Array<{ color: string; text: string }> = [
+      const stats = [
         { color: "#27ae60", text: `✅ ${p.correct}` },
         { color: "#e74c3c", text: `❌ ${p.wrong}` },
-        ...(p.penaltyPoints > 0
-          ? [{ color: "#c0392b", text: `扣${p.penaltyPoints}分` }]
-          : []),
         { color: "#7f8c8d", text: `正确率 ${accuracy}` },
         { color: "#7f8c8d", text: `均 ${(avgMs / 1000).toFixed(1)}s` },
         { color: "#7f8c8d", text: `最快 ${(minMs / 1000).toFixed(1)}s` },

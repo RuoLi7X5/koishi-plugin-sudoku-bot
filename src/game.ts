@@ -105,9 +105,8 @@ type TrainingQuestion = {
 type TrainingParticipant = {
   userId: string;
   username: string;
-  correct: number;      // 答对题数
-  wrong: number;        // 答错总次数
-  penaltyPoints: number; // 本场累计扣分（答错产生，防止瞎猜）
+  correct: number;  // 答对题数
+  wrong: number;    // 答错总次数
   /** 每道答对题的 { 题号, 用时(ms) } */
   correctAnswers: Array<{ questionIndex: number; elapsedMs: number }>;
 };
@@ -180,6 +179,8 @@ type GameState = {
   usernameCache: Map<string, string>;     // 本局内昵称缓存（answer 时捕获），用于结算和存储
   currentPrefix: string;                  // 本轮分配的题目前缀，如 "a"、"ab"
   currentQuestionIdx: number;             // 本轮已出题序号（1-based），当前题编号 = currentPrefix + currentQuestionIdx
+  /** 当前题每个玩家的连续答错次数（每道新题出题时清空） */
+  questionWrongAttempts: Map<string, number>;
   // 预生成下一题的异步任务（在当前题发出后立即触发，完成后可直接使用，消除出题延迟）
   pregenerationTask?: Promise<PregeneratedGameQuestion | null>;
 };
@@ -282,14 +283,16 @@ export class SudokuGame {
       "",
       "📝 玩法说明",
       `  每轮 ${c.rounds} 题，每题限时 ${curTimeout > 0 ? `${curTimeout} 秒` : "无限制（答对才进入下一题）"}`,
-      "  答对得分答错扣分，连续答对有积分加成",
+      "  答对得分，连续答对有积分加成",
+      "  答错扣分（同一题连续答错递进惩罚）：首次-10分，再错-100分，三错及以上-666分",
       `  完美局（全 ${c.rounds} 题全对，无一答错）可解锁专属成就，探索隐藏成就获得专属头衔！`,
       "",
       "🔍 求解指引",
       `  ${c.commandHint} a1 - 查询题目 a1 的推理解法（游戏结束后可用，24小时内有效）`,
     "",
     "🎯 唯余训练",
-    `  ${c.commandTrainingStart} - 开始唯余训练（无限模式，找出盘面中唯一的缺失数字）`,
+    `  ${c.commandTrainingStart} - 开始普通唯余训练（找出盘面中唯一的缺失数字）`,
+    `  ${c.commandTrainingStart} 进阶 - 开始进阶唯余训练（加入干扰项，不能靠"一眼少哪个"）`,
     `  ${c.commandTrainingStop} - 结束本轮训练并查看统计报告`,
     ].join("\n");
     await session.send(message);
@@ -367,6 +370,7 @@ export class SudokuGame {
       usernameCache: new Map(),
       currentPrefix: "",
       currentQuestionIdx: 0,
+      questionWrongAttempts: new Map(),
     };
 
     this.games.set(session.channelId, newGame);
@@ -949,6 +953,8 @@ export class SudokuGame {
 
     // ── 标记题目为"待作答"（防止发图失败时游戏卡死），须在 send 之前完成 ────────
     game.answered = false;
+    // 每道新题清空连续答错计数，重新开始计梯度扣分
+    game.questionWrongAttempts = new Map();
 
     // 每次出题重置无人参与超时计时器（无需等待图片发出）
     this.resetInactivityTimer(session, game);
@@ -1032,18 +1038,29 @@ export class SudokuGame {
     const correct = game.currentSolution[q.row][q.col];
 
     if (number !== correct) {
-      this.updateParticipant(game, session.userId, false, answerTime);
-      // 单人嘲讽：50%概率触发
-      if (Math.random() < 0.5) {
-        // 使用已缓存的昵称（本次捕获 > 之前缓存 > userId）
-        const displayUser = capturedName || game.usernameCache.get(session.userId) || session.userId;
+      // 递进扣分：同一题连续答错依次 -10 / -100 / -666，防止瞎猜
+      const prevWrong = game.questionWrongAttempts.get(session.userId) ?? 0;
+      const newWrong = prevWrong + 1;
+      game.questionWrongAttempts.set(session.userId, newWrong);
+      const PENALTY_TIERS = [10, 100, 666] as const;
+      const penalty = PENALTY_TIERS[Math.min(newWrong - 1, PENALTY_TIERS.length - 1)];
+
+      this.updateParticipant(game, session.userId, false, answerTime, penalty);
+
+      const displayUser = capturedName || game.usernameCache.get(session.userId) || session.userId;
+      // 单人嘲讽：50%概率触发（首次答错）；多次答错固定显示警告
+      if (newWrong === 1 && Math.random() < 0.5) {
         const mockMsg = this.getRandomMock("singleMock", {
           user: displayUser,
-          penalty: this.config.penalty,
+          penalty,
         });
         await session.send(mockMsg);
+      } else if (newWrong === 2) {
+        await session.send(`${h.at(session.userId)} 连续答错！扣 ${penalty} 分。`);
+      } else if (newWrong >= 3) {
+        await session.send(`${h.at(session.userId)} 疯狂乱猜？扣 ${penalty} 分！！`);
       } else {
-        await session.send(`${h.at(session.userId)} 答错了，扣 ${this.config.penalty} 分。`);
+        await session.send(`${h.at(session.userId)} 答错了，扣 ${penalty} 分。`);
       }
       return;
     }
@@ -1076,6 +1093,7 @@ export class SudokuGame {
     userId: string,
     isCorrect: boolean,
     answerTime?: number,
+    penalty?: number,
   ) {
     let p = game.participants.get(userId);
     if (!p) {
@@ -1110,7 +1128,7 @@ export class SudokuGame {
     } else {
       p.wrong++;
       p.streak = 0;
-      p.score -= this.config.penalty;
+      p.score -= (penalty ?? this.config.penalty);
     }
     return p;
   }
@@ -1595,7 +1613,6 @@ export class SudokuGame {
         username,
         correct: 0,
         wrong: 0,
-        penaltyPoints: 0,
         correctAnswers: [],
       });
     }
@@ -1604,25 +1621,11 @@ export class SudokuGame {
     participant.username = username;
 
     if (num !== cq.answer) {
-      // 答错：按本题连续错误次数累进扣分，防止瞎猜
-      const prevWrong = cq.wrongAttempts.get(session.userId) ?? 0;
-      const newWrong = prevWrong + 1;
-      cq.wrongAttempts.set(session.userId, newWrong);
+      // 答错：记录，嘲讽，继续等待
+      cq.wrongAttempts.set(session.userId, (cq.wrongAttempts.get(session.userId) ?? 0) + 1);
       participant.wrong++;
-
-      // 扣分梯度：第1次-10，第2次-100，第3次及以上-666
-      const PENALTY_TIERS = [10, 100, 666] as const;
-      const penalty = PENALTY_TIERS[Math.min(newWrong - 1, PENALTY_TIERS.length - 1)];
-      participant.penaltyPoints += penalty;
-
       const mockMsg = this.getRandomMock("trainingMock", { user: username });
-      const penaltyTip =
-        newWrong === 1
-          ? `（扣 ${penalty} 分）`
-          : newWrong === 2
-          ? `⚠️ 连续答错！扣 ${penalty} 分！`
-          : `🚨 疯狂乱猜？扣 ${penalty} 分！！`;
-      await session.send(`${mockMsg}\n${penaltyTip}`);
+      await session.send(mockMsg);
       return;
     }
 
@@ -1997,7 +2000,6 @@ export class SudokuGame {
         username: p.username,
         correct: p.correct,
         wrong: p.wrong,
-        penaltyPoints: p.penaltyPoints,
         correctTimesMs: p.correctAnswers.map((a) => a.elapsedMs),
         questionIndices: p.correctAnswers.map((a) => a.questionIndex),
       })),
@@ -2022,8 +2024,7 @@ export class SudokuGame {
             p.correctAnswers.length > 0
               ? p.correctAnswers.reduce((s, a) => s + a.elapsedMs, 0) / p.correctAnswers.length
               : 0;
-          const penaltyStr = p.penaltyPoints > 0 ? ` 扣${p.penaltyPoints}分` : "";
-          return `${p.username}：✅${p.correct} ❌${p.wrong}${penaltyStr} 正确率${acc} 均${(avgMs / 1000).toFixed(1)}s`;
+          return `${p.username}：✅${p.correct} ❌${p.wrong} 正确率${acc} 均${(avgMs / 1000).toFixed(1)}s`;
         }),
       ];
       await session.send(lines.join("\n"));
