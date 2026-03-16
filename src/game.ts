@@ -969,7 +969,7 @@ export class SudokuGame {
         logger.error("Canvas 返回空 Buffer，图片生成失败");
         await session.send("⚠️ 图片生成失败，但游戏继续。");
       } else {
-        await session.send(h.image(`data:image/png;base64,${image.toString("base64")}`));
+        await this.sendImage(session, image);
         logger.info(`第 ${game.currentRound + 1} 题盘面发送（${image.length} bytes）编号：${questionId}`);
       }
     } catch (error: any) {
@@ -1049,18 +1049,22 @@ export class SudokuGame {
 
       const displayUser = capturedName || game.usernameCache.get(session.userId) || session.userId;
       // 单人嘲讽：50%概率触发（首次答错）；多次答错固定显示警告
-      if (newWrong === 1 && Math.random() < 0.5) {
-        const mockMsg = this.getRandomMock("singleMock", {
-          user: displayUser,
-          penalty,
-        });
-        await session.send(mockMsg);
-      } else if (newWrong === 2) {
-        await session.send(`${h.at(session.userId)} 连续答错！扣 ${penalty} 分。`);
-      } else if (newWrong >= 3) {
-        await session.send(`${h.at(session.userId)} 疯狂乱猜？扣 ${penalty} 分！！`);
-      } else {
-        await session.send(`${h.at(session.userId)} 答错了，扣 ${penalty} 分。`);
+      try {
+        if (newWrong === 1 && Math.random() < 0.5) {
+          const mockMsg = this.getRandomMock("singleMock", {
+            user: displayUser,
+            penalty,
+          });
+          await session.send(mockMsg);
+        } else if (newWrong === 2) {
+          await session.send(`${h.at(session.userId)} 连续答错！扣 ${penalty} 分。`);
+        } else if (newWrong >= 3) {
+          await session.send(`${h.at(session.userId)} 疯狂乱猜？扣 ${penalty} 分！！`);
+        } else {
+          await session.send(`${h.at(session.userId)} 答错了，扣 ${penalty} 分。`);
+        }
+      } catch (err: any) {
+        this.ctx.logger("sudoku").warn("答错反馈消息发送失败：", err?.message ?? err);
       }
       return;
     }
@@ -1082,10 +1086,29 @@ export class SudokuGame {
     const timeStr = answerTime < 60
       ? `${answerTime}秒`
       : `${Math.floor(answerTime / 60)}分${answerTime % 60}秒`;
-    await session.send(`恭喜 ${displayName} 答对！+${earned} 分（连击${participant.streak}次），用时 ${timeStr}。`);
+    // 答对反馈：发送失败时仅记录警告，不阻止游戏推进（如 QQ 临时风控 retcode:1200）
+    try {
+      await session.send(`恭喜 ${displayName} 答对！+${earned} 分（连击${participant.streak}次），用时 ${timeStr}。`);
+    } catch (err: any) {
+      this.ctx.logger("sudoku").warn("答对反馈消息发送失败：", err?.message ?? err);
+    }
 
     game.currentRound++;
     await this.askNextQuestion(session, game);
+  }
+
+  /**
+   * 发送图片：优先 base64 内联（单次 API 调用，延迟最低）；
+   * 若 base64 发送失败（如 OneBot 实现限制），自动降级为 file:// 本地路径。
+   */
+  private async sendImage(session: Session, buf: Buffer): Promise<void> {
+    try {
+      await session.send(h.image(`data:image/png;base64,${buf.toString("base64")}`));
+    } catch {
+      // base64 失败（请求体过大或 OneBot 限制）→ 降级为 file:// 本地文件路径
+      const filePath = await this.renderer.saveTmpImage(buf);
+      await session.send(h.image(`file://${filePath}`));
+    }
   }
 
   private updateParticipant(
@@ -1938,7 +1961,7 @@ export class SudokuGame {
         // ── 路径A：命中题目池——直接发送预渲染图片（仅剩网络传输延迟）─────────────
         cq.answer = poolEntry.answer;
         if (!this.trainings.has(ts.channelId)) return;
-        await session.send(h.image(`data:image/png;base64,${poolEntry.renderedImage.toString("base64")}`));
+        await this.sendImage(session, poolEntry.renderedImage);
       } else {
         // ── 路径B：池未就绪——实时生成 + 渲染（退化路径，通常仅第1题触发）──────────
         const { puzzle, answer } = ts.mode === 'advanced'
@@ -1947,7 +1970,7 @@ export class SudokuGame {
         cq.answer = answer;
         const imgBuf = await this.renderer.render(puzzle, label, undefined, undefined);
         if (!this.trainings.has(ts.channelId)) return;
-        await session.send(h.image(`data:image/png;base64,${imgBuf.toString("base64")}`));
+        await this.sendImage(session, imgBuf);
       }
     } catch (err: any) {
       if (!this.trainings.has(ts.channelId)) return;
@@ -2007,8 +2030,7 @@ export class SudokuGame {
 
     try {
       const imgBuf = await this.renderer.renderTrainingStats(renderData);
-      const b64 = imgBuf.toString("base64");
-      await session.send(h.image(`data:image/png;base64,${b64}`));
+      await this.sendImage(session, imgBuf);
     } catch (err: any) {
       this.ctx.logger("sudoku").warn("训练报告渲染失败，降级为文字：", err);
       // 文字降级报告

@@ -226,16 +226,55 @@ function getPlayerColors(n: number): string[] {
 export class ImageRenderer {
   private static fontsInitialized = false;
 
+  /** 临时图片目录，用于 file:// 方式发图，避免大 base64 请求体 */
+  private tmpDir: string;
+
   constructor(private ctx: Context) {
+    // ── 字体初始化 ──────────────────────────────────────────────────────────
     if (!ImageRenderer.fontsInitialized) {
       ImageRenderer.fontsInitialized = true;
       const logger = ctx.logger?.("sudoku") ?? ctx.logger("sudoku");
-      // extraDirs：让用户可以把字体文件放到 <koishi数据目录>/fonts/ 下即可生效
       const extraDirs = ctx.baseDir
         ? [join(ctx.baseDir, "fonts"), join(ctx.baseDir, "data", "fonts")]
         : [];
       loadCJKFonts(extraDirs, logger);
     }
+
+    // ── 临时目录初始化 ──────────────────────────────────────────────────────
+    this.tmpDir = ctx.baseDir
+      ? join(ctx.baseDir, "tmp", "sudoku-images")
+      : join(require("os").tmpdir(), "sudoku-images");
+    try {
+      require("fs").mkdirSync(this.tmpDir, { recursive: true });
+    } catch {}
+  }
+
+  /**
+   * 将图片 Buffer 写入临时文件，返回绝对路径（供 file:// 降级路径使用）。
+   * 同时异步清理超过 10 分钟的旧文件，不阻塞事件循环。
+   */
+  async saveTmpImage(buf: Buffer): Promise<string> {
+    const fsp = require("fs").promises;
+
+    // 异步写入新文件（先写后清理，确保主路径最快完成）
+    const fileName = `sudoku_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.png`;
+    const filePath = join(this.tmpDir, fileName);
+    await fsp.writeFile(filePath, buf);
+
+    // 后台异步清理超龄文件（不 await，不阻塞调用方）
+    fsp.readdir(this.tmpDir).then(async (files: string[]) => {
+      const now = Date.now();
+      for (const file of files) {
+        if (!file.endsWith(".png")) continue;
+        const fp = join(this.tmpDir, file);
+        try {
+          const stat = await fsp.stat(fp);
+          if (now - stat.mtimeMs > 10 * 60 * 1000) await fsp.unlink(fp);
+        } catch {}
+      }
+    }).catch(() => {});
+
+    return filePath;
   }
 
   /** 创建 Canvas 和 2D 上下文（自动探测可用 API） */
@@ -301,10 +340,10 @@ export class ImageRenderer {
     questionId?: string,
   ): Promise<Buffer> {
     const logger = this.ctx.logger("sudoku");
-    const cellSize = 50;
+    const cellSize = 40;          // 原 50，缩减 20% 使 PNG 体积减少约 30%
     const gridSize = cellSize * 9;
-    const padding = 20;
-    const bottomSpace = 40;
+    const padding = 16;
+    const bottomSpace = 34;
     const size = gridSize + padding * 2;
     const totalHeight = size + bottomSpace;
 
@@ -356,7 +395,7 @@ export class ImageRenderer {
       }
 
       // 数字
-      ctx2d.font = `30px ${CJK_FONT_STACK}`;
+      ctx2d.font = `24px ${CJK_FONT_STACK}`;
       ctx2d.fillStyle = "#000000";
       ctx2d.textAlign = "center";
       ctx2d.textBaseline = "middle";
@@ -375,7 +414,7 @@ export class ImageRenderer {
 
       // 底部：难度居中，题目编号右对齐
       const bottomY = size + bottomSpace / 2;
-      ctx2d.font = `bold 16px ${CJK_FONT_STACK}`;
+      ctx2d.font = `bold 13px ${CJK_FONT_STACK}`;
       ctx2d.fillStyle = "#666666";
       ctx2d.textBaseline = "middle";
 
