@@ -96,7 +96,43 @@ export type TrainingRenderData = {
   }>;
 };
 
-const PLAYER_COLORS = ["#4C9BE8", "#F4A026", "#5ABF6F", "#E8634C", "#9B59B6"];
+/** 10 个精选对比色，覆盖常规训练人数 */
+const PLAYER_COLOR_PALETTE = [
+  "#4C9BE8", // 蓝
+  "#E8634C", // 红橙
+  "#5ABF6F", // 绿
+  "#F4A026", // 橙黄
+  "#9B59B6", // 紫
+  "#1ABC9C", // 青绿
+  "#E91E8C", // 玫红
+  "#D4AC0D", // 金黄
+  "#2E86C1", // 深蓝
+  "#784212", // 棕
+];
+
+/** HSL → #rrggbb，用于超过调色板容量时动态生成 */
+function hslToHex(h: number, s: number, l: number): string {
+  s /= 100;
+  l /= 100;
+  const a = s * Math.min(l, 1 - l);
+  const f = (n: number) => {
+    const k = (n + h / 30) % 12;
+    const c = l - a * Math.max(Math.min(k - 3, 9 - k, 1), -1);
+    return Math.round(255 * c).toString(16).padStart(2, "0");
+  };
+  return `#${f(0)}${f(8)}${f(4)}`;
+}
+
+/** 返回 n 个唯一且视觉可辨的玩家颜色 */
+function getPlayerColors(n: number): string[] {
+  if (n <= PLAYER_COLOR_PALETTE.length) {
+    return PLAYER_COLOR_PALETTE.slice(0, n);
+  }
+  // 超过调色板上限：用黄金角均匀分布色相，保证最大视觉差异
+  return Array.from({ length: n }, (_, i) =>
+    hslToHex((i * 137.508) % 360, 65, 48),
+  );
+}
 
 export class ImageRenderer {
   constructor(private ctx: Context) {}
@@ -282,6 +318,7 @@ export class ImageRenderer {
     const FOOTER_H = 20;
 
     const nPlayers = data.participants.length;
+    const playerColors = getPlayerColors(nPlayers);
     const totalH =
       TITLE_H +
       PLAYER_ROW_H * nPlayers +
@@ -318,7 +355,7 @@ export class ImageRenderer {
     // ── 玩家统计行 ───────────────────────────────
     for (let i = 0; i < nPlayers; i++) {
       const p = data.participants[i];
-      const color = PLAYER_COLORS[i % PLAYER_COLORS.length];
+      const color = playerColors[i];
       const total = p.correct + p.wrong;
       const accuracy = total === 0 ? "—" : `${((p.correct / total) * 100).toFixed(1)}%`;
       const avgMs =
@@ -376,6 +413,7 @@ export class ImageRenderer {
     this.drawHistogram(
       ctx2d,
       data.participants,
+      playerColors,
       PAD + AXIS_W,
       y,
       CHART_W,
@@ -406,7 +444,7 @@ export class ImageRenderer {
         ctx2d.textAlign = "left";
         ctx2d.fillText(lbl, lx, y + 14);
         lx -= 16;
-        ctx2d.fillStyle = PLAYER_COLORS[i % PLAYER_COLORS.length];
+        ctx2d.fillStyle = playerColors[i];
         ctx2d.fillRect(lx - 12, y + 6, 12, 12);
         lx -= 18;
       }
@@ -416,6 +454,7 @@ export class ImageRenderer {
     this.drawLineChart(
       ctx2d,
       data.participants,
+      playerColors,
       PAD + AXIS_W,
       y,
       CHART_W,
@@ -447,6 +486,7 @@ export class ImageRenderer {
   private drawHistogram(
     ctx2d: any,
     participants: TrainingRenderData["participants"],
+    playerColors: string[],
     chartX: number,
     chartY: number,
     chartW: number,
@@ -519,7 +559,7 @@ export class ImageRenderer {
         const bh = (cnt / maxCount) * barAreaH;
         const bx = chartX + bi * bucketW + BAR_GAP + pi * (barW + BAR_GAP);
         const by = chartY + barAreaH - bh;
-        ctx2d.fillStyle = PLAYER_COLORS[pi % PLAYER_COLORS.length];
+        ctx2d.fillStyle = playerColors[pi];
         ctx2d.fillRect(bx, by, barW, bh);
 
         // 柱顶数字（仅单玩家或柱子够宽时）
@@ -541,6 +581,7 @@ export class ImageRenderer {
   private drawLineChart(
     ctx2d: any,
     participants: TrainingRenderData["participants"],
+    playerColors: string[],
     chartX: number,
     chartY: number,
     chartW: number,
@@ -597,7 +638,7 @@ export class ImageRenderer {
       const p = participants[pi];
       if (p.questionIndices.length === 0) continue;
 
-      const color = PLAYER_COLORS[pi % PLAYER_COLORS.length];
+      const color = playerColors[pi];
 
       // 按题号排序
       const pairs = p.questionIndices
