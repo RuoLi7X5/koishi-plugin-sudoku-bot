@@ -77,70 +77,93 @@ export const CJK_FONT_STACK = [
 ].join(", ");
 
 /**
- * 向 Canvas 注册 CJK 字体。
- * 同时扫描目录（适合 @napi-rs/canvas）并逐文件显式注册（更可靠）。
- * @param extraDirs 额外扫描的目录（如 Koishi 数据目录下的 fonts 子目录）
- * @param logger    可选日志器，用于输出字体加载结果
+ * 向 Canvas 注册 CJK 字体，返回成功注册的文件数。
+ *
+ * 优先级：koishiCanvas.GlobalFonts（与画布创建使用同一模块实例）> NativeCanvas.GlobalFonts > NativeCanvas.registerFont
+ *
+ * @param extraDirs    额外扫描目录（Koishi 数据目录 fonts 子目录等）
+ * @param logger       日志器
+ * @param koishiCanvas ctx.canvas，用于访问与画布同一模块实例的 GlobalFonts
  */
-function loadCJKFonts(extraDirs: string[] = [], logger?: Logger): void {
-  if (!NativeCanvas) return;
+function loadCJKFonts(
+  extraDirs: string[] = [],
+  logger?: Logger,
+  koishiCanvas?: any,
+): number {
   const { existsSync, readFileSync, readdirSync } = require("fs");
+
+  // 获取 GlobalFonts：优先从 Koishi canvas 服务（与 createCanvas 同实例），
+  // 兜底用直接 require 到的 NativeCanvas
+  const gf: any =
+    koishiCanvas?.GlobalFonts ??
+    NativeCanvas?.GlobalFonts ??
+    null;
+
+  const legacyRegisterFont: ((path: string, options: { family: string }) => void) | null =
+    NativeCanvas?.registerFont ?? koishiCanvas?.registerFont ?? null;
+
+  if (!gf && !legacyRegisterFont) {
+    logger?.warn(
+      "Canvas 字体注册 API 不可用（GlobalFonts / registerFont 均未找到），中文将显示为方块。\n" +
+      "  请确认 @napi-rs/canvas 或 canvas 已正确安装。"
+    );
+    return 0;
+  }
 
   let loaded = 0;
 
-  if (NativeCanvas?.GlobalFonts) {
-    // ── @napi-rs/canvas ──────────────────────────────────────────────────
-    try { NativeCanvas.GlobalFonts.loadSystemFonts?.(); } catch {}
+  if (gf) {
+    // ── @napi-rs/canvas GlobalFonts ────────────────────────────────────
+    try { gf.loadSystemFonts?.(); } catch {}
 
-    // 目录扫描（不递归，需把子目录都列出来）
     for (const dir of [...CJK_FONT_DIRS, ...extraDirs]) {
-      try { NativeCanvas.GlobalFonts.loadFontsFromDir?.(dir); } catch {}
+      try { gf.loadFontsFromDir?.(dir); } catch {}
     }
 
-    // 逐文件显式注册（最可靠，能确认文件是否存在）
+    // 逐文件显式注册
     for (const [filePath, family] of CJK_FONT_FILES) {
       try {
         if (existsSync(filePath)) {
-          const buf = readFileSync(filePath) as Buffer;
-          NativeCanvas.GlobalFonts.register(buf, family);
+          gf.register(readFileSync(filePath) as Buffer, family);
           loaded++;
         }
       } catch {}
     }
 
-    // 扫描用户自定义字体目录中的所有字体文件
+    // 扫描用户自定义目录
     for (const dir of extraDirs) {
       try {
         if (!existsSync(dir)) continue;
         for (const file of readdirSync(dir) as string[]) {
           if (!/\.(ttf|otf|ttc|woff|woff2)$/i.test(file)) continue;
           try {
-            const buf = readFileSync(join(dir, file)) as Buffer;
-            NativeCanvas.GlobalFonts.register(buf, file.replace(/\.[^.]+$/, ""));
+            gf.register(
+              readFileSync(join(dir, file)) as Buffer,
+              file.replace(/\.[^.]+$/, ""),
+            );
             loaded++;
           } catch {}
         }
       } catch {}
     }
-  } else if (NativeCanvas?.registerFont) {
-    // ── node-canvas ──────────────────────────────────────────────────────
+  } else if (legacyRegisterFont) {
+    // ── node-canvas registerFont ───────────────────────────────────────
     for (const [filePath, family] of CJK_FONT_FILES) {
       try {
         if (existsSync(filePath)) {
-          NativeCanvas.registerFont(filePath, { family });
+          legacyRegisterFont(filePath, { family });
           loaded++;
         }
       } catch {}
     }
 
-    // 扫描用户自定义字体目录
     for (const dir of extraDirs) {
       try {
         if (!existsSync(dir)) continue;
         for (const file of readdirSync(dir) as string[]) {
           if (!/\.(ttf|otf|ttc)$/i.test(file)) continue;
           try {
-            NativeCanvas.registerFont(join(dir, file), { family: file.replace(/\.[^.]+$/, "") });
+            legacyRegisterFont(join(dir, file), { family: file.replace(/\.[^.]+$/, "") });
             loaded++;
           } catch {}
         }
@@ -148,19 +171,71 @@ function loadCJKFonts(extraDirs: string[] = [], logger?: Logger): void {
     }
   }
 
-  if (logger) {
-    if (loaded > 0) {
-      logger.info(`CJK 字体加载完成，共注册 ${loaded} 个字体文件`);
-    } else {
-      logger.warn(
-        "未找到任何 CJK 字体文件，图片中的中文可能显示为方块。\n" +
-        "  Linux 解决方案（任选其一）：\n" +
-        "    apt-get install fonts-wqy-zenhei  （Debian/Ubuntu）\n" +
-        "    yum install wqy-zenhei-fonts       （CentOS/RHEL）\n" +
-        "  或将 .ttf/.otf/.ttc 字体文件放入 Koishi 数据目录下的 fonts/ 子目录。"
-      );
+  return loaded;
+}
+
+/**
+ * 当系统无任何 CJK 字体时，从 CDN 下载 Noto Sans SC 简体子集（约 1.2 MB）并缓存。
+ * 下载成功后立即注册到 GlobalFonts；下次启动直接从缓存加载，无需再次下载。
+ */
+async function downloadAndCacheCJKFont(
+  cacheDir: string,
+  gf: any,
+  logger?: Logger,
+): Promise<void> {
+  const fsp = require("fs").promises;
+  const https = require("https");
+  const http = require("http");
+  const cachedPath = join(cacheDir, "NotoSansSC-Regular.woff2");
+
+  // 已缓存则直接注册
+  try {
+    const buf = await fsp.readFile(cachedPath);
+    gf.register(buf, "Noto Sans CJK SC");
+    logger?.info(`CJK 字体从缓存加载：${cachedPath}`);
+    return;
+  } catch {}
+
+  // 尝试多个 CDN（按优先级）
+  const FONT_URLS = [
+    // jsDelivr 上的 @fontsource/noto-sans-sc 简体子集 woff2，约 1.2 MB
+    "https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-sc@5/files/noto-sans-sc-chinese-simplified-400-normal.woff2",
+    // 备用：unpkg
+    "https://unpkg.com/@fontsource/noto-sans-sc@5/files/noto-sans-sc-chinese-simplified-400-normal.woff2",
+  ];
+
+  for (const url of FONT_URLS) {
+    try {
+      const buf = await new Promise<Buffer>((resolve, reject) => {
+        const lib = url.startsWith("https") ? https : http;
+        lib.get(url, { timeout: 30_000 }, (res: any) => {
+          if (res.statusCode !== 200) {
+            reject(new Error(`HTTP ${res.statusCode}`));
+            return;
+          }
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => resolve(Buffer.concat(chunks)));
+          res.on("error", reject);
+        }).on("error", reject).on("timeout", () => reject(new Error("timeout")));
+      });
+
+      await fsp.mkdir(cacheDir, { recursive: true });
+      await fsp.writeFile(cachedPath, buf);
+      gf.register(buf, "Noto Sans CJK SC");
+      logger?.info(`CJK 字体下载并缓存成功（${(buf.length / 1024).toFixed(0)} KB）：${cachedPath}`);
+      return;
+    } catch (err: any) {
+      logger?.warn(`CJK 字体从 ${url} 下载失败：${err?.message}`);
     }
   }
+
+  logger?.warn(
+    "CJK 字体自动下载失败，中文将显示为方块。\n" +
+    "  请手动将 .ttf/.otf 字体文件放入 Koishi 数据目录下的 fonts/ 子目录，或安装系统字体：\n" +
+    "    yum install google-droid-sans-fonts  （CentOS/RHEL）\n" +
+    "    apt-get install fonts-wqy-zenhei      （Debian/Ubuntu）"
+  );
 }
 
 declare module "koishi" {
@@ -233,11 +308,39 @@ export class ImageRenderer {
     // ── 字体初始化 ──────────────────────────────────────────────────────────
     if (!ImageRenderer.fontsInitialized) {
       ImageRenderer.fontsInitialized = true;
-      const logger = ctx.logger?.("sudoku") ?? ctx.logger("sudoku");
+      const logger = ctx.logger("sudoku");
       const extraDirs = ctx.baseDir
-        ? [join(ctx.baseDir, "fonts"), join(ctx.baseDir, "data", "fonts")]
+        ? [
+            join(ctx.baseDir, "fonts"),
+            join(ctx.baseDir, "data", "fonts"),
+            join(ctx.baseDir, "data", "sudoku", "fonts"),
+          ]
         : [];
-      loadCJKFonts(extraDirs, logger);
+
+      // 关键修复：同时传入 ctx.canvas，确保使用与 createCanvas 相同模块实例的 GlobalFonts
+      const loaded = loadCJKFonts(extraDirs, logger, ctx.canvas);
+
+      if (loaded > 0) {
+        logger.info(`CJK 字体加载完成，共注册 ${loaded} 个字体文件`);
+      } else {
+        logger.warn("未找到系统 CJK 字体，尝试自动下载 Noto Sans SC 子集…");
+        // 异步下载字体，不阻塞启动
+        const gf: any =
+          ctx.canvas?.GlobalFonts ??
+          NativeCanvas?.GlobalFonts ??
+          null;
+        if (gf) {
+          const cacheDir = ctx.baseDir
+            ? join(ctx.baseDir, "data", "sudoku", "fonts")
+            : join(require("os").tmpdir(), "sudoku-fonts");
+          downloadAndCacheCJKFont(cacheDir, gf, logger).catch(() => {});
+        } else {
+          logger.warn(
+            "GlobalFonts API 不可用，无法自动下载字体。\n" +
+            "  请安装系统字体或将字体文件放入 Koishi 数据目录下的 fonts/ 子目录。"
+          );
+        }
+      }
     }
 
     // ── 临时目录初始化 ──────────────────────────────────────────────────────
