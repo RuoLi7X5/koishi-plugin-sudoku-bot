@@ -105,8 +105,9 @@ type TrainingQuestion = {
 type TrainingParticipant = {
   userId: string;
   username: string;
-  correct: number;  // 答对题数
-  wrong: number;    // 答错总次数
+  correct: number;      // 答对题数
+  wrong: number;        // 答错总次数
+  penaltyPoints: number; // 本场累计扣分（答错产生，防止瞎猜）
   /** 每道答对题的 { 题号, 用时(ms) } */
   correctAnswers: Array<{ questionIndex: number; elapsedMs: number }>;
 };
@@ -1594,6 +1595,7 @@ export class SudokuGame {
         username,
         correct: 0,
         wrong: 0,
+        penaltyPoints: 0,
         correctAnswers: [],
       });
     }
@@ -1602,11 +1604,25 @@ export class SudokuGame {
     participant.username = username;
 
     if (num !== cq.answer) {
-      // 答错：记录，嘲讽，继续等待
-      cq.wrongAttempts.set(session.userId, (cq.wrongAttempts.get(session.userId) ?? 0) + 1);
+      // 答错：按本题连续错误次数累进扣分，防止瞎猜
+      const prevWrong = cq.wrongAttempts.get(session.userId) ?? 0;
+      const newWrong = prevWrong + 1;
+      cq.wrongAttempts.set(session.userId, newWrong);
       participant.wrong++;
+
+      // 扣分梯度：第1次-10，第2次-100，第3次及以上-666
+      const PENALTY_TIERS = [10, 100, 666] as const;
+      const penalty = PENALTY_TIERS[Math.min(newWrong - 1, PENALTY_TIERS.length - 1)];
+      participant.penaltyPoints += penalty;
+
       const mockMsg = this.getRandomMock("trainingMock", { user: username });
-      await session.send(mockMsg);
+      const penaltyTip =
+        newWrong === 1
+          ? `（扣 ${penalty} 分）`
+          : newWrong === 2
+          ? `⚠️ 连续答错！扣 ${penalty} 分！`
+          : `🚨 疯狂乱猜？扣 ${penalty} 分！！`;
+      await session.send(`${mockMsg}\n${penaltyTip}`);
       return;
     }
 
@@ -1981,6 +1997,7 @@ export class SudokuGame {
         username: p.username,
         correct: p.correct,
         wrong: p.wrong,
+        penaltyPoints: p.penaltyPoints,
         correctTimesMs: p.correctAnswers.map((a) => a.elapsedMs),
         questionIndices: p.correctAnswers.map((a) => a.questionIndex),
       })),
@@ -2005,7 +2022,8 @@ export class SudokuGame {
             p.correctAnswers.length > 0
               ? p.correctAnswers.reduce((s, a) => s + a.elapsedMs, 0) / p.correctAnswers.length
               : 0;
-          return `${p.username}：✅${p.correct} ❌${p.wrong} 正确率${acc} 均${(avgMs / 1000).toFixed(1)}s`;
+          const penaltyStr = p.penaltyPoints > 0 ? ` 扣${p.penaltyPoints}分` : "";
+          return `${p.username}：✅${p.correct} ❌${p.wrong}${penaltyStr} 正确率${acc} 均${(avgMs / 1000).toFixed(1)}s`;
         }),
       ];
       await session.send(lines.join("\n"));
