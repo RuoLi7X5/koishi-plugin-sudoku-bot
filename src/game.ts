@@ -119,7 +119,7 @@ type TrainingSession = {
   currentQuestionIndex: number;       // 已出题序号（1-based）
   finishedQuestions: number;          // 已正确作答的题目总数
   participants: Map<string, TrainingParticipant>;
-  mode: 'basic' | 'advanced';        // 训练模式：basic=纯唯余，advanced=带干扰项唯余
+  mode: 'basic' | 'advanced';        // 训练模式：basic=难度1纯唯余，advanced=难度2带干扰项唯余
   // 题目池：预生成并预渲染的训练题队列，可直接发送
   questionPool: PregeneratedTrainingQuestion[];
   poolNextQueuedIndex: number;        // 下一个待排入池的题号（始终领先于 currentQuestionIndex）
@@ -291,8 +291,8 @@ export class SudokuGame {
       `  ${c.commandHint} a1 - 查询题目 a1 的推理解法（游戏结束后可用，24小时内有效）`,
     "",
     "🎯 唯余训练",
-    `  ${c.commandTrainingStart} - 开始普通唯余训练（找出盘面中唯一的缺失数字）`,
-    `  ${c.commandTrainingStart} 进阶 - 开始进阶唯余训练（加入干扰项，不能靠"一眼少哪个"）`,
+    `  ${c.commandTrainingStart} - 开始唯余训练（难度1：找出盘面中唯一的缺失数字）`,
+    `  ${c.commandTrainingStart} 2 - 开始唯余训练难度2（加入视觉干扰项，不能靠"一眼少哪个"）`,
     `  ${c.commandTrainingStop} - 结束本轮训练并查看统计报告`,
     ].join("\n");
     await session.send(message);
@@ -1464,10 +1464,10 @@ export class SudokuGame {
     ) ?? "";
   }
 
-  private getRandomMock(type: "groupMock" | "singleMock" | "trainingMock", params: Record<string, any>): string {
+  private getRandomMock(type: "groupMock" | "singleMock" | "trainingMock" | "trainingMockHard" | "trainingMockMax", params: Record<string, any>): string {
     const messages = this.mockMessages[type];
     const template = messages[Math.floor(Math.random() * messages.length)];
-    return template.replace(/\{(\w+)\}/g, (_, key) => params[key] || "");
+    return template.replace(/\{(\w+)\}/g, (_: string, key: string) => String(params[key] ?? ""));
   }
 
   /**
@@ -1587,15 +1587,15 @@ export class SudokuGame {
 
     if (mode === 'advanced') {
       await session.send(
-        "🎯 唯余训练（进阶）开始！\n" +
+        "🎯 唯余训练【难度2】开始！\n" +
         "盘面中恰好有一格可以用「唯余法」填入数字。\n" +
-        "⚠️ 注意：盘面已加入干扰数字，不能仅凭「哪个数少」来判断，需仔细排除才能确定目标格！\n" +
+        "⚠️ 注意：盘面已加入视觉干扰数字，不能仅凭「哪个数少」来判断，需仔细对行/列/宫逐一排除！\n" +
         "输入 1-9 作答。\n" +
         "输入「" + this.config.commandTrainingStop + "」可结束本轮训练并查看报告。",
       );
     } else {
       await session.send(
-        "🎯 唯余训练开始！\n盘面中恰好有一格可以用「唯余法」填入数字，输入 1-9 作答。\n输入「" +
+        "🎯 唯余训练【难度1】开始！\n盘面中恰好有一格可以用「唯余法」填入数字，输入 1-9 作答。\n输入「" +
         this.config.commandTrainingStop +
         "」可结束本轮训练并查看报告。",
       );
@@ -1644,10 +1644,15 @@ export class SudokuGame {
     participant.username = username;
 
     if (num !== cq.answer) {
-      // 答错：记录，嘲讽，继续等待
-      cq.wrongAttempts.set(session.userId, (cq.wrongAttempts.get(session.userId) ?? 0) + 1);
+      // 答错：记录连续答错次数，分级嘲讽，继续等待
+      const attempts = (cq.wrongAttempts.get(session.userId) ?? 0) + 1;
+      cq.wrongAttempts.set(session.userId, attempts);
       participant.wrong++;
-      const mockMsg = this.getRandomMock("trainingMock", { user: username });
+      let mockType: "trainingMock" | "trainingMockHard" | "trainingMockMax";
+      if (attempts >= 3) mockType = "trainingMockMax";
+      else if (attempts === 2) mockType = "trainingMockHard";
+      else mockType = "trainingMock";
+      const mockMsg = this.getRandomMock(mockType, { user: username, attempts });
       await session.send(mockMsg);
       return;
     }
@@ -1662,8 +1667,11 @@ export class SudokuGame {
     ts.finishedQuestions++;
     ts.currentQuestion = null;
 
-    // 简短反馈
-    await session.send(`✅ 答对了！（${(elapsed / 1000).toFixed(1)}s）`);
+    // 答对反馈：格式 "唯余:X 答对了！（XX秒）"
+    const secs = elapsed < 1000
+      ? (elapsed / 1000).toFixed(1)
+      : String(Math.round(elapsed / 1000));
+    await session.send(`唯余:${cq.answer} 答对了！（${secs}秒）`);
 
     // 检查训练是否已被停止（stopTraining 可能在 await 期间调用）
     if (!this.trainings.has(ts.channelId)) return;
@@ -1754,7 +1762,7 @@ export class SudokuGame {
     return this.buildTrainingPuzzleOnce();
   }
 
-  // ─── 唯余训练（进阶）盘面生成 ──────────────────────────────────────────────────
+  // ─── 唯余训练难度2：带干扰项盘面生成 ─────────────────────────────────────────
 
   /**
    * 生成一道带干扰项的进阶唯余训练盘面（单次）。
@@ -1805,6 +1813,24 @@ export class SudokuGame {
       return valid;
     };
 
+    /**
+     * 每次放置数字后的综合校验：
+     * 1. 目标格仍以 answer 为唯一候选数（防止答案被"看见"导致目标格无解）
+     * 2. 全盘无"死格"（0候选数的空格，放置错误会导致无解）
+     * 3. 全盘恰好只有1个唯余格（即目标格）
+     */
+    const isValidPlacement = (): boolean => {
+      const tc = getValidDigits(targetRow, targetCol);
+      if (!tc.has(answer) || tc.size !== 1) return false;
+      if (this.countSoleCandidateCells(puzzle) !== 1) return false;
+      for (let rr = 0; rr < 9; rr++)
+        for (let cc = 0; cc < 9; cc++) {
+          if (puzzle[rr][cc] !== 0 || (rr === targetRow && cc === targetCol)) continue;
+          if (getValidDigits(rr, cc).size === 0) return false;
+        }
+      return true;
+    };
+
     // ── 第一步：在非 peer 格放置答案数（干扰项，最多放2个，至少成功1个）────────
     const nonPeerEmpties: [number, number][] = [];
     for (let r = 0; r < 9; r++)
@@ -1818,10 +1844,10 @@ export class SudokuGame {
       if (decoyCount >= 2) break;
       if (!getValidDigits(r, c).has(answer)) continue;
       puzzle[r][c] = answer;
-      if (this.countSoleCandidateCells(puzzle) === 1) {
+      if (isValidPlacement()) {
         decoyCount++;
       } else {
-        puzzle[r][c] = 0; // 此位置会导致其他格出现新唯余，回退
+        puzzle[r][c] = 0;
       }
     }
     if (decoyCount === 0) return null; // 找不到可放干扰的非peer格，外层重试
@@ -1841,13 +1867,16 @@ export class SudokuGame {
       if (extraCount >= extraTarget) break;
       const valid = getValidDigits(r, c);
       if (valid.size === 0) continue;
+      // peer 格不允许填入 answer（防止目标格候选数被消除）
+      if (isPeer(r, c)) valid.delete(answer);
+      if (valid.size === 0) continue;
       const digits = [...valid];
       const digit = digits[Math.floor(Math.random() * digits.length)];
       puzzle[r][c] = digit;
-      if (this.countSoleCandidateCells(puzzle) === 1) {
+      if (isValidPlacement()) {
         extraCount++;
       } else {
-        puzzle[r][c] = 0; // 会导致新唯余格，回退
+        puzzle[r][c] = 0;
       }
     }
 
@@ -1895,7 +1924,7 @@ export class SudokuGame {
           consecutive_failures < 3
         ) {
           const idx = ts.poolNextQueuedIndex++;
-          const labelPrefix = ts.mode === 'advanced' ? '唯余训练（进阶）' : '唯余训练';
+          const labelPrefix = ts.mode === 'advanced' ? '唯余训练【难度2】' : '唯余训练【难度1】';
           const label = `${labelPrefix} · 第${idx}题`;
           try {
             const { puzzle, answer } = ts.mode === 'advanced'
@@ -1929,7 +1958,7 @@ export class SudokuGame {
 
     ts.currentQuestionIndex++;
     const expectedIndex = ts.currentQuestionIndex;
-    const labelPrefix = ts.mode === 'advanced' ? '唯余训练（进阶）' : '唯余训练';
+    const labelPrefix = ts.mode === 'advanced' ? '唯余训练【难度2】' : '唯余训练【难度1】';
     const label = `${labelPrefix} · 第${expectedIndex}题`;
 
     // ── 从题目池取题（校验题号匹配）────────────────────────────────────────────
@@ -2012,7 +2041,7 @@ export class SudokuGame {
     const participants = Array.from(ts.participants.values());
 
     // 标题
-    const modeLabel = ts.mode === 'advanced' ? '唯余训练（进阶）' : '唯余训练';
+    const modeLabel = ts.mode === 'advanced' ? '唯余训练【难度2】' : '唯余训练【难度1】';
     const title =
       participants.length === 1
         ? `「${participants[0].username}」${modeLabel}报告`

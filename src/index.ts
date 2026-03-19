@@ -252,9 +252,9 @@ export function apply(ctx: Context, config: Config) {
       return game.showHint(session, questionId);
     });
 
-  ctx.command(`${config.commandTrainingStart} [mode]`).action(({ session, args }) => {
+  ctx.command(`${config.commandTrainingStart} [level]`).action(({ session, args }) => {
     if (!session) return "无法获取会话信息";
-    const mode = args?.[0] === '进阶' ? 'advanced' : 'basic';
+    const mode = args?.[0] === '2' ? 'advanced' : 'basic';
     return game.startTraining(session, mode);
   });
 
