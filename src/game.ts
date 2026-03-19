@@ -97,8 +97,16 @@ function checkTargetDifficultyMatch(
 /** 单道训练题的运行状态 */
 type TrainingQuestion = {
   answer: number;
-  questionStartTime: number;          // 出题时间戳
+  questionStartTime: number;          // 出题时间戳（图片发出后才设置）
   wrongAttempts: Map<string, number>; // userId → 本题错误次数
+  /**
+   * 第一个正确答案已收到，正在准备下一题。
+   * 此状态下 ts.currentQuestion 仍指向本题，允许慢一步的玩家继续答对并计时，
+   * 直到下一题图片真正发出时 ts.currentQuestion 才切换到新题。
+   */
+  transitioning: boolean;
+  /** 本题已答对的玩家集合（防止同一玩家重复答对计分） */
+  correctAnswerers: Set<string>;
 };
 
 /** 每个参与训练玩家的累计数据 */
@@ -1657,26 +1665,32 @@ export class SudokuGame {
       return;
     }
 
-    // 答对
+    // 答对 —— 防止同一玩家对同一题重复计分
+    if (cq.correctAnswerers.has(session.userId)) return;
+    cq.correctAnswerers.add(session.userId);
+
     const elapsed = Date.now() - cq.questionStartTime;
     participant.correct++;
     participant.correctAnswers.push({
       questionIndex: ts.currentQuestionIndex,
       elapsedMs: elapsed,
     });
-    ts.finishedQuestions++;
-    ts.currentQuestion = null;
 
-    // 答对反馈：格式 "唯余:X 答对了！（XX秒）"
-    const secs = elapsed < 1000
-      ? (elapsed / 1000).toFixed(1)
-      : String(Math.round(elapsed / 1000));
+    // 答对反馈：格式 "唯余:X 答对了！（XX.XX秒）"，精确到两位小数
+    const secs = (elapsed / 1000).toFixed(2);
     await session.send(`唯余:${cq.answer} 答对了！（${secs}秒）`);
 
     // 检查训练是否已被停止（stopTraining 可能在 await 期间调用）
     if (!this.trainings.has(ts.channelId)) return;
 
-    // 出下一题
+    if (cq.transitioning) {
+      // 已有玩家答对且正在过渡到下一题 —— 本次只记录时间/反馈，不重复推进
+      return;
+    }
+
+    // 本题第一个正确答案：标记过渡状态，推进到下一题
+    cq.transitioning = true;
+    ts.finishedQuestions++;
     await this.nextTrainingQuestion(session, ts);
   }
 
@@ -1985,13 +1999,16 @@ export class SudokuGame {
     // 题目从池中取走后立即触发补充，维持池的饱满度
     this.fillTrainingPool(ts);
 
-    // questionStartTime 将在图片发出后设置（finally 块），确保计时从玩家看到题目时开始
+    // 新题对象：answer 和 questionStartTime 均在图片发出后才最终确定/计时
+    // ts.currentQuestion 保持指向旧题，直到新题图片真正发出才切换（见 finally）
+    // 这样消除了"新题已赋值但图片未发"的竞态窗口，避免错误的 questionStartTime=0 问题
     const cq: TrainingQuestion = {
       answer: 0,
       questionStartTime: 0,
       wrongAttempts: new Map(),
+      transitioning: false,
+      correctAnswerers: new Set(),
     };
-    ts.currentQuestion = cq;
 
     try {
       if (poolEntry) {
@@ -2021,8 +2038,12 @@ export class SudokuGame {
       }
       await session.send(`📋 ${label}（图片渲染失败，请输入 1-9 作答）`);
     } finally {
-      // 图片发出后启动计时
-      cq.questionStartTime = Date.now();
+      // 图片（或降级文本）发出后，原子性地切换当前题并启动计时
+      // 若训练在此期间被停止，则不切换（避免悬挂引用）
+      if (this.trainings.has(ts.channelId)) {
+        cq.questionStartTime = Date.now();
+        ts.currentQuestion = cq;
+      }
     }
   }
 

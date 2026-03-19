@@ -615,6 +615,25 @@ export class ImageRenderer {
   // 唯余训练报告渲染
   // ─────────────────────────────────────────
 
+  /**
+   * 过滤中途参与玩家的首次异常数据。
+   * 若玩家第一条答对用时比其余记录均值高出 >10s，则视为"中途参与异常"，将其从时间数组中排除。
+   * 只检测第一条记录；后续记录无论多大波动均保留。
+   * correctTimesMs 与 questionIndices 是同长并行数组，同步过滤。
+   */
+  private filterFirstOutlier(
+    timesMs: number[],
+    questionIndices: number[],
+  ): { timesMs: number[]; questionIndices: number[] } {
+    if (timesMs.length <= 1) return { timesMs, questionIndices };
+    const restMs = timesMs.slice(1);
+    const avgRest = restMs.reduce((s, t) => s + t, 0) / restMs.length;
+    if (timesMs[0] - avgRest > 10_000) {
+      return { timesMs: restMs, questionIndices: questionIndices.slice(1) };
+    }
+    return { timesMs, questionIndices };
+  }
+
   async renderTrainingStats(data: TrainingRenderData): Promise<Buffer> {
     const W = 800;
     const PAD = 30;
@@ -666,17 +685,28 @@ export class ImageRenderer {
     y += TITLE_H;
 
     // ── 玩家统计行 ───────────────────────────────
+    // 同时构建过滤后的 participants 供图表使用（过滤中途参与首次异常数据）
+    const filteredParticipants = data.participants.map((p) => {
+      const { timesMs, questionIndices } = this.filterFirstOutlier(
+        p.correctTimesMs,
+        p.questionIndices,
+      );
+      return { ...p, correctTimesMs: timesMs, questionIndices };
+    });
+
     for (let i = 0; i < nPlayers; i++) {
       const p = data.participants[i];
+      const fp = filteredParticipants[i];
       const color = playerColors[i];
       const total = p.correct + p.wrong;
       const accuracy = total === 0 ? "—" : `${((p.correct / total) * 100).toFixed(1)}%`;
+      // 时间统计使用过滤后的数据
       const avgMs =
-        p.correctTimesMs.length > 0
-          ? p.correctTimesMs.reduce((s, t) => s + t, 0) / p.correctTimesMs.length
+        fp.correctTimesMs.length > 0
+          ? fp.correctTimesMs.reduce((s, t) => s + t, 0) / fp.correctTimesMs.length
           : 0;
-      const minMs = p.correctTimesMs.length > 0 ? Math.min(...p.correctTimesMs) : 0;
-      const maxMs = p.correctTimesMs.length > 0 ? Math.max(...p.correctTimesMs) : 0;
+      const minMs = fp.correctTimesMs.length > 0 ? Math.min(...fp.correctTimesMs) : 0;
+      const maxMs = fp.correctTimesMs.length > 0 ? Math.max(...fp.correctTimesMs) : 0;
 
       const rowY = y + i * PLAYER_ROW_H;
 
@@ -691,15 +721,15 @@ export class ImageRenderer {
       ctx2d.textBaseline = "top";
       ctx2d.fillText(p.username, PAD + 14, rowY + 12);
 
-      // 统计数据
+      // 统计数据：答对道数（原始值）、答错道数、正确率及时间统计（过滤后）
       ctx2d.font = `13px ${CJK_FONT_STACK}`;
       const stats = [
-        { color: "#27ae60", text: `✅ ${p.correct}` },
-        { color: "#e74c3c", text: `❌ ${p.wrong}` },
-        { color: "#7f8c8d", text: `正确率 ${accuracy}` },
-        { color: "#7f8c8d", text: `均 ${(avgMs / 1000).toFixed(1)}s` },
-        { color: "#7f8c8d", text: `最快 ${(minMs / 1000).toFixed(1)}s` },
-        { color: "#7f8c8d", text: `最慢 ${(maxMs / 1000).toFixed(1)}s` },
+        { color: "#27ae60", text: `正确${p.correct}道` },
+        { color: "#e74c3c", text: `错误${p.wrong}道` },
+        { color: "#2c3e50", text: `正确率${accuracy}` },
+        { color: "#2c3e50", text: `均用时${(avgMs / 1000).toFixed(2)}秒` },
+        { color: "#2c3e50", text: `最快${(minMs / 1000).toFixed(2)}秒` },
+        { color: "#2c3e50", text: `最慢${(maxMs / 1000).toFixed(2)}秒` },
       ];
       let sx = PAD + 14;
       const statY = rowY + 32;
@@ -721,11 +751,28 @@ export class ImageRenderer {
     ctx2d.textAlign = "left";
     ctx2d.textBaseline = "middle";
     ctx2d.fillText("时间分布（答对用时）", PAD + AXIS_W, y + 14);
+    // 直方图图例（多玩家时，与折线图图例格式一致）
+    if (nPlayers > 1) {
+      let lx = W - PAD;
+      for (let i = nPlayers - 1; i >= 0; i--) {
+        const lbl = data.participants[i].username;
+        ctx2d.font = `12px ${CJK_FONT_STACK}`;
+        const tw = ctx2d.measureText(lbl).width;
+        lx -= tw;
+        ctx2d.fillStyle = "#2c3e50";
+        ctx2d.textAlign = "left";
+        ctx2d.fillText(lbl, lx, y + 14);
+        lx -= 16;
+        ctx2d.fillStyle = playerColors[i];
+        ctx2d.fillRect(lx - 12, y + 6, 12, 12);
+        lx -= 18;
+      }
+    }
     y += CHART_LABEL_H;
 
     this.drawHistogram(
       ctx2d,
-      data.participants,
+      filteredParticipants,
       playerColors,
       PAD + AXIS_W,
       y,
@@ -766,7 +813,7 @@ export class ImageRenderer {
 
     this.drawLineChart(
       ctx2d,
-      data.participants,
+      filteredParticipants,
       playerColors,
       PAD + AXIS_W,
       y,
@@ -789,7 +836,15 @@ export class ImageRenderer {
   }
 
   /**
-   * 时间分布直方图
+   * 时间分布图（答对用时直方图）
+   *
+   * 根据玩家数量自动选择最优图表形式：
+   *   1 人   → 柱状图（单色，直观）
+   *   2–3 人 → 分组柱状图（Grouped Bars）：并排柱子，可直接对比高度
+   *   4+ 人  → 频率折线图（Frequency Polygon）：
+   *            各玩家一条彩色折线叠加在同一坐标系，半透明面积填充 + 数据圆点 + 计数标签，
+   *            可视觉比较分布形态，且柱宽/圆点大小不随人数变化。
+   *
    * @param chartX  图表区域左边界（已含 AXIS_W 偏移）
    * @param chartY  图表区域顶边界
    * @param chartW  图表区域宽度
@@ -812,7 +867,7 @@ export class ImageRenderer {
     const barAreaH = chartH - xLabelH;
     const nPlayers = participants.length;
 
-    // 统计各玩家各桶计数
+    // ── 各玩家各桶计数 ──────────────────────────────────────────────────────
     const counts: number[][] = participants.map((p) => {
       const bc = Array(N_BUCKETS).fill(0);
       for (const ms of p.correctTimesMs) {
@@ -827,9 +882,11 @@ export class ImageRenderer {
       return bc;
     });
 
+    // Y 轴最大值以单玩家最大桶计数为基准，各玩家在同一标尺下可直接比较
     const maxCount = Math.max(1, ...counts.flat());
+    const bucketW = chartW / N_BUCKETS;
 
-    // Y 轴格线 & 标签
+    // ── Y 轴格线 & 标签（三种图表通用）──────────────────────────────────────
     const gridSteps = 4;
     for (let g = 0; g <= gridSteps; g++) {
       const cnt = Math.round((maxCount * g) / gridSteps);
@@ -840,7 +897,6 @@ export class ImageRenderer {
       ctx2d.moveTo(chartX, gy);
       ctx2d.lineTo(chartX + chartW, gy);
       ctx2d.stroke();
-
       ctx2d.fillStyle = "#999";
       ctx2d.font = `11px ${CJK_FONT_STACK}`;
       ctx2d.textAlign = "right";
@@ -848,40 +904,142 @@ export class ImageRenderer {
       ctx2d.fillText(cnt.toString(), chartX - 4, gy);
     }
 
-    // 柱子
-    const bucketW = chartW / N_BUCKETS;
-    const BAR_GAP = 5;
-    const innerW = bucketW - BAR_GAP * 2;
-    const barW = nPlayers > 1
-      ? (innerW - BAR_GAP * (nPlayers - 1)) / nPlayers
-      : innerW;
-
+    // ── X 轴标签（三种图表通用）──────────────────────────────────────────────
     for (let bi = 0; bi < N_BUCKETS; bi++) {
-      const labelX = chartX + bi * bucketW + bucketW / 2;
-
-      // X 轴标签
       ctx2d.fillStyle = "#555";
       ctx2d.font = `11px ${CJK_FONT_STACK}`;
       ctx2d.textAlign = "center";
       ctx2d.textBaseline = "top";
-      ctx2d.fillText(BUCKET_LABELS[bi], labelX, chartY + barAreaH + 4);
+      ctx2d.fillText(
+        BUCKET_LABELS[bi],
+        chartX + bi * bucketW + bucketW / 2,
+        chartY + barAreaH + 4,
+      );
+    }
 
+    if (nPlayers >= 4) {
+      // ── 频率折线图（频率多边形，4+ 人）────────────────────────────────────
+      // 桶中心 X / 对应 Y（高度由计数决定）
+      const cx = (bi: number) => chartX + bi * bucketW + bucketW / 2;
+      const cy = (cnt: number) => chartY + barAreaH - (cnt / maxCount) * barAreaH;
+
+      // 第一遍：画所有玩家的半透明面积填充（先画，避免遮挡后绘的折线和圆点）
       for (let pi = 0; pi < nPlayers; pi++) {
-        const cnt = counts[pi][bi];
-        if (cnt === 0) continue;
-        const bh = (cnt / maxCount) * barAreaH;
-        const bx = chartX + bi * bucketW + BAR_GAP + pi * (barW + BAR_GAP);
-        const by = chartY + barAreaH - bh;
+        ctx2d.beginPath();
+        ctx2d.moveTo(cx(0), chartY + barAreaH);
+        for (let bi = 0; bi < N_BUCKETS; bi++) ctx2d.lineTo(cx(bi), cy(counts[pi][bi]));
+        ctx2d.lineTo(cx(N_BUCKETS - 1), chartY + barAreaH);
+        ctx2d.closePath();
+        ctx2d.globalAlpha = 0.10;
         ctx2d.fillStyle = playerColors[pi];
-        ctx2d.fillRect(bx, by, barW, bh);
+        ctx2d.fill();
+        ctx2d.globalAlpha = 1;
+      }
 
-        // 柱顶数字（仅单玩家或柱子够宽时）
-        if (nPlayers === 1 || barW >= 18) {
-          ctx2d.fillStyle = "#2c3e50";
-          ctx2d.font = `11px ${CJK_FONT_STACK}`;
-          ctx2d.textAlign = "center";
+      // 第二遍：画折线 + 数据点 + 计数标签
+      for (let pi = 0; pi < nPlayers; pi++) {
+        const color = playerColors[pi];
+
+        // 折线（经过所有桶中心，包括计数为 0 的桶）
+        ctx2d.strokeStyle = color;
+        ctx2d.lineWidth = 2;
+        ctx2d.lineJoin = "round";
+        ctx2d.beginPath();
+        for (let bi = 0; bi < N_BUCKETS; bi++) {
+          const px = cx(bi), py = cy(counts[pi][bi]);
+          if (bi === 0) ctx2d.moveTo(px, py); else ctx2d.lineTo(px, py);
+        }
+        ctx2d.stroke();
+
+        // 数据点 + 计数标签：所有桶均绘制（含 0 计数桶）
+        for (let bi = 0; bi < N_BUCKETS; bi++) {
+          const cnt = counts[pi][bi];
+          const px = cx(bi);
+          const py = cy(cnt); // cnt=0 时 py = 基线 chartY + barAreaH
+          const isZero = cnt === 0;
+          const dotR = isZero ? 3 : 4;
+
+          // 白心 + 彩色边框圆点（0 计数时圆点略小）
+          ctx2d.fillStyle = "#fff";
+          ctx2d.beginPath();
+          ctx2d.arc(px, py, dotR, 0, Math.PI * 2);
+          ctx2d.fill();
+          ctx2d.strokeStyle = color;
+          ctx2d.lineWidth = isZero ? 1.5 : 2;
+          ctx2d.beginPath();
+          ctx2d.arc(px, py, dotR, 0, Math.PI * 2);
+          ctx2d.stroke();
+
+          // 计数标签（与折线颜色相同）
+          // 0 计数时：多人共享同一 X 位置（基线），水平错开避免重叠
+          ctx2d.fillStyle = color;
+          ctx2d.font = `bold 10px ${CJK_FONT_STACK}`;
           ctx2d.textBaseline = "bottom";
-          ctx2d.fillText(cnt.toString(), bx + barW / 2, by - 1);
+          if (isZero) {
+            // 各玩家以桶中心为轴左右错开，步长 8px，确保标签不重叠
+            const hOffset = (pi - (nPlayers - 1) / 2) * 8;
+            ctx2d.textAlign = "center";
+            ctx2d.fillText("0", px + hOffset, py - dotR - 2);
+          } else {
+            ctx2d.textAlign = "center";
+            ctx2d.fillText(cnt.toString(), px, py - 7);
+          }
+        }
+      }
+    } else {
+      // ── 分组柱状图（1–3 人）────────────────────────────────────────────────
+      // 分组逻辑：X 轴以时间区间为主分组，每个区间内各玩家的柱子并排排列
+      //   每个时间桶宽度 = bucketW
+      //   桶内布局：[左间距 BAR_GAP] [P1柱] [柱间距 BAR_GAP] [P2柱] [柱间距 BAR_GAP] [P3柱] [右间距 BAR_GAP]
+      //   桶间距由相邻桶的右间距+左间距自然形成（BAR_GAP * 2 = 10px）
+      //
+      // 对于计数为 0 的玩家：绘制空心占位轮廓柱，保证每个时间桶内的位置关系固定不变，
+      // 让观看者始终能识别"左柱 = P1、中柱 = P2、右柱 = P3"
+      const BAR_GAP = 5;
+      const innerW = bucketW - BAR_GAP * 2;
+      const barW = nPlayers > 1
+        ? (innerW - BAR_GAP * (nPlayers - 1)) / nPlayers
+        : innerW;
+
+      for (let bi = 0; bi < N_BUCKETS; bi++) {
+        for (let pi = 0; pi < nPlayers; pi++) {
+          const cnt = counts[pi][bi];
+          const bx = chartX + bi * bucketW + BAR_GAP + pi * (barW + BAR_GAP);
+          const baseY = chartY + barAreaH;
+          // 多玩家时标签用玩家色（方便对应），单玩家用深灰
+          const labelColor = nPlayers > 1 ? playerColors[pi] : "#2c3e50";
+          const showLabel = nPlayers === 1 || barW >= 18;
+
+          if (cnt === 0) {
+            // 高度为 0：在基线绘制一条玩家颜色细线，表示该桶底边（0 高度的柱子）
+            ctx2d.strokeStyle = playerColors[pi];
+            ctx2d.lineWidth = 2;
+            ctx2d.beginPath();
+            ctx2d.moveTo(bx, baseY - 1);
+            ctx2d.lineTo(bx + barW, baseY - 1);
+            ctx2d.stroke();
+            // "0" 标签
+            if (showLabel) {
+              ctx2d.fillStyle = labelColor;
+              ctx2d.font = `11px ${CJK_FONT_STACK}`;
+              ctx2d.textAlign = "center";
+              ctx2d.textBaseline = "bottom";
+              ctx2d.fillText("0", bx + barW / 2, baseY - 5);
+            }
+          } else {
+            const bh = (cnt / maxCount) * barAreaH;
+            const by = baseY - bh;
+            ctx2d.fillStyle = playerColors[pi];
+            ctx2d.fillRect(bx, by, barW, bh);
+            // 柱顶计数标签
+            if (showLabel) {
+              ctx2d.fillStyle = labelColor;
+              ctx2d.font = `11px ${CJK_FONT_STACK}`;
+              ctx2d.textAlign = "center";
+              ctx2d.textBaseline = "bottom";
+              ctx2d.fillText(cnt.toString(), bx + barW / 2, by - 1);
+            }
+          }
         }
       }
     }
