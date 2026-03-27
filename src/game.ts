@@ -7,6 +7,197 @@ import { MOCK_MESSAGES } from "./mockMessages";
 import { HintManager } from "./hint";
 import { solve, formatCompactSteps, checkPuzzleIntuitiveSolvable } from "./solver";
 
+// ══════════════════════════════════════════════════════
+// 唯余训练：候选数工具函数（模块级，不依赖 this）
+// ══════════════════════════════════════════════════════
+
+/** 计算全盘每个空格的候选数集合（已填格返回空 Set） */
+function computeCandidates(puzzle: number[][]): Set<number>[][] {
+  const cands: Set<number>[][] = [];
+  for (let r = 0; r < 9; r++) {
+    cands[r] = [];
+    for (let c = 0; c < 9; c++) {
+      if (puzzle[r][c] !== 0) { cands[r][c] = new Set(); continue; }
+      const seen = new Set<number>();
+      for (let j = 0; j < 9; j++) {
+        if (puzzle[r][j]) seen.add(puzzle[r][j]);
+        if (puzzle[j][c]) seen.add(puzzle[j][c]);
+      }
+      const br = Math.floor(r / 3) * 3, bc = Math.floor(c / 3) * 3;
+      for (let dr = 0; dr < 3; dr++)
+        for (let dc = 0; dc < 3; dc++)
+          if (puzzle[br + dr][bc + dc]) seen.add(puzzle[br + dr][bc + dc]);
+      const cand = new Set<number>();
+      for (let d = 1; d <= 9; d++) if (!seen.has(d)) cand.add(d);
+      cands[r][c] = cand;
+    }
+  }
+  return cands;
+}
+
+/** 获取某空格当前合法可填的数字集合 */
+function getValidDigitsAt(puzzle: number[][], r: number, c: number): Set<number> {
+  const seen = new Set<number>();
+  for (let j = 0; j < 9; j++) {
+    if (puzzle[r][j]) seen.add(puzzle[r][j]);
+    if (puzzle[j][c]) seen.add(puzzle[j][c]);
+  }
+  const br = Math.floor(r / 3) * 3, bc = Math.floor(c / 3) * 3;
+  for (let dr = 0; dr < 3; dr++)
+    for (let dc = 0; dc < 3; dc++)
+      if (puzzle[br + dr][bc + dc]) seen.add(puzzle[br + dr][bc + dc]);
+  const valid = new Set<number>();
+  for (let d = 1; d <= 9; d++) if (!seen.has(d)) valid.add(d);
+  return valid;
+}
+
+/**
+ * 在直接候选数基础上迭代应用区块排除推理（指向数对 + 区块行列法），直到稳定。
+ * 用于验证 D3+ 难度题目中依赖区块逻辑才能出数的目标格。
+ */
+function computeAdvancedCandidates(puzzle: number[][]): Set<number>[][] {
+  const cands = computeCandidates(puzzle);
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+
+    // ── 指向数对（宫→行/列）────────────────────────────────────────────────────
+    // 宫内某数字候选仅分布在同一行/列 → 该行/列在宫外的同数字候选消除
+    for (let br = 0; br < 9; br += 3) {
+      for (let bc = 0; bc < 9; bc += 3) {
+        for (let d = 1; d <= 9; d++) {
+          const pos: [number, number][] = [];
+          for (let dr = 0; dr < 3; dr++)
+            for (let dc = 0; dc < 3; dc++) {
+              const r = br + dr, c = bc + dc;
+              if (puzzle[r][c] === 0 && cands[r][c].has(d)) pos.push([r, c]);
+            }
+          if (pos.length === 0) continue;
+          const rows = new Set(pos.map(p => p[0]));
+          const cols = new Set(pos.map(p => p[1]));
+          if (rows.size === 1) {
+            const row = pos[0][0];
+            for (let c = 0; c < 9; c++) {
+              if (c >= bc && c < bc + 3) continue;
+              if (puzzle[row][c] === 0 && cands[row][c].has(d)) {
+                cands[row][c].delete(d); changed = true;
+              }
+            }
+          }
+          if (cols.size === 1) {
+            const col = pos[0][1];
+            for (let r = 0; r < 9; r++) {
+              if (r >= br && r < br + 3) continue;
+              if (puzzle[r][col] === 0 && cands[r][col].has(d)) {
+                cands[r][col].delete(d); changed = true;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // ── 区块行列法（行/列→宫）────────────────────────────────────────────────
+    // 行/列内某数字候选仅分布在同一宫 → 该宫内同行/列以外的同数字候选消除
+    for (let r = 0; r < 9; r++) {
+      for (let d = 1; d <= 9; d++) {
+        const cs: number[] = [];
+        for (let c = 0; c < 9; c++)
+          if (puzzle[r][c] === 0 && cands[r][c].has(d)) cs.push(c);
+        if (cs.length === 0) continue;
+        const boxCols = new Set(cs.map(c => Math.floor(c / 3)));
+        if (boxCols.size === 1) {
+          const bc = [...boxCols][0] * 3;
+          const br = Math.floor(r / 3) * 3;
+          for (let dr = 0; dr < 3; dr++)
+            for (let dc = 0; dc < 3; dc++) {
+              const r2 = br + dr, c2 = bc + dc;
+              if (r2 === r) continue;
+              if (puzzle[r2][c2] === 0 && cands[r2][c2].has(d)) {
+                cands[r2][c2].delete(d); changed = true;
+              }
+            }
+        }
+      }
+    }
+    for (let c = 0; c < 9; c++) {
+      for (let d = 1; d <= 9; d++) {
+        const rs: number[] = [];
+        for (let r = 0; r < 9; r++)
+          if (puzzle[r][c] === 0 && cands[r][c].has(d)) rs.push(r);
+        if (rs.length === 0) continue;
+        const boxRows = new Set(rs.map(r => Math.floor(r / 3)));
+        if (boxRows.size === 1) {
+          const br = [...boxRows][0] * 3;
+          const bc = Math.floor(c / 3) * 3;
+          for (let dr = 0; dr < 3; dr++)
+            for (let dc = 0; dc < 3; dc++) {
+              const r2 = br + dr, c2 = bc + dc;
+              if (c2 === c) continue;
+              if (puzzle[r2][c2] === 0 && cands[r2][c2].has(d)) {
+                cands[r2][c2].delete(d); changed = true;
+              }
+            }
+        }
+      }
+    }
+  }
+
+  return cands;
+}
+
+/**
+ * 获取盘面中所有可推理出的格子集合（显性唯余 + 隐性唯余行/列/宫）。
+ * 使用含区块排除推理的候选数，支持 D3+ 难度题目的验证。
+ * 用于验证"唯一出数"约束。
+ */
+function getDeducibleCells(puzzle: number[][]): Set<string> {
+  const cands = computeAdvancedCandidates(puzzle);
+  const result = new Set<string>();
+
+  for (let r = 0; r < 9; r++)
+    for (let c = 0; c < 9; c++)
+      if (puzzle[r][c] === 0 && cands[r][c].size === 1)
+        result.add(`${r},${c}`);
+
+  for (let r = 0; r < 9; r++)
+    for (let d = 1; d <= 9; d++) {
+      const pos: [number, number][] = [];
+      for (let c = 0; c < 9; c++)
+        if (puzzle[r][c] === 0 && cands[r][c].has(d)) pos.push([r, c]);
+      if (pos.length === 1) result.add(`${pos[0][0]},${pos[0][1]}`);
+    }
+
+  for (let c = 0; c < 9; c++)
+    for (let d = 1; d <= 9; d++) {
+      const pos: [number, number][] = [];
+      for (let r = 0; r < 9; r++)
+        if (puzzle[r][c] === 0 && cands[r][c].has(d)) pos.push([r, c]);
+      if (pos.length === 1) result.add(`${pos[0][0]},${pos[0][1]}`);
+    }
+
+  for (let br = 0; br < 9; br += 3)
+    for (let bc = 0; bc < 9; bc += 3)
+      for (let d = 1; d <= 9; d++) {
+        const pos: [number, number][] = [];
+        for (let dr = 0; dr < 3; dr++)
+          for (let dc = 0; dc < 3; dc++) {
+            const r = br + dr, c = bc + dc;
+            if (puzzle[r][c] === 0 && cands[r][c].has(d)) pos.push([r, c]);
+          }
+        if (pos.length === 1) result.add(`${pos[0][0]},${pos[0][1]}`);
+      }
+
+  return result;
+}
+
+/** 验证全盘只有目标格可被推理出（唯一出数严格约束） */
+function isExactlyOneDeducibleCell(puzzle: number[][], TR: number, TC: number): boolean {
+  const cells = getDeducibleCells(puzzle);
+  return cells.size === 1 && cells.has(`${TR},${TC}`);
+}
+
 // ─── 目标格验证：非直观技巧集合（难度5-6出题格禁止出现）───────────────────
 //
 // 直观技巧（允许）：行/列/宫排除、隐性唯余（宫/行/列）、显性唯余、
@@ -127,7 +318,8 @@ type TrainingSession = {
   currentQuestionIndex: number;       // 已出题序号（1-based）
   finishedQuestions: number;          // 已正确作答的题目总数
   participants: Map<string, TrainingParticipant>;
-  mode: 'basic' | 'advanced';        // 训练模式：basic=难度1纯唯余，advanced=难度2带干扰项唯余
+  /** 训练难度：1=纯唯余，2=干扰项唯余，3=区块唯余，4=双区块，5=数对→区块，6=多数对→双区块 */
+  difficulty: number;
   // 题目池：预生成并预渲染的训练题队列，可直接发送
   questionPool: PregeneratedTrainingQuestion[];
   poolNextQueuedIndex: number;        // 下一个待排入池的题号（始终领先于 currentQuestionIndex）
@@ -297,11 +489,41 @@ export class SudokuGame {
       "",
       "🔍 求解指引",
       `  ${c.commandHint} a1 - 查询题目 a1 的推理解法（游戏结束后可用，24小时内有效）`,
-    "",
-    "🎯 唯余训练",
-    `  ${c.commandTrainingStart} - 开始唯余训练（难度1：找出盘面中唯一的缺失数字）`,
-    `  ${c.commandTrainingStart} 2 - 开始唯余训练难度2（加入视觉干扰项，不能靠"一眼少哪个"）`,
-    `  ${c.commandTrainingStop} - 结束本轮训练并查看统计报告`,
+      "",
+      "🎯 唯余训练",
+      `  ${c.commandTrainingStart} [难度1-6] - 开始唯余训练，不填难度默认1`,
+      `  ${c.commandTrainingStop} - 结束本轮训练并查看统计报告`,
+      "  训练说明：每题盘面只能推出一个数字，难度越高技巧越复杂",
+      "",
+      "📖 难度说明",
+      `  ${c.commandDiffInfo} - 查看答题游戏与唯余训练各难度的技巧详解`,
+    ].join("\n");
+    await session.send(message);
+  }
+
+  /** 难度说明：输出答题游戏难度 + 唯余训练难度的技巧说明 */
+  async showDifficultyInfo(session: Session): Promise<void> {
+    const message = [
+      "【难度说明】",
+      "",
+      "🎮 答题游戏（1-7级）",
+      "  1·简单    直接排除，盘面较空",
+      "  2·较易    显性唯余：某格排除后仅剩1个候选数",
+      "  3·中等    隐性唯余：某数字在行/列/宫中只有1格能填",
+      "  4·中等+   区块排除：宫内候选格集中在同行/列，可向外消除",
+      "  5·困难    显性数对：两格锁定相同2候选数，互相排除",
+      "  6·困难+   数组等多技巧组合",
+      "  7·极难    X翼/XY翼等多步高级推理",
+      "",
+      "━━━━━━━━━━━━━━━━━━━━━━━━",
+      "",
+      "🎯 唯余训练（1-6级）  每题盘面恰好只有1格可推出",
+      "  1·基础唯余    行/列/宫直接排除，目标格9缺1",
+      "  2·干扰唯余    同训练1，加入干扰数字遮蔽视野",
+      "  3·区块唯余    1个区块排除推出目标格（混合显/隐性）",
+      "  4·双区块      2个区块排除推出目标格（混合显/隐性）",
+      "  5·数对→区块   数对占位→形成区块→推出目标格",
+      "  6·多数对      2个数对→双区块→推出目标格",
     ].join("\n");
     await session.send(message);
   }
@@ -1561,7 +1783,7 @@ export class SudokuGame {
   // ══════════════════════════════════════════════════════
 
   /** 开始唯余训练（指令入口） */
-  async startTraining(session: Session, mode: 'basic' | 'advanced' = 'basic'): Promise<void> {
+  async startTraining(session: Session, difficulty: number = 1): Promise<void> {
     const key = this.getTrainingChannelKey(session);
     if (!key) {
       await session.send("唯余训练暂不支持私聊，请在群组中使用。");
@@ -1576,6 +1798,8 @@ export class SudokuGame {
       return;
     }
 
+    const d = Math.min(Math.max(Math.floor(difficulty), 1), 6);
+
     const ts: TrainingSession = {
       channelId: key,
       startTime: Date.now(),
@@ -1583,31 +1807,19 @@ export class SudokuGame {
       currentQuestionIndex: 0,
       finishedQuestions: 0,
       participants: new Map(),
-      mode,
+      difficulty: d,
       questionPool: [],
-      poolNextQueuedIndex: 2, // 第1题由 nextTrainingQuestion 实时生成，池从第2题起预填
+      poolNextQueuedIndex: 2,
       poolFilling: false,
     };
     this.trainings.set(key, ts);
 
-    // 开局即刻开始后台预生成题目池（利用发欢迎消息和渲染第1题的时间）
     this.fillTrainingPool(ts);
 
-    if (mode === 'advanced') {
-      await session.send(
-        "🎯 唯余训练【难度2】开始！\n" +
-        "盘面中恰好有一格可以用「唯余法」填入数字。\n" +
-        "⚠️ 注意：盘面已加入视觉干扰数字，不能仅凭「哪个数少」来判断，需仔细对行/列/宫逐一排除！\n" +
-        "输入 1-9 作答。\n" +
-        "输入「" + this.config.commandTrainingStop + "」可结束本轮训练并查看报告。",
-      );
-    } else {
-      await session.send(
-        "🎯 唯余训练【难度1】开始！\n盘面中恰好有一格可以用「唯余法」填入数字，输入 1-9 作答。\n输入「" +
-        this.config.commandTrainingStop +
-        "」可结束本轮训练并查看报告。",
-      );
-    }
+    await session.send(
+      `🎯 唯余训练【难度${d}】开始！\n盘面只能推出一个数字，找到它并填入！\n` +
+      `输入「${this.config.commandTrainingStop}」可结束本轮训练并查看报告。`,
+    );
     await this.nextTrainingQuestion(session, ts);
   }
 
@@ -1912,6 +2124,937 @@ export class SudokuGame {
     return this.generateTrainingPuzzle();
   }
 
+  // ─── 干扰数字添加（D2-D6 通用）──────────────────────────────────────────────
+
+  /**
+   * 向已验证的训练盘面追加干扰数字。
+   * 每追加一个数字立即验证唯一出数约束，不满足则撤销。
+   * @param maxDecoys  目标答案数字的副本数上限（放在非peer区域）
+   * @param maxExtras  额外随机数字上限
+   */
+  private addTrainingInterference(
+    puzzle: number[][],
+    TR: number, TC: number, answer: number,
+    maxDecoys = 2, maxExtras = 5,
+  ): void {
+    const peerKey = (r: number, c: number) =>
+      r === TR || c === TC ||
+      (Math.floor(r / 3) * 3 === Math.floor(TR / 3) * 3 &&
+       Math.floor(c / 3) * 3 === Math.floor(TC / 3) * 3);
+
+    const empties: [number, number][] = [];
+    for (let r = 0; r < 9; r++)
+      for (let c = 0; c < 9; c++)
+        if (puzzle[r][c] === 0 && !(r === TR && c === TC))
+          empties.push([r, c]);
+    shuffleArray(empties);
+
+    // 放目标数副本（非peer位置）
+    let decoys = 0;
+    for (const [r, c] of empties) {
+      if (decoys >= maxDecoys) break;
+      if (peerKey(r, c)) continue;
+      if (!getValidDigitsAt(puzzle, r, c).has(answer)) continue;
+      puzzle[r][c] = answer;
+      if (isExactlyOneDeducibleCell(puzzle, TR, TC)) { decoys++; } else { puzzle[r][c] = 0; }
+    }
+
+    // 放随机额外数字
+    let extras = 0;
+    const allEmpties: [number, number][] = [];
+    for (let r = 0; r < 9; r++)
+      for (let c = 0; c < 9; c++)
+        if (puzzle[r][c] === 0 && !(r === TR && c === TC))
+          allEmpties.push([r, c]);
+    shuffleArray(allEmpties);
+
+    for (const [r, c] of allEmpties) {
+      if (extras >= maxExtras) break;
+      const valid = getValidDigitsAt(puzzle, r, c);
+      if (valid.size === 0) continue;
+      const digit = [...valid][Math.floor(Math.random() * valid.size)];
+      puzzle[r][c] = digit;
+      if (isExactlyOneDeducibleCell(puzzle, TR, TC)) { extras++; } else { puzzle[r][c] = 0; }
+    }
+  }
+
+  // ══════════════════════════════════════════════════════
+  // 难度3：1区块唯余（显性 + 隐性 混合）
+  // ══════════════════════════════════════════════════════
+
+  /**
+   * 构造D3显性唯余：1个指向区块排除目标格1个候选数 + 7个直接peer覆盖其余候选。
+   *
+   * 区块方向（指向排除）：
+   *   源宫B（与目标格同行带、不同列带）内，数字D仅在目标格所在行TR有候选
+   *   → D从TR行宫B以外的格消除 → 目标格(TR,TC)的D被消除
+   *   构造手段：在源宫B的非TR行中（行r1,r2）各放1个D，使D在行r1/r2可见
+   *             → 源宫B内r1/r2行格子的D被消除 → D锁在源宫B的TR行 → 区块形成
+   */
+  private buildD3NakedSingleOnce(): {
+    puzzle: number[][];
+    targetRow: number; targetCol: number; answer: number;
+  } | null {
+    const TR = Math.floor(Math.random() * 9);
+    const TC = Math.floor(Math.random() * 9);
+    const A  = Math.floor(Math.random() * 9) + 1;
+
+    const targetBR = Math.floor(TR / 3) * 3;
+    const targetBC = Math.floor(TC / 3) * 3;
+
+    // 随机选 D（由区块排除的数）和其余7个直接peer数
+    const others = shuffleArray([1,2,3,4,5,6,7,8,9].filter(d => d !== A));
+    const D = others[0];
+    const rem7 = others.slice(1);
+
+    // 源宫列带（与目标宫列带不同）
+    const srcBCs = [0, 3, 6].filter(bc => bc !== targetBC);
+    const srcBC = srcBCs[Math.floor(Math.random() * srcBCs.length)];
+    // 第三列带（既不是目标宫也不是源宫）
+    const thirdBC = [0, 3, 6].find(bc => bc !== targetBC && bc !== srcBC)!;
+    const thirdCols = [thirdBC, thirdBC + 1, thirdBC + 2];
+
+    // 源宫非TR行
+    const nonTR = [targetBR, targetBR + 1, targetBR + 2].filter(r => r !== TR);
+
+    // D必须放在第三列带（既不在源宫列带也不在目标宫列带），且两格列不同
+    const shuffled3 = shuffleArray([...thirdCols]);
+    const d1C = shuffled3[0], d2C = shuffled3[1];
+
+    const puzzle: number[][] = Array.from({length: 9}, () => Array(9).fill(0));
+    puzzle[nonTR[0]][d1C] = D;
+    puzzle[nonTR[1]][d2C] = D;
+
+    // 放7个直接peer数字（同行/同列/同宫），排除源宫的TR行格子不作为peer
+    const srcBoxTRCols = new Set([srcBC, srcBC + 1, srcBC + 2]);
+    const peerSeen = new Set<string>();
+    const peerList: [number, number][] = [];
+    for (let c = 0; c < 9; c++)
+      if (c !== TC && !srcBoxTRCols.has(c)) peerList.push([TR, c]);
+    for (let r = 0; r < 9; r++)
+      if (r !== TR) peerList.push([r, TC]);
+    for (let dr = 0; dr < 3; dr++)
+      for (let dc = 0; dc < 3; dc++) {
+        const r = targetBR + dr, c = targetBC + dc;
+        if (r !== TR && c !== TC) peerList.push([r, c]);
+      }
+    const uniquePeers: [number, number][] = [];
+    for (const [r, c] of peerList) {
+      const k = `${r},${c}`;
+      if (!peerSeen.has(k)) { peerSeen.add(k); uniquePeers.push([r, c]); }
+    }
+    shuffleArray(uniquePeers);
+
+    const usedPos = new Set<string>();
+    for (const digit of rem7) {
+      let ok = false;
+      for (const [r, c] of uniquePeers) {
+        if (usedPos.has(`${r},${c}`) || puzzle[r][c] !== 0) continue;
+        if (!getValidDigitsAt(puzzle, r, c).has(digit)) continue;
+        puzzle[r][c] = digit; usedPos.add(`${r},${c}`); ok = true; break;
+      }
+      if (!ok) return null;
+    }
+
+    const cands = computeAdvancedCandidates(puzzle);
+    if (!cands[TR][TC].has(A) || cands[TR][TC].size !== 1) return null;
+    if (!isExactlyOneDeducibleCell(puzzle, TR, TC)) return null;
+
+    this.addTrainingInterference(puzzle, TR, TC, A);
+    return { puzzle, targetRow: TR, targetCol: TC, answer: A };
+  }
+
+  /**
+   * 构造D3隐性唯余（行排除）：
+   * 1个区块（列向指向排除）消除行TR某格的候选A + 7个直接A放置消除其余行TR格的A
+   * → 行TR中只有目标格(TR,TC)可以填A
+   *
+   * 区块方向（列向指向排除）：
+   *   源宫S（不同行带，与cBlocked同列带）内A的候选仅在cBlocked列
+   *   → A从cBlocked列宫S以外的格消除 → (TR, cBlocked) 的A被消除
+   *   构造手段：在源宫S的非cBlocked列格子，通过在其行/列外部放置A来消除S内A候选
+   */
+  private buildD3HiddenSingleRowOnce(): {
+    puzzle: number[][];
+    targetRow: number; targetCol: number; answer: number;
+  } | null {
+    const TR = Math.floor(Math.random() * 9);
+    const TC = Math.floor(Math.random() * 9);
+    const A  = Math.floor(Math.random() * 9) + 1;
+
+    const targetBR = Math.floor(TR / 3) * 3;
+    const targetBC = Math.floor(TC / 3) * 3;
+
+    // 随机选一列 cBlocked（行TR中需要被区块封锁的格子的列）
+    const rowCols = [0,1,2,3,4,5,6,7,8].filter(c => c !== TC);
+    shuffleArray(rowCols);
+    let cBlocked = -1;
+    for (const c of rowCols) {
+      const bc = Math.floor(c / 3) * 3;
+      if (bc !== targetBC) { cBlocked = c; break; }
+    }
+    if (cBlocked === -1) return null;
+
+    const srcBC = Math.floor(cBlocked / 3) * 3;
+
+    // 源宫S：不同行带（行带 ≠ targetBR），与 cBlocked 同列带
+    const srcBROptions = [0, 3, 6].filter(br => br !== targetBR);
+    const srcBR = srcBROptions[Math.floor(Math.random() * srcBROptions.length)];
+
+    const puzzle: number[][] = Array.from({length: 9}, () => Array(9).fill(0));
+
+    // 源宫S内需要封锁A的格子（非cBlocked列的6格）
+    // 封锁方法：在该格的行（源宫外）或列（源宫外）放置A
+    const srcNonCCols = [srcBC, srcBC + 1, srcBC + 2].filter(c => c !== cBlocked);
+    for (const col of srcNonCCols) {
+      // 对该列的3个源宫行，逐一在源宫外的行放A来消除该列源宫格
+      const rowsInSrc = [srcBR, srcBR + 1, srcBR + 2];
+      // 找一个行外位置放A（只需让该列在源宫以外已有A即可）
+      const outsideRows = [0,1,2,3,4,5,6,7,8].filter(r => r < srcBR || r > srcBR + 2);
+      shuffleArray(outsideRows);
+      let placed = false;
+      for (const r of outsideRows) {
+        if (r === TR) continue; // 不能放在目标行（会直接可见影响目标）
+        if (getValidDigitsAt(puzzle, r, col).has(A)) {
+          puzzle[r][col] = A; placed = true; break;
+        }
+      }
+      if (!placed) return null;
+    }
+
+    // 验证：源宫S内A的候选仅在cBlocked列
+    const candsCheck = computeCandidates(puzzle);
+    let srcHasAOutsideCBlocked = false;
+    for (let dr = 0; dr < 3; dr++)
+      for (let dc = 0; dc < 3; dc++) {
+        const r = srcBR + dr, c = srcBC + dc;
+        if (c !== cBlocked && puzzle[r][c] === 0 && candsCheck[r][c].has(A)) {
+          srcHasAOutsideCBlocked = true;
+        }
+      }
+    if (srcHasAOutsideCBlocked) return null; // 区块未成功形成
+
+    // 对行TR其余7格（≠TC, ≠cBlocked）逐一在其列或宫放A来封锁
+    const otherRowCols = [0,1,2,3,4,5,6,7,8].filter(c => c !== TC && c !== cBlocked);
+    for (const col of otherRowCols) {
+      const cands2 = computeCandidates(puzzle);
+      if (!cands2[TR][col].has(A)) continue; // 已经被封锁，无需处理
+      // 在该列（行TR以外）找一个位置放A
+      const colRows = [0,1,2,3,4,5,6,7,8].filter(r => r !== TR);
+      shuffleArray(colRows);
+      let placed = false;
+      for (const r of colRows) {
+        if (puzzle[r][col] !== 0) continue;
+        if (!getValidDigitsAt(puzzle, r, col).has(A)) continue;
+        puzzle[r][col] = A; placed = true; break;
+      }
+      if (!placed) {
+        // 尝试在该格的宫内放A
+        const brc = Math.floor(TR / 3) * 3, bcc = Math.floor(col / 3) * 3;
+        let placedBox = false;
+        const boxCells: [number,number][] = [];
+        for (let dr = 0; dr < 3; dr++)
+          for (let dc = 0; dc < 3; dc++)
+            boxCells.push([brc + dr, bcc + dc]);
+        shuffleArray(boxCells);
+        for (const [r2, c2] of boxCells) {
+          if (r2 === TR || puzzle[r2][c2] !== 0) continue;
+          if (!getValidDigitsAt(puzzle, r2, c2).has(A)) continue;
+          puzzle[r2][c2] = A; placedBox = true; break;
+        }
+        if (!placedBox) return null;
+      }
+    }
+
+    // 验证行TR中只有(TR,TC)可以填A（隐性唯余·行）
+    const candsF = computeAdvancedCandidates(puzzle);
+    if (!candsF[TR][TC].has(A)) return null;
+    for (let c = 0; c < 9; c++)
+      if (c !== TC && puzzle[TR][c] === 0 && candsF[TR][c].has(A)) return null;
+
+    if (!isExactlyOneDeducibleCell(puzzle, TR, TC)) return null;
+
+    this.addTrainingInterference(puzzle, TR, TC, A);
+    return { puzzle, targetRow: TR, targetCol: TC, answer: A };
+  }
+
+  /**
+   * 构造D3隐性唯余（列排除）：与行排除对称，但在目标格所在列中寻找隐性唯余。
+   */
+  private buildD3HiddenSingleColOnce(): {
+    puzzle: number[][];
+    targetRow: number; targetCol: number; answer: number;
+  } | null {
+    const TR = Math.floor(Math.random() * 9);
+    const TC = Math.floor(Math.random() * 9);
+    const A  = Math.floor(Math.random() * 9) + 1;
+
+    const targetBR = Math.floor(TR / 3) * 3;
+    const targetBC = Math.floor(TC / 3) * 3;
+
+    // 随机选一行 rBlocked（列TC中需要被区块封锁的格子的行）
+    const colRows = [0,1,2,3,4,5,6,7,8].filter(r => r !== TR);
+    shuffleArray(colRows);
+    let rBlocked = -1;
+    for (const r of colRows) {
+      const br = Math.floor(r / 3) * 3;
+      if (br !== targetBR) { rBlocked = r; break; }
+    }
+    if (rBlocked === -1) return null;
+
+    const srcBR = Math.floor(rBlocked / 3) * 3;
+
+    // 源宫S：不同列带，与 rBlocked 同行带
+    const srcBCOptions = [0, 3, 6].filter(bc => bc !== targetBC);
+    const srcBC = srcBCOptions[Math.floor(Math.random() * srcBCOptions.length)];
+
+    const puzzle: number[][] = Array.from({length: 9}, () => Array(9).fill(0));
+
+    // 源宫S内非rBlocked行的格子：在其列（宫外）放A
+    const srcNonRRows = [srcBR, srcBR + 1, srcBR + 2].filter(r => r !== rBlocked);
+    for (const row of srcNonRRows) {
+      const colsInSrc = [srcBC, srcBC + 1, srcBC + 2];
+      const outsideCols = [0,1,2,3,4,5,6,7,8].filter(c => c < srcBC || c > srcBC + 2);
+      shuffleArray(outsideCols);
+      let placed = false;
+      for (const col of outsideCols) {
+        if (col === TC) continue;
+        if (getValidDigitsAt(puzzle, row, col).has(A)) {
+          puzzle[row][col] = A; placed = true; break;
+        }
+      }
+      if (!placed) return null;
+    }
+
+    const candsCheck = computeCandidates(puzzle);
+    let srcHasAOutsideRBlocked = false;
+    for (let dr = 0; dr < 3; dr++)
+      for (let dc = 0; dc < 3; dc++) {
+        const r = srcBR + dr, c = srcBC + dc;
+        if (r !== rBlocked && puzzle[r][c] === 0 && candsCheck[r][c].has(A))
+          srcHasAOutsideRBlocked = true;
+      }
+    if (srcHasAOutsideRBlocked) return null;
+
+    // 封锁列TC其余行（≠TR, ≠rBlocked）
+    const otherColRows = [0,1,2,3,4,5,6,7,8].filter(r => r !== TR && r !== rBlocked);
+    for (const row of otherColRows) {
+      const cands2 = computeCandidates(puzzle);
+      if (!cands2[row][TC].has(A)) continue;
+      const rowCols = [0,1,2,3,4,5,6,7,8].filter(c => c !== TC);
+      shuffleArray(rowCols);
+      let placed = false;
+      for (const col of rowCols) {
+        if (puzzle[row][col] !== 0) continue;
+        if (!getValidDigitsAt(puzzle, row, col).has(A)) continue;
+        puzzle[row][col] = A; placed = true; break;
+      }
+      if (!placed) {
+        const brc = Math.floor(row / 3) * 3, bcc = Math.floor(TC / 3) * 3;
+        let placedBox = false;
+        const boxCells: [number,number][] = [];
+        for (let dr = 0; dr < 3; dr++)
+          for (let dc = 0; dc < 3; dc++) boxCells.push([brc + dr, bcc + dc]);
+        shuffleArray(boxCells);
+        for (const [r2, c2] of boxCells) {
+          if (c2 === TC || puzzle[r2][c2] !== 0) continue;
+          if (!getValidDigitsAt(puzzle, r2, c2).has(A)) continue;
+          puzzle[r2][c2] = A; placedBox = true; break;
+        }
+        if (!placedBox) return null;
+      }
+    }
+
+    const candsF = computeAdvancedCandidates(puzzle);
+    if (!candsF[TR][TC].has(A)) return null;
+    for (let r = 0; r < 9; r++)
+      if (r !== TR && puzzle[r][TC] === 0 && candsF[r][TC].has(A)) return null;
+
+    if (!isExactlyOneDeducibleCell(puzzle, TR, TC)) return null;
+
+    this.addTrainingInterference(puzzle, TR, TC, A);
+    return { puzzle, targetRow: TR, targetCol: TC, answer: A };
+  }
+
+  /** D3 单次构造：随机在显性唯余 / 隐性唯余行 / 隐性唯余列 三种形式中选一 */
+  private buildD3PuzzleOnce(): {
+    puzzle: number[][];
+    targetRow: number; targetCol: number; answer: number;
+  } | null {
+    const type = Math.floor(Math.random() * 3);
+    if (type === 0) return this.buildD3NakedSingleOnce();
+    if (type === 1) return this.buildD3HiddenSingleRowOnce();
+    return this.buildD3HiddenSingleColOnce();
+  }
+
+  private generateD3Puzzle(): { puzzle: number[][]; targetRow: number; targetCol: number; answer: number } {
+    for (let i = 0; i < 200; i++) {
+      const r = this.buildD3PuzzleOnce();
+      if (r) return r;
+    }
+    throw new Error('D3 puzzle generation failed after 200 attempts');
+  }
+
+  // ══════════════════════════════════════════════════════
+  // 难度4：双区块唯余
+  // ══════════════════════════════════════════════════════
+
+  /**
+   * D4显性唯余：2个独立区块分别排除目标格2个候选数 + 6个直接peer覆盖其余6个。
+   *
+   * 两个源宫均在目标格同行带，分别使用第二、第三列带。
+   * D1 放置在第三列带行（使源宫1锁定 D1 在TR行）
+   * D2 放置在第二列带行（使源宫2锁定 D2 在TR行）
+   */
+  private buildD4NakedSingleOnce(): {
+    puzzle: number[][];
+    targetRow: number; targetCol: number; answer: number;
+  } | null {
+    const TR = Math.floor(Math.random() * 9);
+    const TC = Math.floor(Math.random() * 9);
+    const A  = Math.floor(Math.random() * 9) + 1;
+
+    const targetBR = Math.floor(TR / 3) * 3;
+    const targetBC = Math.floor(TC / 3) * 3;
+
+    const allBC = [0, 3, 6];
+    const otherBCs = allBC.filter(bc => bc !== targetBC);
+    const srcBC1 = otherBCs[0], srcBC2 = otherBCs[1];
+
+    const others = shuffleArray([1,2,3,4,5,6,7,8,9].filter(d => d !== A));
+    const D1 = others[0], D2 = others[1];
+    const rem6 = others.slice(2);
+
+    const nonTR = [targetBR, targetBR + 1, targetBR + 2].filter(r => r !== TR);
+
+    // D1 锁在源宫1（srcBC1列带）：D1放在 srcBC2 列带非TR行
+    const srcBC2Cols = shuffleArray([srcBC2, srcBC2 + 1, srcBC2 + 2]);
+    // D2 锁在源宫2（srcBC2列带）：D2放在 srcBC1 列带非TR行
+    const srcBC1Cols = shuffleArray([srcBC1, srcBC1 + 1, srcBC1 + 2]);
+
+    const puzzle: number[][] = Array.from({length: 9}, () => Array(9).fill(0));
+    puzzle[nonTR[0]][srcBC2Cols[0]] = D1;
+    puzzle[nonTR[1]][srcBC2Cols[1]] = D1;
+    puzzle[nonTR[0]][srcBC1Cols[0]] = D2;
+    puzzle[nonTR[1]][srcBC1Cols[1]] = D2;
+
+    // 6个直接peer（排除源宫TR行格）
+    const src1TRCols = new Set([srcBC1, srcBC1 + 1, srcBC1 + 2]);
+    const src2TRCols = new Set([srcBC2, srcBC2 + 1, srcBC2 + 2]);
+    const peerSeen = new Set<string>();
+    const peerList: [number, number][] = [];
+    for (let c = 0; c < 9; c++)
+      if (c !== TC && !src1TRCols.has(c) && !src2TRCols.has(c)) peerList.push([TR, c]);
+    for (let r = 0; r < 9; r++) if (r !== TR) peerList.push([r, TC]);
+    for (let dr = 0; dr < 3; dr++)
+      for (let dc = 0; dc < 3; dc++) {
+        const r = targetBR + dr, c = targetBC + dc;
+        if (r !== TR && c !== TC) peerList.push([r, c]);
+      }
+    const uniquePeers: [number, number][] = [];
+    for (const [r, c] of peerList) {
+      const k = `${r},${c}`;
+      if (!peerSeen.has(k)) { peerSeen.add(k); uniquePeers.push([r, c]); }
+    }
+    shuffleArray(uniquePeers);
+
+    const usedPos = new Set<string>();
+    for (const digit of rem6) {
+      let ok = false;
+      for (const [r, c] of uniquePeers) {
+        if (usedPos.has(`${r},${c}`) || puzzle[r][c] !== 0) continue;
+        if (!getValidDigitsAt(puzzle, r, c).has(digit)) continue;
+        puzzle[r][c] = digit; usedPos.add(`${r},${c}`); ok = true; break;
+      }
+      if (!ok) return null;
+    }
+
+    const cands = computeAdvancedCandidates(puzzle);
+    if (!cands[TR][TC].has(A) || cands[TR][TC].size !== 1) return null;
+    if (!isExactlyOneDeducibleCell(puzzle, TR, TC)) return null;
+
+    this.addTrainingInterference(puzzle, TR, TC, A);
+    return { puzzle, targetRow: TR, targetCol: TC, answer: A };
+  }
+
+  /**
+   * D4隐性唯余（行排除）：2个独立的列向区块各封锁行TR中1格的候选A + 6个直接A放置封锁其余6格。
+   */
+  private buildD4HiddenSingleRowOnce(): {
+    puzzle: number[][];
+    targetRow: number; targetCol: number; answer: number;
+  } | null {
+    const TR = Math.floor(Math.random() * 9);
+    const TC = Math.floor(Math.random() * 9);
+    const A  = Math.floor(Math.random() * 9) + 1;
+
+    const targetBR = Math.floor(TR / 3) * 3;
+    const targetBC = Math.floor(TC / 3) * 3;
+
+    // 选2个不同列（不同列带，均不是TC所在列带）作为2个区块封锁目标
+    const nonTargetBCs = [0, 3, 6].filter(bc => bc !== targetBC);
+    if (nonTargetBCs.length < 2) return null;
+    const [bc1, bc2] = nonTargetBCs;
+
+    // 各选一列作为 cBlocked1/cBlocked2
+    const bc1Cols = shuffleArray([bc1, bc1 + 1, bc1 + 2]);
+    const bc2Cols = shuffleArray([bc2, bc2 + 1, bc2 + 2]);
+    const cBlocked1 = bc1Cols[0];
+    const cBlocked2 = bc2Cols[0];
+
+    // 2个源宫（不同行带）
+    const srcBROptions = [0, 3, 6].filter(br => br !== targetBR);
+    if (srcBROptions.length < 1) return null;
+    const srcBR1 = srcBROptions[Math.floor(Math.random() * srcBROptions.length)];
+    const srcBR2Options = srcBROptions.filter(br => br !== srcBR1);
+    const srcBR2 = srcBR2Options.length > 0
+      ? srcBR2Options[Math.floor(Math.random() * srcBR2Options.length)]
+      : srcBR1;
+
+    const puzzle: number[][] = Array.from({length: 9}, () => Array(9).fill(0));
+
+    // 封锁区块1：源宫1（srcBR1, bc1）内A的非cBlocked1列格子在列外放A
+    const buildBlock = (srcBR: number, srcBC_: number, cBlk: number): boolean => {
+      const nonBlkCols = [srcBC_, srcBC_ + 1, srcBC_ + 2].filter(c => c !== cBlk);
+      for (const col of nonBlkCols) {
+        const outsideRows = [0,1,2,3,4,5,6,7,8].filter(r => r < srcBR || r > srcBR + 2);
+        shuffleArray(outsideRows);
+        let ok = false;
+        for (const r of outsideRows) {
+          if (r === TR) continue;
+          if (getValidDigitsAt(puzzle, r, col).has(A)) { puzzle[r][col] = A; ok = true; break; }
+        }
+        if (!ok) return false;
+      }
+      return true;
+    };
+
+    if (!buildBlock(srcBR1, bc1, cBlocked1)) return null;
+    if (!buildBlock(srcBR2, bc2, cBlocked2)) return null;
+
+    // 封锁行TR其余格（≠TC, ≠cBlocked1, ≠cBlocked2）
+    const otherCols = [0,1,2,3,4,5,6,7,8].filter(c => c !== TC && c !== cBlocked1 && c !== cBlocked2);
+    for (const col of otherCols) {
+      const cands2 = computeCandidates(puzzle);
+      if (!cands2[TR][col].has(A)) continue;
+      const opts = shuffleArray([0,1,2,3,4,5,6,7,8].filter(r => r !== TR));
+      let placed = false;
+      for (const r of opts) {
+        if (puzzle[r][col] !== 0 || !getValidDigitsAt(puzzle, r, col).has(A)) continue;
+        puzzle[r][col] = A; placed = true; break;
+      }
+      if (!placed) return null;
+    }
+
+    const candsF = computeAdvancedCandidates(puzzle);
+    if (!candsF[TR][TC].has(A)) return null;
+    for (let c = 0; c < 9; c++)
+      if (c !== TC && puzzle[TR][c] === 0 && candsF[TR][c].has(A)) return null;
+
+    if (!isExactlyOneDeducibleCell(puzzle, TR, TC)) return null;
+
+    this.addTrainingInterference(puzzle, TR, TC, A);
+    return { puzzle, targetRow: TR, targetCol: TC, answer: A };
+  }
+
+  private buildD4PuzzleOnce(): {
+    puzzle: number[][];
+    targetRow: number; targetCol: number; answer: number;
+  } | null {
+    return Math.random() < 0.5
+      ? this.buildD4NakedSingleOnce()
+      : this.buildD4HiddenSingleRowOnce();
+  }
+
+  private generateD4Puzzle(): { puzzle: number[][]; targetRow: number; targetCol: number; answer: number } {
+    for (let i = 0; i < 200; i++) {
+      const r = this.buildD4PuzzleOnce();
+      if (r) return r;
+    }
+    throw new Error('D4 puzzle generation failed after 200 attempts');
+  }
+
+  // ══════════════════════════════════════════════════════
+  // 难度5：显性数对 → 1个区块 → 唯余
+  // ══════════════════════════════════════════════════════
+
+  /**
+   * D5构造（隐性唯余·行）：
+   * 1. 选一源宫S（不同行带，列带含cBlocked）
+   * 2. 源宫S内，A仅在cBlocked列有候选
+   *    其中：对某一非cBlocked列中的某行格 (rPair, cPairInBox)，A被排除原因是【数对占位】
+   *          另一非cBlocked列的格子：通过外部已知A直接封锁
+   * 3. 数对 {P,Q} 在列cPairInBox的两格（rPair在源宫内，rPartner在源宫外）
+   *    → 使 (rPair, cPairInBox) 只剩候选 {P,Q}（不含A）
+   * 4. 源宫S因A仅在cBlocked列 → 列向区块 → A从cBlocked列宫S以外的格消除
+   * 5. 行TR其余格通过6个直接A封锁 → (TR,TC) 隐性唯余
+   */
+  private buildD5PuzzleOnce(): {
+    puzzle: number[][];
+    targetRow: number; targetCol: number; answer: number;
+  } | null {
+    const TR = Math.floor(Math.random() * 9);
+    const TC = Math.floor(Math.random() * 9);
+    const A  = Math.floor(Math.random() * 9) + 1;
+
+    const targetBR = Math.floor(TR / 3) * 3;
+    const targetBC = Math.floor(TC / 3) * 3;
+
+    // 选cBlocked（源自非targetBC列带）
+    const nonTargetBCs = [0, 3, 6].filter(bc => bc !== targetBC);
+    if (nonTargetBCs.length === 0) return null;
+    const srcBCIdx = Math.floor(Math.random() * nonTargetBCs.length);
+    const srcBC = nonTargetBCs[srcBCIdx];
+    const srcBCCols = [srcBC, srcBC + 1, srcBC + 2];
+    shuffleArray(srcBCCols);
+    const cBlocked = srcBCCols[0];
+    const nonCBlkCols = srcBCCols.slice(1); // 2个非cBlocked列
+
+    // 源宫行带（不同于targetBR）
+    const srcBROptions = [0, 3, 6].filter(br => br !== targetBR);
+    const srcBR = srcBROptions[Math.floor(Math.random() * srcBROptions.length)];
+
+    // 数对配置
+    const digitsNonA = shuffleArray([1,2,3,4,5,6,7,8,9].filter(d => d !== A));
+    const P = digitsNonA[0], Q = digitsNonA[1];
+
+    // 数对列：选 nonCBlkCols[0] 作为放数对的列（cPairInBox）
+    const cPairInBox = nonCBlkCols[0];
+    const cOtherInBox = nonCBlkCols[1]; // 另一非cBlocked列，直接外部A封锁
+
+    // 数对行：在源宫行带中选一行作为 rPair（数对在源宫内的那个格）
+    const srcRows = shuffleArray([srcBR, srcBR + 1, srcBR + 2]);
+    const rPair = srcRows[0];
+
+    const puzzle: number[][] = Array.from({length: 9}, () => Array(9).fill(0));
+
+    // 封锁cOtherInBox列源宫格：在列cOtherInBox的宫外行放A
+    const cOtherOutsideRows = shuffleArray([0,1,2,3,4,5,6,7,8].filter(r => r < srcBR || r > srcBR + 2));
+    let placedCOther = false;
+    for (const r of cOtherOutsideRows) {
+      if (r === TR) continue;
+      if (getValidDigitsAt(puzzle, r, cOtherInBox).has(A)) {
+        puzzle[r][cOtherInBox] = A; placedCOther = true; break;
+      }
+    }
+    if (!placedCOther) return null;
+
+    // 构造数对：使 (rPair, cPairInBox) 候选数仅剩 {P,Q}
+    // 需要在其peer（行rPair、列cPairInBox、源宫S）内放置A和其他5个数（除P,Q外）
+    const toElim = [1,2,3,4,5,6,7,8,9].filter(d => d !== P && d !== Q);
+    // 先放A（通过在rPair行宫外或列cPairInBox宫外放A）
+    // 确保A不在rPair行（否则会影响源宫内cBlocked列的A）
+    // 用列cPairInBox宫外放A来消除 (rPair, cPairInBox) 的A
+    const pairColOutsideRows = shuffleArray([0,1,2,3,4,5,6,7,8].filter(r => r < srcBR || r > srcBR + 2));
+    let placedAPairCol = false;
+    for (const r of pairColOutsideRows) {
+      if (r === TR) continue;
+      if (getValidDigitsAt(puzzle, r, cPairInBox).has(A)) {
+        puzzle[r][cPairInBox] = A; placedAPairCol = true; break;
+      }
+    }
+    if (!placedAPairCol) return null;
+
+    // 放另外5个非P非Q的数到 (rPair, cPairInBox) 的peer
+    const remainElim = toElim.filter(d => d !== A);
+    const pairPeers: [number, number][] = [];
+    for (let c = 0; c < 9; c++) if (c !== cPairInBox) pairPeers.push([rPair, c]);
+    for (let r = 0; r < 9; r++) if (r !== rPair) pairPeers.push([r, cPairInBox]);
+    const pairBR = Math.floor(rPair / 3) * 3, pairBC = Math.floor(cPairInBox / 3) * 3;
+    for (let dr = 0; dr < 3; dr++)
+      for (let dc = 0; dc < 3; dc++) {
+        const r = pairBR + dr, c = pairBC + dc;
+        if (r !== rPair && c !== cPairInBox) pairPeers.push([r, c]);
+      }
+    shuffleArray(pairPeers);
+
+    const usedPairPeers = new Set<string>();
+    for (const d of remainElim) {
+      let ok = false;
+      for (const [r, c] of pairPeers) {
+        if (usedPairPeers.has(`${r},${c}`) || puzzle[r][c] !== 0) continue;
+        if (!getValidDigitsAt(puzzle, r, c).has(d)) continue;
+        puzzle[r][c] = d; usedPairPeers.add(`${r},${c}`); ok = true; break;
+      }
+      if (!ok) return null;
+    }
+
+    // 验证 (rPair, cPairInBox) 候选数 = {P,Q}
+    const pairCands = computeCandidates(puzzle);
+    const pc = pairCands[rPair][cPairInBox];
+    if (pc.size !== 2 || !pc.has(P) || !pc.has(Q)) return null;
+
+    // 添加数对伙伴格（同行或同列同宫中另一格也有候选{P,Q}，构成合法数对）
+    // 数对在列cPairInBox中：找另一行（宫外）的格，候选也仅{P,Q}
+    const partnerRows = shuffleArray([0,1,2,3,4,5,6,7,8].filter(r => r !== rPair));
+    let partnerPlaced = false;
+    for (const rPartner of partnerRows) {
+      if (puzzle[rPartner][cPairInBox] !== 0) continue;
+      const partCands = computeCandidates(puzzle);
+      const partC = partCands[rPartner][cPairInBox];
+      if (partC.size === 2 && partC.has(P) && partC.has(Q)) {
+        partnerPlaced = true; break; // 已自然形成数对
+      }
+      // 尝试在 rPartner 行放入A和其他数，使 (rPartner,cPairInBox) 候选仅{P,Q}
+      const toElimPartner = [1,2,3,4,5,6,7,8,9].filter(d => d !== P && d !== Q);
+      const partnerPeers: [number,number][] = [];
+      for (let c = 0; c < 9; c++) if (c !== cPairInBox) partnerPeers.push([rPartner, c]);
+      for (let r = 0; r < 9; r++) if (r !== rPartner) partnerPeers.push([r, cPairInBox]);
+      const pBR = Math.floor(rPartner / 3) * 3, pBC = Math.floor(cPairInBox / 3) * 3;
+      for (let dr = 0; dr < 3; dr++)
+        for (let dc = 0; dc < 3; dc++) {
+          const r = pBR + dr, c = pBC + dc;
+          if (r !== rPartner && c !== cPairInBox) partnerPeers.push([r, c]);
+        }
+      shuffleArray(partnerPeers);
+      const savedPuzzle = puzzle.map(row => [...row]);
+      const usedPP = new Set<string>();
+      let elimFailed = false;
+      for (const d of toElimPartner) {
+        if (computeCandidates(puzzle)[rPartner][cPairInBox].has(d)) {
+          let ok2 = false;
+          for (const [r2, c2] of partnerPeers) {
+            if (usedPP.has(`${r2},${c2}`) || puzzle[r2][c2] !== 0) continue;
+            if (!getValidDigitsAt(puzzle, r2, c2).has(d)) continue;
+            puzzle[r2][c2] = d; usedPP.add(`${r2},${c2}`); ok2 = true; break;
+          }
+          if (!ok2) { elimFailed = true; break; }
+        }
+      }
+      if (elimFailed) {
+        // 回滚
+        for (let r = 0; r < 9; r++) puzzle[r] = savedPuzzle[r];
+        continue;
+      }
+      const newCands = computeCandidates(puzzle);
+      if (newCands[rPartner][cPairInBox].size === 2 &&
+          newCands[rPartner][cPairInBox].has(P) &&
+          newCands[rPartner][cPairInBox].has(Q)) {
+        partnerPlaced = true; break;
+      }
+      // 回滚
+      for (let r = 0; r < 9; r++) puzzle[r] = savedPuzzle[r];
+    }
+    if (!partnerPlaced) return null;
+
+    // 验证区块：源宫S内A仅在cBlocked列
+    const candsBlockCheck = computeCandidates(puzzle);
+    for (let dr = 0; dr < 3; dr++)
+      for (let dc = 0; dc < 3; dc++) {
+        const r = srcBR + dr, c = srcBC + dc;
+        if (c !== cBlocked && puzzle[r][c] === 0 && candsBlockCheck[r][c].has(A)) return null;
+      }
+
+    // 封锁行TR其余格（≠TC, ≠cBlocked）
+    const otherRowCols = [0,1,2,3,4,5,6,7,8].filter(c => c !== TC && c !== cBlocked);
+    for (const col of otherRowCols) {
+      const cands2 = computeCandidates(puzzle);
+      if (!cands2[TR][col].has(A)) continue;
+      const opts = shuffleArray([0,1,2,3,4,5,6,7,8].filter(r => r !== TR));
+      let placed = false;
+      for (const r of opts) {
+        if (puzzle[r][col] !== 0 || !getValidDigitsAt(puzzle, r, col).has(A)) continue;
+        puzzle[r][col] = A; placed = true; break;
+      }
+      if (!placed) return null;
+    }
+
+    const candsF = computeAdvancedCandidates(puzzle);
+    if (!candsF[TR][TC].has(A)) return null;
+    for (let c = 0; c < 9; c++)
+      if (c !== TC && puzzle[TR][c] === 0 && candsF[TR][c].has(A)) return null;
+
+    if (!isExactlyOneDeducibleCell(puzzle, TR, TC)) return null;
+
+    this.addTrainingInterference(puzzle, TR, TC, A, 1, 3);
+    return { puzzle, targetRow: TR, targetCol: TC, answer: A };
+  }
+
+  private generateD5Puzzle(): { puzzle: number[][]; targetRow: number; targetCol: number; answer: number } {
+    for (let i = 0; i < 200; i++) {
+      const r = this.buildD5PuzzleOnce();
+      if (r) return r;
+    }
+    throw new Error('D5 puzzle generation failed after 200 attempts');
+  }
+
+  // ══════════════════════════════════════════════════════
+  // 难度6：多数对/数组 → 双区块 → 唯余
+  // ══════════════════════════════════════════════════════
+
+  /**
+   * D6构造：2个数对各自推导出1个区块（方向相同：均为列向区块封锁行TR不同格的A）
+   * → 双区块 + 6个直接A封锁 → (TR,TC) 隐性唯余·行
+   */
+  private buildD6PuzzleOnce(): {
+    puzzle: number[][];
+    targetRow: number; targetCol: number; answer: number;
+  } | null {
+    const TR = Math.floor(Math.random() * 9);
+    const TC = Math.floor(Math.random() * 9);
+    const A  = Math.floor(Math.random() * 9) + 1;
+
+    const targetBR = Math.floor(TR / 3) * 3;
+    const targetBC = Math.floor(TC / 3) * 3;
+
+    // 2个不同列带（非targetBC）各设1个源宫+1个数对
+    const nonTargetBCs = [0, 3, 6].filter(bc => bc !== targetBC);
+    if (nonTargetBCs.length < 2) return null;
+    const [srcBC1, srcBC2] = shuffleArray([...nonTargetBCs]);
+
+    // 2个不同行带（非targetBR）作为2个源宫行带
+    const srcBROptions = [0, 3, 6].filter(br => br !== targetBR);
+    const srcBR1 = srcBROptions[Math.floor(Math.random() * srcBROptions.length)];
+    const srcBR2Options = srcBROptions.filter(br => br !== srcBR1);
+    const srcBR2 = srcBR2Options.length > 0
+      ? srcBR2Options[Math.floor(Math.random() * srcBR2Options.length)]
+      : srcBR1;
+
+    // 各选一列作为被封锁列
+    const bc1Cols = shuffleArray([srcBC1, srcBC1 + 1, srcBC1 + 2]);
+    const bc2Cols = shuffleArray([srcBC2, srcBC2 + 1, srcBC2 + 2]);
+    const cBlocked1 = bc1Cols[0];
+    const cBlocked2 = bc2Cols[0];
+    const nonCBlk1 = bc1Cols.slice(1);
+    const nonCBlk2 = bc2Cols.slice(1);
+
+    const digitsNonA = shuffleArray([1,2,3,4,5,6,7,8,9].filter(d => d !== A));
+    // 2个数对：{P1,Q1} 和 {P2,Q2}（允许数字重叠，但对间独立）
+    const P1 = digitsNonA[0], Q1 = digitsNonA[1];
+    const P2 = digitsNonA[2], Q2 = digitsNonA[3];
+
+    const puzzle: number[][] = Array.from({length: 9}, () => Array(9).fill(0));
+
+    // 构造源宫1的区块（通过数对+直接封锁使A仅在cBlocked1列）
+    const buildBlockWithPair = (
+      srcBR: number, srcBC_: number, cBlk: number, nonCBlkCols_: number[],
+      Pp: number, Qp: number,
+    ): boolean => {
+      // nonCBlkCols_[0]: 数对列, nonCBlkCols_[1]: 直接A封锁列
+      const cPairInBox = nonCBlkCols_[0];
+      const cDirectBlk = nonCBlkCols_[1];
+
+      // 直接封锁 cDirectBlk（在其列宫外放A）
+      const outsideRowsDirect = shuffleArray([0,1,2,3,4,5,6,7,8].filter(r => r < srcBR || r > srcBR + 2));
+      let placedDirect = false;
+      for (const r of outsideRowsDirect) {
+        if (r === TR) continue;
+        if (getValidDigitsAt(puzzle, r, cDirectBlk).has(A)) {
+          puzzle[r][cDirectBlk] = A; placedDirect = true; break;
+        }
+      }
+      if (!placedDirect) return false;
+
+      // 在 cPairInBox 列宫外放A，消除源宫内该列的A
+      const outsideRowsPair = shuffleArray([0,1,2,3,4,5,6,7,8].filter(r => r < srcBR || r > srcBR + 2));
+      let placedAPairCol = false;
+      for (const r of outsideRowsPair) {
+        if (r === TR) continue;
+        if (getValidDigitsAt(puzzle, r, cPairInBox).has(A)) {
+          puzzle[r][cPairInBox] = A; placedAPairCol = true; break;
+        }
+      }
+      if (!placedAPairCol) return false;
+
+      // 构造数对：选 srcBR 区的一行 rPair，使 (rPair, cPairInBox) 仅有 {Pp,Qq}
+      const pairRows = shuffleArray([srcBR, srcBR + 1, srcBR + 2]);
+      let pairMade = false;
+      for (const rPair of pairRows) {
+        const toElimPair = [1,2,3,4,5,6,7,8,9].filter(d => d !== Pp && d !== Qp);
+        const peerCells: [number,number][] = [];
+        for (let c = 0; c < 9; c++) if (c !== cPairInBox) peerCells.push([rPair, c]);
+        for (let r = 0; r < 9; r++) if (r !== rPair) peerCells.push([r, cPairInBox]);
+        const pBR = Math.floor(rPair / 3) * 3, pBC = Math.floor(cPairInBox / 3) * 3;
+        for (let dr2 = 0; dr2 < 3; dr2++)
+          for (let dc2 = 0; dc2 < 3; dc2++) {
+            const r2 = pBR + dr2, c2 = pBC + dc2;
+            if (r2 !== rPair && c2 !== cPairInBox) peerCells.push([r2, c2]);
+          }
+        shuffleArray(peerCells);
+        const saved = puzzle.map(row => [...row]);
+        const used = new Set<string>();
+        let failed = false;
+        for (const d of toElimPair) {
+          if (!computeCandidates(puzzle)[rPair][cPairInBox].has(d)) continue;
+          let ok2 = false;
+          for (const [r2, c2] of peerCells) {
+            if (used.has(`${r2},${c2}`) || puzzle[r2][c2] !== 0) continue;
+            if (!getValidDigitsAt(puzzle, r2, c2).has(d)) continue;
+            puzzle[r2][c2] = d; used.add(`${r2},${c2}`); ok2 = true; break;
+          }
+          if (!ok2) { failed = true; break; }
+        }
+        if (!failed) {
+          const c = computeCandidates(puzzle);
+          if (c[rPair][cPairInBox].size === 2 && c[rPair][cPairInBox].has(Pp) && c[rPair][cPairInBox].has(Qp)) {
+            pairMade = true; break;
+          }
+        }
+        for (let r = 0; r < 9; r++) puzzle[r] = saved[r];
+      }
+      return pairMade;
+    };
+
+    if (!buildBlockWithPair(srcBR1, srcBC1, cBlocked1, nonCBlk1, P1, Q1)) return null;
+    if (!buildBlockWithPair(srcBR2, srcBC2, cBlocked2, nonCBlk2, P2, Q2)) return null;
+
+    // 验证2个区块均形成
+    const candsBlk = computeCandidates(puzzle);
+    for (let dr = 0; dr < 3; dr++)
+      for (let dc = 0; dc < 3; dc++) {
+        const r1 = srcBR1 + dr, c1 = srcBC1 + dc;
+        if (c1 !== cBlocked1 && puzzle[r1][c1] === 0 && candsBlk[r1][c1].has(A)) return null;
+        const r2 = srcBR2 + dr, c2 = srcBC2 + dc;
+        if (c2 !== cBlocked2 && puzzle[r2][c2] === 0 && candsBlk[r2][c2].has(A)) return null;
+      }
+
+    // 封锁行TR其余格
+    const otherRowCols = [0,1,2,3,4,5,6,7,8].filter(c => c !== TC && c !== cBlocked1 && c !== cBlocked2);
+    for (const col of otherRowCols) {
+      const cands2 = computeCandidates(puzzle);
+      if (!cands2[TR][col].has(A)) continue;
+      const opts = shuffleArray([0,1,2,3,4,5,6,7,8].filter(r => r !== TR));
+      let placed = false;
+      for (const r of opts) {
+        if (puzzle[r][col] !== 0 || !getValidDigitsAt(puzzle, r, col).has(A)) continue;
+        puzzle[r][col] = A; placed = true; break;
+      }
+      if (!placed) return null;
+    }
+
+    const candsF = computeAdvancedCandidates(puzzle);
+    if (!candsF[TR][TC].has(A)) return null;
+    for (let c = 0; c < 9; c++)
+      if (c !== TC && puzzle[TR][c] === 0 && candsF[TR][c].has(A)) return null;
+
+    if (!isExactlyOneDeducibleCell(puzzle, TR, TC)) return null;
+
+    this.addTrainingInterference(puzzle, TR, TC, A, 1, 2);
+    return { puzzle, targetRow: TR, targetCol: TC, answer: A };
+  }
+
+  private generateD6Puzzle(): { puzzle: number[][]; targetRow: number; targetCol: number; answer: number } {
+    for (let i = 0; i < 200; i++) {
+      const r = this.buildD6PuzzleOnce();
+      if (r) return r;
+    }
+    throw new Error('D6 puzzle generation failed after 200 attempts');
+  }
+
+  /** 根据难度编号路由到对应生成函数 */
+  private generateTrainingPuzzleByDifficulty(difficulty: number): {
+    puzzle: number[][]; targetRow: number; targetCol: number; answer: number;
+  } {
+    switch (difficulty) {
+      case 2: return this.generateAdvancedTrainingPuzzle();
+      case 3: return this.generateD3Puzzle();
+      case 4: return this.generateD4Puzzle();
+      case 5: return this.generateD5Puzzle();
+      case 6: return this.generateD6Puzzle();
+      default: return this.generateTrainingPuzzle();
+    }
+  }
+
   /** 训练题目池容量（预渲染图片数，每张约 100-200 KB，10 张 ≈ 1.5 MB） */
   private readonly TRAINING_POOL_SIZE = 10;
 
@@ -1930,7 +3073,6 @@ export class SudokuGame {
 
     setImmediate(async () => {
       try {
-        // 每次调用最多连续填充直到池满或训练结束
         let consecutive_failures = 0;
         while (
           ts.questionPool.length < this.TRAINING_POOL_SIZE &&
@@ -1938,12 +3080,9 @@ export class SudokuGame {
           consecutive_failures < 3
         ) {
           const idx = ts.poolNextQueuedIndex++;
-          const labelPrefix = ts.mode === 'advanced' ? '唯余训练【难度2】' : '唯余训练【难度1】';
-          const label = `${labelPrefix} · 第${idx}题`;
+          const label = `唯余训练【难度${ts.difficulty}】 · 第${idx}题`;
           try {
-            const { puzzle, answer } = ts.mode === 'advanced'
-              ? this.generateAdvancedTrainingPuzzle()
-              : this.generateTrainingPuzzle();
+            const { puzzle, answer } = this.generateTrainingPuzzleByDifficulty(ts.difficulty);
             const imgBuf = await this.renderer.render(puzzle, label, undefined, undefined);
             if (!this.trainings.has(ts.channelId)) break;
             ts.questionPool.push({ puzzle, answer, renderedImage: imgBuf, label, questionIndex: idx });
@@ -1955,7 +3094,6 @@ export class SudokuGame {
         }
       } finally {
         ts.poolFilling = false;
-        // 若池仍未满（部分失败），延迟重试
         if (ts.questionPool.length < this.TRAINING_POOL_SIZE && this.trainings.has(ts.channelId)) {
           setTimeout(() => this.fillTrainingPool(ts), 500);
         }
@@ -1972,8 +3110,7 @@ export class SudokuGame {
 
     ts.currentQuestionIndex++;
     const expectedIndex = ts.currentQuestionIndex;
-    const labelPrefix = ts.mode === 'advanced' ? '唯余训练【难度2】' : '唯余训练【难度1】';
-    const label = `${labelPrefix} · 第${expectedIndex}题`;
+    const label = `唯余训练【难度${ts.difficulty}】 · 第${expectedIndex}题`;
 
     // ── 从题目池取题（校验题号匹配）────────────────────────────────────────────
     // 题目池以 poolNextQueuedIndex 严格递增排队，正常情况下池头题号与期望题号吻合。
@@ -2012,15 +3149,11 @@ export class SudokuGame {
 
     try {
       if (poolEntry) {
-        // ── 路径A：命中题目池——直接发送预渲染图片（仅剩网络传输延迟）─────────────
         cq.answer = poolEntry.answer;
         if (!this.trainings.has(ts.channelId)) return;
         await this.sendImage(session, poolEntry.renderedImage);
       } else {
-        // ── 路径B：池未就绪——实时生成 + 渲染（退化路径，通常仅第1题触发）──────────
-        const { puzzle, answer } = ts.mode === 'advanced'
-          ? this.generateAdvancedTrainingPuzzle()
-          : this.generateTrainingPuzzle();
+        const { puzzle, answer } = this.generateTrainingPuzzleByDifficulty(ts.difficulty);
         cq.answer = answer;
         const imgBuf = await this.renderer.render(puzzle, label, undefined, undefined);
         if (!this.trainings.has(ts.channelId)) return;
@@ -2030,11 +3163,12 @@ export class SudokuGame {
       if (!this.trainings.has(ts.channelId)) return;
       logger.warn("唯余训练图片渲染/发送失败：", err);
       if (cq.answer === 0) {
-        // 路径B生成失败，answer 还未设置，补一个
-        const { answer } = ts.mode === 'advanced'
-          ? this.generateAdvancedTrainingPuzzle()
-          : this.generateTrainingPuzzle();
-        cq.answer = answer;
+        try {
+          const { answer } = this.generateTrainingPuzzleByDifficulty(ts.difficulty);
+          cq.answer = answer;
+        } catch {
+          cq.answer = Math.floor(Math.random() * 9) + 1;
+        }
       }
       await session.send(`📋 ${label}（图片渲染失败，请输入 1-9 作答）`);
     } finally {
@@ -2062,7 +3196,7 @@ export class SudokuGame {
     const participants = Array.from(ts.participants.values());
 
     // 标题
-    const modeLabel = ts.mode === 'advanced' ? '唯余训练【难度2】' : '唯余训练【难度1】';
+    const modeLabel = `唯余训练【难度${ts.difficulty}】`;
     const title =
       participants.length === 1
         ? `「${participants[0].username}」${modeLabel}报告`

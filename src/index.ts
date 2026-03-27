@@ -25,6 +25,7 @@ export interface Config {
   commandHint: string;
   commandTrainingStart: string;
   commandTrainingStop: string;
+  commandDiffInfo: string;
   trainingAllowPrivate: boolean;
   timeout: number;
   inactivityTimeout: number;
@@ -70,6 +71,7 @@ export const Config: Schema<Config> = Schema.intersect([
     commandHint: Schema.string().default("获取答案").description("查询题目求解路径的指令名"),
     commandTrainingStart: Schema.string().default("唯余训练").description("开始唯余训练指令"),
     commandTrainingStop: Schema.string().default("结束训练").description("结束唯余训练指令"),
+    commandDiffInfo: Schema.string().default("难度说明").description("查看难度技巧说明指令"),
   }).description("命令配置"),
 
   Schema.object({
@@ -109,6 +111,9 @@ export function apply(ctx: Context, config: Config) {
   if (typeof config.difficulty !== "number") {
     ctx.logger("sudoku").warn(`检测到旧版配置 difficulty="${config.difficulty}"，已自动重置为默认值 2，请在控制台重新保存配置`);
     (config as any).difficulty = 2;
+  }
+  if (!config.commandDiffInfo) {
+    (config as any).commandDiffInfo = "难度说明";
   }
 
   // 扩展数据库模型（字段对象用 as any 绕过 Koishi 的 MapField 泛型约束，
@@ -252,15 +257,20 @@ export function apply(ctx: Context, config: Config) {
       return game.showHint(session, questionId);
     });
 
-  ctx.command(`${config.commandTrainingStart} [level]`).action(({ session, args }) => {
+  ctx.command(`${config.commandTrainingStart} [level:number]`).action(({ session }, level) => {
     if (!session) return "无法获取会话信息";
-    const mode = args?.[0] === '2' ? 'advanced' : 'basic';
-    return game.startTraining(session, mode);
+    const difficulty = (typeof level === 'number' && level >= 1 && level <= 6) ? level : 1;
+    return game.startTraining(session, difficulty);
   });
 
   ctx.command(config.commandTrainingStop).action(({ session }) => {
     if (!session) return "无法获取会话信息";
     return game.stopTraining(session);
+  });
+
+  ctx.command(config.commandDiffInfo).action(({ session }) => {
+    if (!session) return "无法获取会话信息";
+    return game.showDifficultyInfo(session);
   });
 
   // 监听消息（抢答 / 训练答题）—— 先快速检查当前频道是否有游戏，避免处理无关消息
