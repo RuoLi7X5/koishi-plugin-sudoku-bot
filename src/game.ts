@@ -320,10 +320,23 @@ type TrainingSession = {
   participants: Map<string, TrainingParticipant>;
   /** 训练难度：1=纯唯余，2=干扰项唯余，3=区块唯余，4=双区块，5=数对→区块，6=多数对→双区块 */
   difficulty: number;
+  /** 本轮轮次编号（每频道每次 startTraining 自增），用于生成题目编号如 "2-7" */
+  round: number;
   // 题目池：预生成并预渲染的训练题队列，可直接发送
   questionPool: PregeneratedTrainingQuestion[];
   poolNextQueuedIndex: number;        // 下一个待排入池的题号（始终领先于 currentQuestionIndex）
   poolFilling: boolean;               // 防止并发填充
+};
+
+/** 唯余训练题目答案缓存条目 */
+type TrainingHintEntry = {
+  trainingId: string;      // 格式 "轮次-题号"，如 "2-7"
+  targetRow: number;
+  targetCol: number;
+  answer: number;
+  puzzle: number[][];
+  difficulty: number;
+  expireAt: number;        // Unix 时间戳（ms），24小时后过期
 };
 
 // ─── 预生成缓存类型 ──────────────────────────────────────────────────────────
@@ -403,6 +416,12 @@ export class SudokuGame {
 
   // 多频道唯余训练状态表（key = channelId）
   private trainings: Map<string, TrainingSession> = new Map();
+
+  // 唯余训练轮次计数器（key = channelId，每次 startTraining 自增；内存级，重启清零）
+  private trainingRoundCounter: Map<string, number> = new Map();
+
+  // 唯余训练题目答案缓存（key = channelId → trainingId → TrainingHintEntry）
+  private trainingHintCache: Map<string, Map<string, TrainingHintEntry>> = new Map();
 
   // 难度名称映射
   private static readonly DIFFICULTY_NAMES = [
@@ -488,12 +507,14 @@ export class SudokuGame {
       `  完美局（全 ${c.rounds} 题全对，无一答错）可解锁专属成就，探索隐藏成就获得专属头衔！`,
       "",
       "🔍 求解指引",
-      `  ${c.commandHint} a1 - 查询题目 a1 的推理解法（游戏结束后可用，24小时内有效）`,
+      `  ${c.commandHint} a1 - 查询游戏题目 a1 的推理解法（游戏结束后可用，24小时内有效）`,
+      `  ${c.commandHint} 2-7 - 查询训练题目「第2轮第7题」的解题路径（24小时内有效）`,
       "",
       "🎯 唯余训练",
       `  ${c.commandTrainingStart} [难度1-6] - 开始唯余训练，不填难度默认1`,
       `  ${c.commandTrainingStop} - 结束本轮训练并查看统计报告`,
       "  训练说明：每题盘面只能推出一个数字，难度越高技巧越复杂",
+      "  题目右下角显示编号（如 2-7），可用答案指令查询推理路径",
       "",
       "📖 难度说明",
       `  ${c.commandDiffInfo} - 查看答题游戏与唯余训练各难度的技巧详解`,
@@ -765,6 +786,11 @@ export class SudokuGame {
   }
 
   async showHint(session: Session, rawId: string) {
+    // 训练题编号格式（如 "1-7"、"2-23"）优先路由
+    if (/^\d+-\d+$/.test(rawId.trim())) {
+      return this.showTrainingHint(session, rawId.trim());
+    }
+
     if (!session.channelId) return;
 
     const parsed = this.hintManager.parseQuestionId(rawId);
@@ -817,6 +843,39 @@ export class SudokuGame {
     }
 
     await session.send(result.text);
+  }
+
+  /** 查询唯余训练题目答案（编号格式 "轮次-题号"，如 "2-7"） */
+  private async showTrainingHint(session: Session, trainingId: string): Promise<void> {
+    const key = this.getTrainingChannelKey(session) ?? session.channelId;
+    if (!key) {
+      await session.send("无法获取频道信息，请在群组中使用此指令。");
+      return;
+    }
+
+    const cache = this.trainingHintCache.get(key);
+    if (!cache) {
+      await session.send(`训练题编号「${trainingId}」无效，请确认编号是否正确。`);
+      return;
+    }
+
+    const entry = cache.get(trainingId);
+    if (!entry) {
+      await session.send(`训练题编号「${trainingId}」无效，请确认编号是否正确。`);
+      return;
+    }
+
+    if (Date.now() > entry.expireAt) {
+      cache.delete(trainingId);
+      await session.send("该训练题已过期，无法查询（题目数据仅保留 24 小时）。");
+      return;
+    }
+
+    const targetCell = `${String.fromCharCode(65 + entry.targetRow)}${entry.targetCol + 1}`;
+    const explanation = generateTrainingHintExplanation(
+      entry.puzzle, entry.targetRow, entry.targetCol, entry.answer,
+    );
+    await session.send(`目标格：${targetCell}\n解答：${explanation}`);
   }
 
   async showRank(session: Session, type: string = "积分", scope?: string) {
@@ -1800,6 +1859,10 @@ export class SudokuGame {
 
     const d = Math.min(Math.max(Math.floor(difficulty), 1), 6);
 
+    // 自增本频道轮次计数器
+    const round = (this.trainingRoundCounter.get(key) ?? 0) + 1;
+    this.trainingRoundCounter.set(key, round);
+
     const ts: TrainingSession = {
       channelId: key,
       startTime: Date.now(),
@@ -1808,6 +1871,7 @@ export class SudokuGame {
       finishedQuestions: 0,
       participants: new Map(),
       difficulty: d,
+      round,
       questionPool: [],
       poolNextQueuedIndex: 2,
       poolFilling: false,
@@ -1817,7 +1881,8 @@ export class SudokuGame {
     this.fillTrainingPool(ts);
 
     await session.send(
-      `🎯 唯余训练【难度${d}】开始！\n盘面只能推出一个数字，找到它并填入！\n` +
+      `🎯 唯余训练【难度${d}】开始！\n首题生成时间较长，请默数 10 个数耐心等待！\n` +
+      `盘面只能推出一个数字，找到它并填入！\n` +
       `输入「${this.config.commandTrainingStop}」可结束本轮训练并查看报告。`,
     );
     await this.nextTrainingQuestion(session, ts);
@@ -3059,10 +3124,35 @@ export class SudokuGame {
   private readonly TRAINING_POOL_SIZE = 10;
 
   /**
+   * 将训练题目的答案信息存入频道提示缓存，供查询时使用。
+   * 旧的过期条目在此处顺带清理。
+   */
+  private storeTrainingHint(
+    channelId: string,
+    trainingId: string,
+    entry: Omit<TrainingHintEntry, "trainingId" | "expireAt">,
+  ): void {
+    if (!this.trainingHintCache.has(channelId)) {
+      this.trainingHintCache.set(channelId, new Map());
+    }
+    const cache = this.trainingHintCache.get(channelId)!;
+    const now = Date.now();
+    // 顺带清理已过期条目（避免内存无限增长）
+    for (const [id, e] of cache) {
+      if (e.expireAt <= now) cache.delete(id);
+    }
+    cache.set(trainingId, {
+      trainingId,
+      ...entry,
+      puzzle: entry.puzzle.map((row) => [...row]),
+      expireAt: now + 24 * 60 * 60 * 1000,
+    });
+  }
+
+  /**
    * 后台持续填充训练题目池（fire-and-forget）。
    * 使用 setImmediate 确保填充从下一事件循环迭代开始，不阻塞当前消息收发。
    * 每次填充一道（生成盘面 + Canvas 渲染），完成后递归补充直到池满。
-   * poolNextQueuedIndex 追踪下一个要加入池的题号，题号与渲染标签严格对应。
    */
   private fillTrainingPool(ts: TrainingSession): void {
     if (ts.poolFilling) return;
@@ -3080,11 +3170,16 @@ export class SudokuGame {
           consecutive_failures < 3
         ) {
           const idx = ts.poolNextQueuedIndex++;
-          const label = `唯余训练【难度${ts.difficulty}】 · 第${idx}题`;
+          const trainingId = `${ts.round}-${idx}`;
+          const label = `${trainingId}  唯余训练·难度${ts.difficulty}`;
           try {
-            const { puzzle, answer } = this.generateTrainingPuzzleByDifficulty(ts.difficulty);
+            const { puzzle, targetRow, targetCol, answer } =
+              this.generateTrainingPuzzleByDifficulty(ts.difficulty);
             const imgBuf = await this.renderer.render(puzzle, label, undefined, undefined);
             if (!this.trainings.has(ts.channelId)) break;
+            this.storeTrainingHint(ts.channelId, trainingId, {
+              targetRow, targetCol, answer, puzzle, difficulty: ts.difficulty,
+            });
             ts.questionPool.push({ puzzle, answer, renderedImage: imgBuf, label, questionIndex: idx });
             consecutive_failures = 0;
           } catch {
@@ -3110,7 +3205,8 @@ export class SudokuGame {
 
     ts.currentQuestionIndex++;
     const expectedIndex = ts.currentQuestionIndex;
-    const label = `唯余训练【难度${ts.difficulty}】 · 第${expectedIndex}题`;
+    const trainingId = `${ts.round}-${expectedIndex}`;
+    const label = `${trainingId}  唯余训练·难度${ts.difficulty}`;
 
     // ── 从题目池取题（校验题号匹配）────────────────────────────────────────────
     // 题目池以 poolNextQueuedIndex 严格递增排队，正常情况下池头题号与期望题号吻合。
@@ -3153,8 +3249,13 @@ export class SudokuGame {
         if (!this.trainings.has(ts.channelId)) return;
         await this.sendImage(session, poolEntry.renderedImage);
       } else {
-        const { puzzle, answer } = this.generateTrainingPuzzleByDifficulty(ts.difficulty);
+        const { puzzle, targetRow, targetCol, answer } =
+          this.generateTrainingPuzzleByDifficulty(ts.difficulty);
         cq.answer = answer;
+        // 生成成功后立即缓存答案（渲染失败也能保留正确答案供查询）
+        this.storeTrainingHint(ts.channelId, trainingId, {
+          targetRow, targetCol, answer, puzzle, difficulty: ts.difficulty,
+        });
         const imgBuf = await this.renderer.render(puzzle, label, undefined, undefined);
         if (!this.trainings.has(ts.channelId)) return;
         await this.sendImage(session, imgBuf);
@@ -3245,4 +3346,313 @@ export class SudokuGame {
     }
   }
 
+}
+
+// ─── 训练题答案推理路径生成器 ────────────────────────────────────────────────────
+
+/**
+ * 根据训练题盘面、目标格和答案，生成人类可读的推理路径说明。
+ * 逻辑：先找区块排除（指向/行列式），再判断是显性唯余还是隐性唯余，逐步解释。
+ */
+function generateTrainingHintExplanation(
+  puzzle: number[][],
+  TR: number,
+  TC: number,
+  answer: number,
+): string {
+  const cn = (r: number, c: number) => `${String.fromCharCode(65 + r)}${c + 1}`;
+  const TARGET = cn(TR, TC);
+  const boxNo = (r: number, c: number) => Math.floor(r / 3) * 3 + Math.floor(c / 3) + 1;
+
+  // ── 直接候选数计算 ──────────────────────────────────────────────────────────
+  const wc: Set<number>[][] = Array.from({ length: 9 }, (_, r) =>
+    Array.from({ length: 9 }, (_, c) => {
+      if (puzzle[r][c] !== 0) return new Set<number>();
+      const seen = new Set<number>();
+      for (let j = 0; j < 9; j++) {
+        if (puzzle[r][j]) seen.add(puzzle[r][j]);
+        if (puzzle[j][c]) seen.add(puzzle[j][c]);
+      }
+      const br = Math.floor(r / 3) * 3, bc = Math.floor(c / 3) * 3;
+      for (let dr = 0; dr < 3; dr++) for (let dc = 0; dc < 3; dc++)
+        if (puzzle[br + dr][bc + dc]) seen.add(puzzle[br + dr][bc + dc]);
+      const s = new Set<number>();
+      for (let d = 1; d <= 9; d++) if (!seen.has(d)) s.add(d);
+      return s;
+    }),
+  );
+
+  // ── 区块排除追踪 ────────────────────────────────────────────────────────────
+  // 追踪哪些区块排除步骤影响了目标格所在行/列/宫，以及目标格自身
+  type LockedStep = { text: string; type: "onTarget" | "onRow" | "onCol" | "onBox"; digit: number };
+  const lockedSteps: LockedStep[] = [];
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+
+    // 指向排除（宫 → 行/列）
+    for (let br = 0; br < 9; br += 3) {
+      for (let bc = 0; bc < 9; bc += 3) {
+        for (let d = 1; d <= 9; d++) {
+          const pos: [number, number][] = [];
+          for (let dr = 0; dr < 3; dr++) for (let dc = 0; dc < 3; dc++) {
+            const r = br + dr, c = bc + dc;
+            if (puzzle[r][c] === 0 && wc[r][c].has(d)) pos.push([r, c]);
+          }
+          if (pos.length === 0) continue;
+          const rowSet = new Set(pos.map((p) => p[0]));
+          const colSet = new Set(pos.map((p) => p[1]));
+
+          if (rowSet.size === 1) {
+            const row = pos[0][0];
+            const aff: string[] = [];
+            for (let c = 0; c < 9; c++) {
+              if (c >= bc && c < bc + 3) continue;
+              if (puzzle[row][c] === 0 && wc[row][c].has(d)) {
+                wc[row][c].delete(d); changed = true;
+                aff.push(cn(row, c));
+              }
+            }
+            if (aff.length > 0) {
+              const text = `第${boxNo(br, bc)}宫数字${d}候选仅在第${row + 1}行（指向排除）→ 排除${aff.join("、")}的候选${d}`;
+              for (const cellStr of aff) {
+                const cellR = cellStr.charCodeAt(0) - 65;
+                const cellC = parseInt(cellStr[1]) - 1;
+                let type: LockedStep["type"] | null = null;
+                if (cellR === TR && cellC === TC) type = "onTarget";
+                else if (cellR === TR && d === answer) type = "onRow";
+                else if (cellC === TC && d === answer) type = "onCol";
+                else if (Math.floor(cellR / 3) === Math.floor(TR / 3) &&
+                  Math.floor(cellC / 3) === Math.floor(TC / 3) && d === answer) type = "onBox";
+                if (type) {
+                  // 去重：同一 text+type 只记录一次
+                  if (!lockedSteps.some((s) => s.text === text && s.type === type)) {
+                    lockedSteps.push({ text, type, digit: d });
+                  }
+                }
+              }
+            }
+          }
+
+          if (colSet.size === 1) {
+            const col = pos[0][1];
+            const aff: string[] = [];
+            for (let r = 0; r < 9; r++) {
+              if (r >= br && r < br + 3) continue;
+              if (puzzle[r][col] === 0 && wc[r][col].has(d)) {
+                wc[r][col].delete(d); changed = true;
+                aff.push(cn(r, col));
+              }
+            }
+            if (aff.length > 0) {
+              const text = `第${boxNo(br, bc)}宫数字${d}候选仅在第${col + 1}列（指向排除）→ 排除${aff.join("、")}的候选${d}`;
+              for (const cellStr of aff) {
+                const cellR = cellStr.charCodeAt(0) - 65;
+                const cellC = parseInt(cellStr[1]) - 1;
+                let type: LockedStep["type"] | null = null;
+                if (cellR === TR && cellC === TC) type = "onTarget";
+                else if (cellR === TR && d === answer) type = "onRow";
+                else if (cellC === TC && d === answer) type = "onCol";
+                else if (Math.floor(cellR / 3) === Math.floor(TR / 3) &&
+                  Math.floor(cellC / 3) === Math.floor(TC / 3) && d === answer) type = "onBox";
+                if (type) {
+                  if (!lockedSteps.some((s) => s.text === text && s.type === type)) {
+                    lockedSteps.push({ text, type, digit: d });
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // 行列式（行/列 → 宫）
+    for (let r = 0; r < 9; r++) {
+      for (let d = 1; d <= 9; d++) {
+        const cs: number[] = [];
+        for (let c = 0; c < 9; c++) if (puzzle[r][c] === 0 && wc[r][c].has(d)) cs.push(c);
+        if (cs.length === 0) continue;
+        const bcSet = new Set(cs.map((c) => Math.floor(c / 3)));
+        if (bcSet.size === 1) {
+          const bc = [...bcSet][0] * 3, br = Math.floor(r / 3) * 3;
+          const aff: string[] = [];
+          for (let dr = 0; dr < 3; dr++) for (let dc = 0; dc < 3; dc++) {
+            const r2 = br + dr, c2 = bc + dc;
+            if (r2 === r) continue;
+            if (puzzle[r2][c2] === 0 && wc[r2][c2].has(d)) {
+              wc[r2][c2].delete(d); changed = true;
+              aff.push(cn(r2, c2));
+            }
+          }
+          if (aff.length > 0) {
+            const text = `第${r + 1}行数字${d}候选仅在第${boxNo(br, bc)}宫（行列式）→ 排除${aff.join("、")}的候选${d}`;
+            for (const cellStr of aff) {
+              const cellR = cellStr.charCodeAt(0) - 65;
+              const cellC = parseInt(cellStr[1]) - 1;
+              let type: LockedStep["type"] | null = null;
+              if (cellR === TR && cellC === TC) type = "onTarget";
+              else if (cellR === TR && d === answer) type = "onRow";
+              else if (cellC === TC && d === answer) type = "onCol";
+              else if (Math.floor(cellR / 3) === Math.floor(TR / 3) &&
+                Math.floor(cellC / 3) === Math.floor(TC / 3) && d === answer) type = "onBox";
+              if (type) {
+                if (!lockedSteps.some((s) => s.text === text && s.type === type)) {
+                  lockedSteps.push({ text, type, digit: d });
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    for (let c = 0; c < 9; c++) {
+      for (let d = 1; d <= 9; d++) {
+        const rs: number[] = [];
+        for (let r = 0; r < 9; r++) if (puzzle[r][c] === 0 && wc[r][c].has(d)) rs.push(r);
+        if (rs.length === 0) continue;
+        const brSet = new Set(rs.map((r) => Math.floor(r / 3)));
+        if (brSet.size === 1) {
+          const br = [...brSet][0] * 3, bc = Math.floor(c / 3) * 3;
+          const aff: string[] = [];
+          for (let dr = 0; dr < 3; dr++) for (let dc = 0; dc < 3; dc++) {
+            const r2 = br + dr, c2 = bc + dc;
+            if (c2 === c) continue;
+            if (puzzle[r2][c2] === 0 && wc[r2][c2].has(d)) {
+              wc[r2][c2].delete(d); changed = true;
+              aff.push(cn(r2, c2));
+            }
+          }
+          if (aff.length > 0) {
+            const text = `第${c + 1}列数字${d}候选仅在第${boxNo(br, bc)}宫（行列式）→ 排除${aff.join("、")}的候选${d}`;
+            for (const cellStr of aff) {
+              const cellR = cellStr.charCodeAt(0) - 65;
+              const cellC = parseInt(cellStr[1]) - 1;
+              let type: LockedStep["type"] | null = null;
+              if (cellR === TR && cellC === TC) type = "onTarget";
+              else if (cellR === TR && d === answer) type = "onRow";
+              else if (cellC === TC && d === answer) type = "onCol";
+              else if (Math.floor(cellR / 3) === Math.floor(TR / 3) &&
+                Math.floor(cellC / 3) === Math.floor(TC / 3) && d === answer) type = "onBox";
+              if (type) {
+                if (!lockedSteps.some((s) => s.text === text && s.type === type)) {
+                  lockedSteps.push({ text, type, digit: d });
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // ── 判断出数方式并生成解释 ──────────────────────────────────────────────────
+
+  // 显性唯余（目标格仅剩1个候选数）
+  if (wc[TR][TC].size === 1 && wc[TR][TC].has(answer)) {
+    const rowNums: number[] = [], colNums: number[] = [], boxNums: number[] = [];
+    const onTargetDigits = new Set(lockedSteps.filter((s) => s.type === "onTarget").map((s) => s.digit));
+    for (let d = 1; d <= 9; d++) {
+      if (d === answer || onTargetDigits.has(d)) continue;
+      let found = false;
+      for (let j = 0; j < 9; j++) { if (puzzle[TR][j] === d) { rowNums.push(d); found = true; break; } }
+      if (!found) for (let i = 0; i < 9; i++) { if (puzzle[i][TC] === d) { colNums.push(d); found = true; break; } }
+      if (!found) {
+        const br2 = Math.floor(TR / 3) * 3, bc2 = Math.floor(TC / 3) * 3;
+        outer: for (let dr = 0; dr < 3; dr++) for (let dc = 0; dc < 3; dc++)
+          if (puzzle[br2 + dr][bc2 + dc] === d) { boxNums.push(d); found = true; break outer; }
+      }
+    }
+    const parts: string[] = [];
+    const onTargetSteps = lockedSteps.filter((s) => s.type === "onTarget");
+    // 区块排除步骤优先展示
+    const seenTexts = new Set<string>();
+    for (const s of onTargetSteps) { if (!seenTexts.has(s.text)) { parts.push(s.text); seenTexts.add(s.text); } }
+    if (rowNums.length) parts.push(`同行已有 ${rowNums.join("/")} 排除`);
+    if (colNums.length) parts.push(`同列已有 ${colNums.join("/")} 排除`);
+    if (boxNums.length) parts.push(`同宫已有 ${boxNums.join("/")} 排除`);
+    return parts.join("；\n") + `；\n${TARGET} 候选仅剩 ${answer}，答案确定（显性唯余）。`;
+  }
+
+  // 隐性唯余（行）
+  const rowCands = Array.from({ length: 9 }, (_, c) => c).filter(
+    (c) => puzzle[TR][c] === 0 && wc[TR][c].has(answer),
+  );
+  if (rowCands.length === 1 && rowCands[0] === TC) {
+    const parts: string[] = [];
+    const seenTexts = new Set<string>();
+    for (const s of lockedSteps.filter((s) => s.type === "onRow")) {
+      if (!seenTexts.has(s.text)) { parts.push(s.text); seenTexts.add(s.text); }
+    }
+    for (let c = 0; c < 9; c++) {
+      if (c === TC || puzzle[TR][c] !== 0 || wc[TR][c].has(answer)) continue;
+      const cell = cn(TR, c);
+      if (parts.some((p) => p.includes(cell))) continue;
+      let done = false;
+      for (let i = 0; i < 9 && !done; i++) if (puzzle[i][c] === answer) { parts.push(`${cell} 因第${c + 1}列已有${answer}排除`); done = true; }
+      if (!done) {
+        const br2 = Math.floor(TR / 3) * 3, bc2 = Math.floor(c / 3) * 3;
+        outer: for (let dr = 0; dr < 3; dr++) for (let dc = 0; dc < 3; dc++)
+          if (puzzle[br2 + dr][bc2 + dc] === answer) { parts.push(`${cell} 因宫内已有${answer}排除`); done = true; break outer; }
+      }
+      if (!done) parts.push(`${cell} 经区块排除数字${answer}`);
+    }
+    return parts.join("；\n") + `；\n第${TR + 1}行数字${answer}仅 ${TARGET} 可填，答案确定（隐性唯余·行）。`;
+  }
+
+  // 隐性唯余（列）
+  const colCands = Array.from({ length: 9 }, (_, r) => r).filter(
+    (r) => puzzle[r][TC] === 0 && wc[r][TC].has(answer),
+  );
+  if (colCands.length === 1 && colCands[0] === TR) {
+    const parts: string[] = [];
+    const seenTexts = new Set<string>();
+    for (const s of lockedSteps.filter((s) => s.type === "onCol")) {
+      if (!seenTexts.has(s.text)) { parts.push(s.text); seenTexts.add(s.text); }
+    }
+    for (let r = 0; r < 9; r++) {
+      if (r === TR || puzzle[r][TC] !== 0 || wc[r][TC].has(answer)) continue;
+      const cell = cn(r, TC);
+      if (parts.some((p) => p.includes(cell))) continue;
+      let done = false;
+      for (let j = 0; j < 9 && !done; j++) if (puzzle[r][j] === answer) { parts.push(`${cell} 因第${r + 1}行已有${answer}排除`); done = true; }
+      if (!done) {
+        const br2 = Math.floor(r / 3) * 3, bc2 = Math.floor(TC / 3) * 3;
+        outer: for (let dr = 0; dr < 3; dr++) for (let dc = 0; dc < 3; dc++)
+          if (puzzle[br2 + dr][bc2 + dc] === answer) { parts.push(`${cell} 因宫内已有${answer}排除`); done = true; break outer; }
+      }
+      if (!done) parts.push(`${cell} 经区块排除数字${answer}`);
+    }
+    return parts.join("；\n") + `；\n第${TC + 1}列数字${answer}仅 ${TARGET} 可填，答案确定（隐性唯余·列）。`;
+  }
+
+  // 隐性唯余（宫）
+  const brT = Math.floor(TR / 3) * 3, bcT = Math.floor(TC / 3) * 3;
+  const boxCands: [number, number][] = [];
+  for (let dr = 0; dr < 3; dr++) for (let dc = 0; dc < 3; dc++) {
+    const r = brT + dr, c = bcT + dc;
+    if (puzzle[r][c] === 0 && wc[r][c].has(answer)) boxCands.push([r, c]);
+  }
+  if (boxCands.length === 1 && boxCands[0][0] === TR && boxCands[0][1] === TC) {
+    const bN = boxNo(TR, TC);
+    const parts: string[] = [];
+    const seenTexts = new Set<string>();
+    for (const s of lockedSteps.filter((s) => s.type === "onBox")) {
+      if (!seenTexts.has(s.text)) { parts.push(s.text); seenTexts.add(s.text); }
+    }
+    for (let dr = 0; dr < 3; dr++) for (let dc = 0; dc < 3; dc++) {
+      const r = brT + dr, c = bcT + dc;
+      if ((r === TR && c === TC) || puzzle[r][c] !== 0 || wc[r][c].has(answer)) continue;
+      const cell = cn(r, c);
+      if (parts.some((p) => p.includes(cell))) continue;
+      let done = false;
+      for (let j = 0; j < 9 && !done; j++) if (puzzle[r][j] === answer) { parts.push(`${cell} 因第${r + 1}行已有${answer}排除`); done = true; }
+      if (!done) for (let i = 0; i < 9 && !done; i++) if (puzzle[i][c] === answer) { parts.push(`${cell} 因第${c + 1}列已有${answer}排除`); done = true; }
+      if (!done) parts.push(`${cell} 经区块排除数字${answer}`);
+    }
+    return parts.join("；\n") + `；\n第${bN}宫数字${answer}仅 ${TARGET} 可填，答案确定（隐性唯余·宫）。`;
+  }
+
+  return `${TARGET} 的答案为 ${answer}（推理路径自动分析失败，请结合难度说明手动推理）。`;
 }
