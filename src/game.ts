@@ -2256,6 +2256,17 @@ export class SudokuGame {
    *   构造手段：在源宫B的非TR行中（行r1,r2）各放1个D，使D在行r1/r2可见
    *             → 源宫B内r1/r2行格子的D被消除 → D锁在源宫B的TR行 → 区块形成
    */
+  /**
+   * 构造D3显性唯余（行列式区块排除）：
+   *
+   * 使用「行列式」（box-line reduction）：目标宫行带中选一行 lockRow（≠ TR），
+   * 该行的数字 D 候选仅分布在目标宫列带内（targetBC 列带）。
+   * → 行列式排除：目标宫内非 lockRow 行的 D 候选被消去，包括 (TR, TC)。
+   * 配合7个直接peer排除其余7个候选数，(TR, TC) 仅余 A（显性唯余）。
+   *
+   * 构造手段：在所有6个非目标宫列带（共6列）分别放置 D，
+   * 行不得为 TR 或 lockRow → lockRow 行中 D 只剩目标宫列带 → 行列式形成。
+   */
   private buildD3NakedSingleOnce(): {
     puzzle: number[][];
     targetRow: number; targetCol: number; answer: number;
@@ -2267,42 +2278,55 @@ export class SudokuGame {
     const targetBR = Math.floor(TR / 3) * 3;
     const targetBC = Math.floor(TC / 3) * 3;
 
-    // 随机选 D（由区块排除的数）和其余7个直接peer数
     const others = shuffleArray([1,2,3,4,5,6,7,8,9].filter(d => d !== A));
-    const D = others[0];
+    const D   = others[0];   // 通过行列式消去的候选数
     const rem7 = others.slice(1);
 
-    // 源宫列带（与目标宫列带不同）
-    const srcBCs = [0, 3, 6].filter(bc => bc !== targetBC);
-    const srcBC = srcBCs[Math.floor(Math.random() * srcBCs.length)];
-    // 第三列带（既不是目标宫也不是源宫）
-    const thirdBC = [0, 3, 6].find(bc => bc !== targetBC && bc !== srcBC)!;
-    const thirdCols = [thirdBC, thirdBC + 1, thirdBC + 2];
-
-    // 源宫非TR行
+    // lockRow：目标宫行带内 ≠ TR 的一行（随机选一个）
     const nonTR = [targetBR, targetBR + 1, targetBR + 2].filter(r => r !== TR);
+    const lockRow = nonTR[Math.floor(Math.random() * nonTR.length)];
 
-    // D必须放在第三列带（既不在源宫列带也不在目标宫列带），且两格列不同
-    const shuffled3 = shuffleArray([...thirdCols]);
-    const d1C = shuffled3[0], d2C = shuffled3[1];
+    // 非目标宫列带共6列，各放一个 D（行不得为 TR 或 lockRow）
+    const nonTargetBCCols = shuffleArray(
+      [0,1,2,3,4,5,6,7,8].filter(c => c < targetBC || c > targetBC + 2)
+    );
+    const forbidRows = new Set([TR, lockRow]);
 
     const puzzle: number[][] = Array.from({length: 9}, () => Array(9).fill(0));
-    puzzle[nonTR[0]][d1C] = D;
-    puzzle[nonTR[1]][d2C] = D;
+    for (const col of nonTargetBCCols) {
+      const availRows = shuffleArray([0,1,2,3,4,5,6,7,8].filter(r => !forbidRows.has(r)));
+      let placed = false;
+      for (const r of availRows) {
+        if (!getValidDigitsAt(puzzle, r, col).has(D)) continue;
+        puzzle[r][col] = D; placed = true; break;
+      }
+      if (!placed) return null;
+    }
 
-    // 放7个直接peer数字（同行/同列/同宫），排除源宫的TR行格子不作为peer
-    const srcBoxTRCols = new Set([srcBC, srcBC + 1, srcBC + 2]);
+    // 验证行列式已形成：lockRow 行中 D 只在目标宫列带有候选
+    const candsCheck = computeCandidates(puzzle);
+    for (let c = 0; c < 9; c++) {
+      if (c >= targetBC && c <= targetBC + 2) continue;
+      if (puzzle[lockRow][c] === 0 && candsCheck[lockRow][c].has(D)) return null;
+    }
+    // 目标宫列带在 lockRow 行中需有至少一个 D 候选（行列式才有意义）
+    let lockHasD = false;
+    for (let dc = 0; dc < 3; dc++) {
+      if (puzzle[lockRow][targetBC + dc] === 0 && candsCheck[lockRow][targetBC + dc].has(D)) {
+        lockHasD = true; break;
+      }
+    }
+    if (!lockHasD) return null;
+
+    // 放7个直接peer数字；排除 lockRow 在目标宫内的格（保护行列式）
     const peerSeen = new Set<string>();
     const peerList: [number, number][] = [];
-    for (let c = 0; c < 9; c++)
-      if (c !== TC && !srcBoxTRCols.has(c)) peerList.push([TR, c]);
-    for (let r = 0; r < 9; r++)
-      if (r !== TR) peerList.push([r, TC]);
-    for (let dr = 0; dr < 3; dr++)
-      for (let dc = 0; dc < 3; dc++) {
-        const r = targetBR + dr, c = targetBC + dc;
-        if (r !== TR && c !== TC) peerList.push([r, c]);
-      }
+    for (let c = 0; c < 9; c++)  if (c !== TC) peerList.push([TR, c]);
+    for (let r = 0; r < 9; r++)  if (r !== TR && r !== lockRow) peerList.push([r, TC]);
+    for (let dr = 0; dr < 3; dr++) for (let dc = 0; dc < 3; dc++) {
+      const r = targetBR + dr, c = targetBC + dc;
+      if (r !== TR && c !== TC && r !== lockRow) peerList.push([r, c]);
+    }
     const uniquePeers: [number, number][] = [];
     for (const [r, c] of peerList) {
       const k = `${r},${c}`;
@@ -2310,13 +2334,106 @@ export class SudokuGame {
     }
     shuffleArray(uniquePeers);
 
-    const usedPos = new Set<string>();
     for (const digit of rem7) {
       let ok = false;
       for (const [r, c] of uniquePeers) {
-        if (usedPos.has(`${r},${c}`) || puzzle[r][c] !== 0) continue;
+        if (puzzle[r][c] !== 0) continue;
         if (!getValidDigitsAt(puzzle, r, c).has(digit)) continue;
-        puzzle[r][c] = digit; usedPos.add(`${r},${c}`); ok = true; break;
+        puzzle[r][c] = digit; ok = true; break;
+      }
+      if (!ok) return null;
+    }
+
+    const cands = computeAdvancedCandidates(puzzle);
+    if (!cands[TR][TC].has(A) || cands[TR][TC].size !== 1) return null;
+    if (!isExactlyOneDeducibleCell(puzzle, TR, TC)) return null;
+
+    this.addTrainingInterference(puzzle, TR, TC, A);
+    return { puzzle, targetRow: TR, targetCol: TC, answer: A };
+  }
+
+  /**
+   * 构造D3显性唯余（列向行列式）：与行向变体对称。
+   *
+   * 目标宫列带内选一列 lockCol（≠ TC），使该列的数字 D 候选仅在目标宫行带（targetBR 行带）。
+   * → 列向行列式排除：目标宫内非 lockCol 列的 D 候选被消去，包括 (TR, TC)。
+   * 配合7个直接peer排除其余7个候选数，(TR, TC) 仅余 A（显性唯余）。
+   *
+   * 构造手段：在所有6个非目标宫行带（共6行）分别放置 D（列 ≠ TC、≠ lockCol），
+   * 使 lockCol 列非目标宫行带各行 D 均被消去 → 列向行列式形成。
+   */
+  private buildD3NakedSingleColOnce(): {
+    puzzle: number[][];
+    targetRow: number; targetCol: number; answer: number;
+  } | null {
+    const TR = Math.floor(Math.random() * 9);
+    const TC = Math.floor(Math.random() * 9);
+    const A  = Math.floor(Math.random() * 9) + 1;
+
+    const targetBR = Math.floor(TR / 3) * 3;
+    const targetBC = Math.floor(TC / 3) * 3;
+
+    const others = shuffleArray([1,2,3,4,5,6,7,8,9].filter(d => d !== A));
+    const D    = others[0];
+    const rem7 = others.slice(1);
+
+    // lockCol：目标宫列带内 ≠ TC 的一列
+    const lockColOpts = [targetBC, targetBC + 1, targetBC + 2].filter(c => c !== TC);
+    const lockCol = lockColOpts[Math.floor(Math.random() * lockColOpts.length)];
+
+    // 在所有6个非目标宫行带的行里，各放一个 D（列 ≠ TC, ≠ lockCol）
+    const nonTargetBRRows = shuffleArray(
+      [0,1,2,3,4,5,6,7,8].filter(r => r < targetBR || r > targetBR + 2)
+    );
+    const forbidCols = new Set([TC, lockCol]);
+
+    const puzzle: number[][] = Array.from({length: 9}, () => Array(9).fill(0));
+    for (const row of nonTargetBRRows) {
+      const availCols = shuffleArray([0,1,2,3,4,5,6,7,8].filter(c => !forbidCols.has(c)));
+      let placed = false;
+      for (const c of availCols) {
+        if (!getValidDigitsAt(puzzle, row, c).has(D)) continue;
+        puzzle[row][c] = D; placed = true; break;
+      }
+      if (!placed) return null;
+    }
+
+    // 验证列向行列式已形成：lockCol 列中 D 只在目标宫行带有候选
+    const candsCheck = computeCandidates(puzzle);
+    for (let r = 0; r < 9; r++) {
+      if (r >= targetBR && r <= targetBR + 2) continue;
+      if (puzzle[r][lockCol] === 0 && candsCheck[r][lockCol].has(D)) return null;
+    }
+    let lockHasD = false;
+    for (let dr = 0; dr < 3; dr++) {
+      if (puzzle[targetBR + dr][lockCol] === 0 && candsCheck[targetBR + dr][lockCol].has(D)) {
+        lockHasD = true; break;
+      }
+    }
+    if (!lockHasD) return null;
+
+    // 放7个直接peer数字；排除 lockCol 在目标宫内的格（保护列向行列式）
+    const peerSeen = new Set<string>();
+    const peerList: [number, number][] = [];
+    for (let c = 0; c < 9; c++)  if (c !== TC) peerList.push([TR, c]);
+    for (let r = 0; r < 9; r++)  if (r !== TR) peerList.push([r, TC]);
+    for (let dr = 0; dr < 3; dr++) for (let dc = 0; dc < 3; dc++) {
+      const r = targetBR + dr, c = targetBC + dc;
+      if (r !== TR && c !== TC && c !== lockCol) peerList.push([r, c]);
+    }
+    const uniquePeers: [number, number][] = [];
+    for (const [r, c] of peerList) {
+      const k = `${r},${c}`;
+      if (!peerSeen.has(k)) { peerSeen.add(k); uniquePeers.push([r, c]); }
+    }
+    shuffleArray(uniquePeers);
+
+    for (const digit of rem7) {
+      let ok = false;
+      for (const [r, c] of uniquePeers) {
+        if (puzzle[r][c] !== 0) continue;
+        if (!getValidDigitsAt(puzzle, r, c).has(digit)) continue;
+        puzzle[r][c] = digit; ok = true; break;
       }
       if (!ok) return null;
     }
@@ -2546,9 +2663,10 @@ export class SudokuGame {
     puzzle: number[][];
     targetRow: number; targetCol: number; answer: number;
   } | null {
-    const type = Math.floor(Math.random() * 3);
-    if (type === 0) return this.buildD3NakedSingleOnce();
-    if (type === 1) return this.buildD3HiddenSingleRowOnce();
+    const type = Math.floor(Math.random() * 4);
+    if (type === 0) return this.buildD3NakedSingleOnce();       // 行向行列式
+    if (type === 1) return this.buildD3NakedSingleColOnce();    // 列向行列式（新变体）
+    if (type === 2) return this.buildD3HiddenSingleRowOnce();
     return this.buildD3HiddenSingleColOnce();
   }
 
@@ -2565,11 +2683,12 @@ export class SudokuGame {
   // ══════════════════════════════════════════════════════
 
   /**
-   * D4显性唯余：2个独立区块分别排除目标格2个候选数 + 6个直接peer覆盖其余6个。
+   * 构造D4显性唯余（双行列式区块排除）：
    *
-   * 两个源宫均在目标格同行带，分别使用第二、第三列带。
-   * D1 放置在第三列带行（使源宫1锁定 D1 在TR行）
-   * D2 放置在第二列带行（使源宫2锁定 D2 在TR行）
+   * 目标宫行带中两行 lockRow1、lockRow2（均≠TR），分别对 D1、D2 形成行列式：
+   * 各自通过在所有6个非目标宫列带放置该数字（行不含 lockRowX 和 TR），
+   * 使 lockRowX 行的 DX 候选仅剩目标宫列带。
+   * 两次行列式排除各消去 (TR,TC) 一个候选数；配合6个直接peer，使 (TR,TC) 仅余 A。
    */
   private buildD4NakedSingleOnce(): {
     puzzle: number[][];
@@ -2582,40 +2701,69 @@ export class SudokuGame {
     const targetBR = Math.floor(TR / 3) * 3;
     const targetBC = Math.floor(TC / 3) * 3;
 
-    const allBC = [0, 3, 6];
-    const otherBCs = allBC.filter(bc => bc !== targetBC);
-    const srcBC1 = otherBCs[0], srcBC2 = otherBCs[1];
-
     const others = shuffleArray([1,2,3,4,5,6,7,8,9].filter(d => d !== A));
     const D1 = others[0], D2 = others[1];
     const rem6 = others.slice(2);
 
+    // 目标宫行带中两个非TR行分别作为两个行列式的锁行
     const nonTR = [targetBR, targetBR + 1, targetBR + 2].filter(r => r !== TR);
+    const lockRow1 = nonTR[0], lockRow2 = nonTR[1];
 
-    // D1 锁在源宫1（srcBC1列带）：D1放在 srcBC2 列带非TR行
-    const srcBC2Cols = shuffleArray([srcBC2, srcBC2 + 1, srcBC2 + 2]);
-    // D2 锁在源宫2（srcBC2列带）：D2放在 srcBC1 列带非TR行
-    const srcBC1Cols = shuffleArray([srcBC1, srcBC1 + 1, srcBC1 + 2]);
+    const nonTargetBCCols = [0,1,2,3,4,5,6,7,8].filter(c => c < targetBC || c > targetBC + 2);
 
     const puzzle: number[][] = Array.from({length: 9}, () => Array(9).fill(0));
-    puzzle[nonTR[0]][srcBC2Cols[0]] = D1;
-    puzzle[nonTR[1]][srcBC2Cols[1]] = D1;
-    puzzle[nonTR[0]][srcBC1Cols[0]] = D2;
-    puzzle[nonTR[1]][srcBC1Cols[1]] = D2;
 
-    // 6个直接peer（排除源宫TR行格）
-    const src1TRCols = new Set([srcBC1, srcBC1 + 1, srcBC1 + 2]);
-    const src2TRCols = new Set([srcBC2, srcBC2 + 1, srcBC2 + 2]);
+    // 构造 D1 的行列式（禁止行：TR 和 lockRow1）
+    for (const col of shuffleArray([...nonTargetBCCols])) {
+      const forbid = new Set([TR, lockRow1]);
+      const availRows = shuffleArray([0,1,2,3,4,5,6,7,8].filter(r => !forbid.has(r)));
+      let placed = false;
+      for (const r of availRows) {
+        if (!getValidDigitsAt(puzzle, r, col).has(D1)) continue;
+        puzzle[r][col] = D1; placed = true; break;
+      }
+      if (!placed) return null;
+    }
+
+    // 构造 D2 的行列式（禁止行：TR 和 lockRow2）
+    for (const col of shuffleArray([...nonTargetBCCols])) {
+      const forbid = new Set([TR, lockRow2]);
+      const availRows = shuffleArray([0,1,2,3,4,5,6,7,8].filter(r => !forbid.has(r)));
+      let placed = false;
+      for (const r of availRows) {
+        if (!getValidDigitsAt(puzzle, r, col).has(D2)) continue;
+        puzzle[r][col] = D2; placed = true; break;
+      }
+      if (!placed) return null;
+    }
+
+    // 验证两个行列式均已形成
+    const candsCheck = computeCandidates(puzzle);
+    for (const [Di, lockRow] of [[D1, lockRow1], [D2, lockRow2]] as [number, number][]) {
+      for (let c = 0; c < 9; c++) {
+        if (c >= targetBC && c <= targetBC + 2) continue;
+        if (puzzle[lockRow][c] === 0 && candsCheck[lockRow][c].has(Di)) return null;
+      }
+      let hasD = false;
+      for (let dc = 0; dc < 3; dc++) {
+        if (puzzle[lockRow][targetBC + dc] === 0 && candsCheck[lockRow][targetBC + dc].has(Di)) {
+          hasD = true; break;
+        }
+      }
+      if (!hasD) return null;
+    }
+
+    // 放6个直接peer数字；排除 lockRow1/lockRow2 在目标宫内的格（保护行列式）
     const peerSeen = new Set<string>();
     const peerList: [number, number][] = [];
-    for (let c = 0; c < 9; c++)
-      if (c !== TC && !src1TRCols.has(c) && !src2TRCols.has(c)) peerList.push([TR, c]);
-    for (let r = 0; r < 9; r++) if (r !== TR) peerList.push([r, TC]);
-    for (let dr = 0; dr < 3; dr++)
-      for (let dc = 0; dc < 3; dc++) {
-        const r = targetBR + dr, c = targetBC + dc;
-        if (r !== TR && c !== TC) peerList.push([r, c]);
-      }
+    for (let c = 0; c < 9; c++) if (c !== TC) peerList.push([TR, c]);
+    for (let r = 0; r < 9; r++) {
+      if (r !== TR && r !== lockRow1 && r !== lockRow2) peerList.push([r, TC]);
+    }
+    for (let dr = 0; dr < 3; dr++) for (let dc = 0; dc < 3; dc++) {
+      const r = targetBR + dr, c = targetBC + dc;
+      if (r !== TR && c !== TC && r !== lockRow1 && r !== lockRow2) peerList.push([r, c]);
+    }
     const uniquePeers: [number, number][] = [];
     for (const [r, c] of peerList) {
       const k = `${r},${c}`;
@@ -2623,13 +2771,120 @@ export class SudokuGame {
     }
     shuffleArray(uniquePeers);
 
-    const usedPos = new Set<string>();
     for (const digit of rem6) {
       let ok = false;
       for (const [r, c] of uniquePeers) {
-        if (usedPos.has(`${r},${c}`) || puzzle[r][c] !== 0) continue;
+        if (puzzle[r][c] !== 0) continue;
         if (!getValidDigitsAt(puzzle, r, c).has(digit)) continue;
-        puzzle[r][c] = digit; usedPos.add(`${r},${c}`); ok = true; break;
+        puzzle[r][c] = digit; ok = true; break;
+      }
+      if (!ok) return null;
+    }
+
+    const cands = computeAdvancedCandidates(puzzle);
+    if (!cands[TR][TC].has(A) || cands[TR][TC].size !== 1) return null;
+    if (!isExactlyOneDeducibleCell(puzzle, TR, TC)) return null;
+
+    this.addTrainingInterference(puzzle, TR, TC, A);
+    return { puzzle, targetRow: TR, targetCol: TC, answer: A };
+  }
+
+  /**
+   * 构造D4显性唯余（双列向行列式）：与行向变体对称。
+   *
+   * 目标宫列带内选两列 lockCol1、lockCol2（均 ≠ TC，互不相同，恰好是 targetBC 带内除 TC 外的两列），
+   * 分别使 D1、D2 通过列向行列式消去目标格候选，配合6个peer，(TR,TC) 仅余 A。
+   *
+   * 构造：对 D1/D2 各自在6个非目标宫行带行放置（列 ≠ TC、≠ 对应 lockCol），
+   * 使 lockCol1 列和 lockCol2 列的 D1/D2 候选均被锁定在目标宫行带内。
+   */
+  private buildD4NakedSingleColOnce(): {
+    puzzle: number[][];
+    targetRow: number; targetCol: number; answer: number;
+  } | null {
+    const TR = Math.floor(Math.random() * 9);
+    const TC = Math.floor(Math.random() * 9);
+    const A  = Math.floor(Math.random() * 9) + 1;
+
+    const targetBR = Math.floor(TR / 3) * 3;
+    const targetBC = Math.floor(TC / 3) * 3;
+
+    const others = shuffleArray([1,2,3,4,5,6,7,8,9].filter(d => d !== A));
+    const D1   = others[0];
+    const D2   = others[1];
+    const rem6 = others.slice(2);
+
+    // lockCol1 和 lockCol2 是 targetBC 列带内 ≠ TC 的两列（恰好2个）
+    const lockCols = [targetBC, targetBC + 1, targetBC + 2].filter(c => c !== TC);
+    if (lockCols.length < 2) return null;
+    const lockCol1 = lockCols[0], lockCol2 = lockCols[1];
+
+    // 6个非目标宫行带的行
+    const nonTargetBRRows = [0,1,2,3,4,5,6,7,8].filter(r => r < targetBR || r > targetBR + 2);
+
+    const puzzle: number[][] = Array.from({length: 9}, () => Array(9).fill(0));
+
+    // D1 列向行列式：在每个非目标宫行带行放 D1（列 ≠ TC, ≠ lockCol1）
+    for (const row of shuffleArray([...nonTargetBRRows])) {
+      const availCols = shuffleArray([0,1,2,3,4,5,6,7,8].filter(c => c !== TC && c !== lockCol1));
+      let placed = false;
+      for (const c of availCols) {
+        if (!getValidDigitsAt(puzzle, row, c).has(D1)) continue;
+        puzzle[row][c] = D1; placed = true; break;
+      }
+      if (!placed) return null;
+    }
+
+    // D2 列向行列式：在每个非目标宫行带行放 D2（列 ≠ TC, ≠ lockCol2）
+    for (const row of shuffleArray([...nonTargetBRRows])) {
+      const availCols = shuffleArray([0,1,2,3,4,5,6,7,8].filter(c => c !== TC && c !== lockCol2));
+      let placed = false;
+      for (const c of availCols) {
+        if (!getValidDigitsAt(puzzle, row, c).has(D2)) continue;
+        puzzle[row][c] = D2; placed = true; break;
+      }
+      if (!placed) return null;
+    }
+
+    // 验证两个列向行列式均形成
+    const candsCheck = computeCandidates(puzzle);
+    for (const [Di, lockCol] of [[D1, lockCol1], [D2, lockCol2]] as [number, number][]) {
+      for (let r = 0; r < 9; r++) {
+        if (r >= targetBR && r <= targetBR + 2) continue;
+        if (puzzle[r][lockCol] === 0 && candsCheck[r][lockCol].has(Di)) return null;
+      }
+      let hasD = false;
+      for (let dr = 0; dr < 3; dr++) {
+        if (puzzle[targetBR + dr][lockCol] === 0 && candsCheck[targetBR + dr][lockCol].has(Di)) {
+          hasD = true; break;
+        }
+      }
+      if (!hasD) return null;
+    }
+
+    // 放6个直接peer数字；排除目标宫内 lockCol1 和 lockCol2 列的格（保护行列式）
+    const lockColSet = new Set([lockCol1, lockCol2]);
+    const peerSeen  = new Set<string>();
+    const peerList: [number, number][] = [];
+    for (let c = 0; c < 9; c++) if (c !== TC) peerList.push([TR, c]);
+    for (let r = 0; r < 9; r++) if (r !== TR) peerList.push([r, TC]);
+    for (let dr = 0; dr < 3; dr++) for (let dc = 0; dc < 3; dc++) {
+      const r = targetBR + dr, c = targetBC + dc;
+      if (r !== TR && c !== TC && !lockColSet.has(c)) peerList.push([r, c]);
+    }
+    const uniquePeers: [number, number][] = [];
+    for (const [r, c] of peerList) {
+      const k = `${r},${c}`;
+      if (!peerSeen.has(k)) { peerSeen.add(k); uniquePeers.push([r, c]); }
+    }
+    shuffleArray(uniquePeers);
+
+    for (const digit of rem6) {
+      let ok = false;
+      for (const [r, c] of uniquePeers) {
+        if (puzzle[r][c] !== 0) continue;
+        if (!getValidDigitsAt(puzzle, r, c).has(digit)) continue;
+        puzzle[r][c] = digit; ok = true; break;
       }
       if (!ok) return null;
     }
@@ -2726,9 +2981,11 @@ export class SudokuGame {
     puzzle: number[][];
     targetRow: number; targetCol: number; answer: number;
   } | null {
-    return Math.random() < 0.5
-      ? this.buildD4NakedSingleOnce()
-      : this.buildD4HiddenSingleRowOnce();
+    const type = Math.floor(Math.random() * 4);
+    if (type === 0) return this.buildD4NakedSingleOnce();       // 行向双行列式
+    if (type === 1) return this.buildD4NakedSingleColOnce();    // 列向双行列式（新变体）
+    if (type === 2) return this.buildD4HiddenSingleRowOnce();
+    return this.buildD4HiddenSingleRowOnce();
   }
 
   private generateD4Puzzle(): { puzzle: number[][]; targetRow: number; targetCol: number; answer: number } {
@@ -2935,9 +3192,158 @@ export class SudokuGame {
     return { puzzle, targetRow: TR, targetCol: TC, answer: A };
   }
 
+  /**
+   * D5构造变体：横向数对（Row Pair）
+   *
+   * 与纵向数对变体对称。数对 {P,Q} 横向分布在源宫同一行 rPair 的两个非cBlocked列
+   * (cPair1, cPair2) 中，两格均在源宫内。
+   *
+   * 布局差异：纵向数对两格上下排列，横向数对两格左右并排，产生不同视觉形态。
+   * 区块形成机制相同：列向行列式使 A 仅在 cBlocked 列有候选 → 行 TR 隐性唯余。
+   */
+  private buildD5RowPairOnce(): {
+    puzzle: number[][];
+    targetRow: number; targetCol: number; answer: number;
+  } | null {
+    const TR = Math.floor(Math.random() * 9);
+    const TC = Math.floor(Math.random() * 9);
+    const A  = Math.floor(Math.random() * 9) + 1;
+
+    const targetBR = Math.floor(TR / 3) * 3;
+    const targetBC = Math.floor(TC / 3) * 3;
+
+    // 选源宫（不同行带、不同列带）
+    const nonTargetBCs = [0, 3, 6].filter(bc => bc !== targetBC);
+    if (nonTargetBCs.length === 0) return null;
+    const srcBC = nonTargetBCs[Math.floor(Math.random() * nonTargetBCs.length)];
+    const srcBCCols = shuffleArray([srcBC, srcBC + 1, srcBC + 2]);
+    const cBlocked = srcBCCols[0];
+    const cPair1   = srcBCCols[1]; // 横向数对的两列
+    const cPair2   = srcBCCols[2];
+
+    const srcBROptions = [0, 3, 6].filter(br => br !== targetBR);
+    const srcBR = srcBROptions[Math.floor(Math.random() * srcBROptions.length)];
+
+    // 数对配置
+    const digitsNonA = shuffleArray([1,2,3,4,5,6,7,8,9].filter(d => d !== A));
+    const P = digitsNonA[0], Q = digitsNonA[1];
+
+    // rPair：横向数对所在行（在源宫行带内）
+    const srcRows = shuffleArray([srcBR, srcBR + 1, srcBR + 2]);
+    const rPair = srcRows[0];
+
+    const puzzle: number[][] = Array.from({length: 9}, () => Array(9).fill(0));
+
+    // 分别在 cPair1 和 cPair2 列宫外放 A，消除源宫这两列中 A 的候选
+    for (const col of [cPair1, cPair2]) {
+      const outsideRows = shuffleArray([0,1,2,3,4,5,6,7,8].filter(r => r < srcBR || r > srcBR + 2));
+      let placed = false;
+      for (const r of outsideRows) {
+        if (r === TR) continue;
+        if (getValidDigitsAt(puzzle, r, col).has(A)) {
+          puzzle[r][col] = A; placed = true; break;
+        }
+      }
+      if (!placed) return null;
+    }
+
+    // 构造横向数对：使 (rPair, cPair1) 和 (rPair, cPair2) 候选均仅剩 {P, Q}
+    // 两格同行同宫，共享行 peer 和宫 peer；优先用行 peer 同时消去两格中的候选数字
+    const toElim = [1,2,3,4,5,6,7,8,9].filter(d => d !== P && d !== Q);
+
+    // 合并两个数对格的 peer 集合（去重）
+    const peerSeen = new Set<string>();
+    const combinedPeers: [number, number][] = [];
+    // 行 peer（同时对两格有效）
+    for (let c = 0; c < 9; c++) {
+      if (c !== cPair1 && c !== cPair2) {
+        const k = `${rPair},${c}`;
+        if (!peerSeen.has(k)) { peerSeen.add(k); combinedPeers.push([rPair, c]); }
+      }
+    }
+    // cPair1 列 peer
+    for (let r = 0; r < 9; r++) {
+      if (r !== rPair) {
+        const k = `${r},${cPair1}`;
+        if (!peerSeen.has(k)) { peerSeen.add(k); combinedPeers.push([r, cPair1]); }
+      }
+    }
+    // cPair2 列 peer
+    for (let r = 0; r < 9; r++) {
+      if (r !== rPair) {
+        const k = `${r},${cPair2}`;
+        if (!peerSeen.has(k)) { peerSeen.add(k); combinedPeers.push([r, cPair2]); }
+      }
+    }
+    // 源宫宫 peer（非 rPair 行、非 cPair1/cPair2 列）
+    for (let dr = 0; dr < 3; dr++) for (let dc = 0; dc < 3; dc++) {
+      const r = srcBR + dr, c = srcBC + dc;
+      if (r !== rPair && c !== cPair1 && c !== cPair2) {
+        const k = `${r},${c}`;
+        if (!peerSeen.has(k)) { peerSeen.add(k); combinedPeers.push([r, c]); }
+      }
+    }
+    shuffleArray(combinedPeers);
+
+    const usedPeers = new Set<string>();
+    // 两轮消除：第一轮用行 peer 尽可能同时消去两格；第二轮处理残余
+    for (let pass = 0; pass < 2; pass++) {
+      for (const d of toElim) {
+        const curCands = computeCandidates(puzzle);
+        const need1 = puzzle[rPair][cPair1] === 0 && curCands[rPair][cPair1].has(d);
+        const need2 = puzzle[rPair][cPair2] === 0 && curCands[rPair][cPair2].has(d);
+        if (!need1 && !need2) continue;
+        let ok = false;
+        for (const [r, c] of combinedPeers) {
+          if (usedPeers.has(`${r},${c}`) || puzzle[r][c] !== 0) continue;
+          if (!getValidDigitsAt(puzzle, r, c).has(d)) continue;
+          puzzle[r][c] = d; usedPeers.add(`${r},${c}`); ok = true; break;
+        }
+        if (!ok && pass === 1) return null;
+      }
+    }
+
+    // 验证两个数对格候选数均为 {P, Q}
+    const pairCands = computeCandidates(puzzle);
+    const pc1 = pairCands[rPair][cPair1], pc2 = pairCands[rPair][cPair2];
+    if (pc1.size !== 2 || !pc1.has(P) || !pc1.has(Q)) return null;
+    if (pc2.size !== 2 || !pc2.has(P) || !pc2.has(Q)) return null;
+
+    // 验证区块：源宫 A 仅在 cBlocked 列
+    const candsBlk = computeCandidates(puzzle);
+    for (let dr = 0; dr < 3; dr++) for (let dc = 0; dc < 3; dc++) {
+      const r = srcBR + dr, c = srcBC + dc;
+      if (c !== cBlocked && puzzle[r][c] === 0 && candsBlk[r][c].has(A)) return null;
+    }
+
+    // 封锁行 TR 其余格（≠ TC, ≠ cBlocked）的 A
+    const otherRowCols = [0,1,2,3,4,5,6,7,8].filter(c => c !== TC && c !== cBlocked);
+    for (const col of otherRowCols) {
+      const cands2 = computeCandidates(puzzle);
+      if (!cands2[TR][col].has(A)) continue;
+      const opts = shuffleArray([0,1,2,3,4,5,6,7,8].filter(r => r !== TR));
+      let placed = false;
+      for (const r of opts) {
+        if (puzzle[r][col] !== 0 || !getValidDigitsAt(puzzle, r, col).has(A)) continue;
+        puzzle[r][col] = A; placed = true; break;
+      }
+      if (!placed) return null;
+    }
+
+    const candsF = computeAdvancedCandidates(puzzle);
+    if (!candsF[TR][TC].has(A)) return null;
+    for (let c = 0; c < 9; c++)
+      if (c !== TC && puzzle[TR][c] === 0 && candsF[TR][c].has(A)) return null;
+
+    if (!isExactlyOneDeducibleCell(puzzle, TR, TC)) return null;
+
+    this.addTrainingInterference(puzzle, TR, TC, A, 1, 3);
+    return { puzzle, targetRow: TR, targetCol: TC, answer: A };
+  }
+
   private generateD5Puzzle(): { puzzle: number[][]; targetRow: number; targetCol: number; answer: number } {
     for (let i = 0; i < 200; i++) {
-      const r = this.buildD5PuzzleOnce();
+      const r = Math.random() < 0.5 ? this.buildD5PuzzleOnce() : this.buildD5RowPairOnce();
       if (r) return r;
     }
     throw new Error('D5 puzzle generation failed after 200 attempts');
@@ -3098,9 +3504,172 @@ export class SudokuGame {
     return { puzzle, targetRow: TR, targetCol: TC, answer: A };
   }
 
+  /**
+   * D6构造变体：双横向数对
+   *
+   * 与 buildD6PuzzleOnce 结构相同，但两个数对均采用横向布局：
+   * 数对 {P,Q} 分布在源宫同一行的两个非 cBlocked 列，两格左右并排（横向），
+   * 而非上下排列（纵向）。两种布局产生截然不同的视觉图案。
+   */
+  private buildD6RowPairOnce(): {
+    puzzle: number[][];
+    targetRow: number; targetCol: number; answer: number;
+  } | null {
+    const TR = Math.floor(Math.random() * 9);
+    const TC = Math.floor(Math.random() * 9);
+    const A  = Math.floor(Math.random() * 9) + 1;
+
+    const targetBR = Math.floor(TR / 3) * 3;
+    const targetBC = Math.floor(TC / 3) * 3;
+
+    // 两个不同列带（非 targetBC），每个设1个横向数对源宫
+    const nonTargetBCs = [0, 3, 6].filter(bc => bc !== targetBC);
+    if (nonTargetBCs.length < 2) return null;
+    const [srcBC1, srcBC2] = shuffleArray([...nonTargetBCs]);
+
+    // 两个源宫行带（可相同）
+    const srcBROptions = [0, 3, 6].filter(br => br !== targetBR);
+    const srcBR1 = srcBROptions[Math.floor(Math.random() * srcBROptions.length)];
+    const srcBR2Options = srcBROptions.filter(br => br !== srcBR1);
+    const srcBR2 = srcBR2Options.length > 0
+      ? srcBR2Options[Math.floor(Math.random() * srcBR2Options.length)]
+      : srcBR1;
+
+    // 各选 cBlocked 列
+    const bc1Cols = shuffleArray([srcBC1, srcBC1 + 1, srcBC1 + 2]);
+    const bc2Cols = shuffleArray([srcBC2, srcBC2 + 1, srcBC2 + 2]);
+    const cBlocked1 = bc1Cols[0];
+    const cBlocked2 = bc2Cols[0];
+
+    const digitsNonA = shuffleArray([1,2,3,4,5,6,7,8,9].filter(d => d !== A));
+    const P1 = digitsNonA[0], Q1 = digitsNonA[1];
+    const P2 = digitsNonA[2], Q2 = digitsNonA[3];
+
+    const puzzle: number[][] = Array.from({length: 9}, () => Array(9).fill(0));
+
+    // 横向数对区块构造辅助：在 srcBR 宫中，选 rPair 行放横向数对 {Pp,Qp}，
+    // 两对格列 = nonCBlk 的两列，通过列向 A 封锁 + peer 消除 构造横向数对
+    const buildBlockWithRowPair = (
+      srcBR: number, srcBC_: number, cBlk: number,
+      Pp: number, Qp: number,
+    ): boolean => {
+      const nonCBlkCols = shuffleArray([srcBC_, srcBC_ + 1, srcBC_ + 2].filter(c => c !== cBlk));
+      const cP1 = nonCBlkCols[0], cP2 = nonCBlkCols[1];
+
+      // 在 cP1 和 cP2 列宫外放 A，消除源宫中这两列的 A 候选
+      for (const col of [cP1, cP2]) {
+        const outsideRows = shuffleArray([0,1,2,3,4,5,6,7,8].filter(r => r < srcBR || r > srcBR + 2));
+        let placedA = false;
+        for (const r of outsideRows) {
+          if (r === TR) continue;
+          if (getValidDigitsAt(puzzle, r, col).has(A)) {
+            puzzle[r][col] = A; placedA = true; break;
+          }
+        }
+        if (!placedA) return false;
+      }
+
+      // 在 srcBR 行带中选 rPair
+      const pairRows = shuffleArray([srcBR, srcBR + 1, srcBR + 2]);
+      let pairMade = false;
+      for (const rPair of pairRows) {
+        const toElimPair = [1,2,3,4,5,6,7,8,9].filter(d => d !== Pp && d !== Qp);
+
+        // 合并两格 peer（优先行 peer 以同时消去两格候选）
+        const pSeen = new Set<string>();
+        const peers: [number, number][] = [];
+        for (let c = 0; c < 9; c++) {
+          if (c !== cP1 && c !== cP2) {
+            const k = `${rPair},${c}`;
+            if (!pSeen.has(k)) { pSeen.add(k); peers.push([rPair, c]); }
+          }
+        }
+        for (const col of [cP1, cP2]) {
+          for (let r = 0; r < 9; r++) {
+            if (r !== rPair) {
+              const k = `${r},${col}`;
+              if (!pSeen.has(k)) { pSeen.add(k); peers.push([r, col]); }
+            }
+          }
+        }
+        for (let dr = 0; dr < 3; dr++) for (let dc = 0; dc < 3; dc++) {
+          const r2 = srcBR + dr, c2 = srcBC_ + dc;
+          if (r2 !== rPair && c2 !== cP1 && c2 !== cP2) {
+            const k = `${r2},${c2}`;
+            if (!pSeen.has(k)) { pSeen.add(k); peers.push([r2, c2]); }
+          }
+        }
+        shuffleArray(peers);
+
+        const saved = puzzle.map(row => [...row]);
+        const used  = new Set<string>();
+        for (let pass = 0; pass < 2; pass++) {
+          for (const d of toElimPair) {
+            const cc = computeCandidates(puzzle);
+            const n1 = puzzle[rPair][cP1] === 0 && cc[rPair][cP1].has(d);
+            const n2 = puzzle[rPair][cP2] === 0 && cc[rPair][cP2].has(d);
+            if (!n1 && !n2) continue;
+            let ok2 = false;
+            for (const [r2, c2] of peers) {
+              if (used.has(`${r2},${c2}`) || puzzle[r2][c2] !== 0) continue;
+              if (!getValidDigitsAt(puzzle, r2, c2).has(d)) continue;
+              puzzle[r2][c2] = d; used.add(`${r2},${c2}`); ok2 = true; break;
+            }
+            if (!ok2 && pass === 1) { /* will rollback */ }
+          }
+        }
+        const cc2 = computeCandidates(puzzle);
+        const ok1 = cc2[rPair][cP1].size === 2 && cc2[rPair][cP1].has(Pp) && cc2[rPair][cP1].has(Qp);
+        const ok2 = cc2[rPair][cP2].size === 2 && cc2[rPair][cP2].has(Pp) && cc2[rPair][cP2].has(Qp);
+        if (ok1 && ok2) { pairMade = true; break; }
+        for (let r = 0; r < 9; r++) puzzle[r] = saved[r];
+      }
+      return pairMade;
+    };
+
+    if (!buildBlockWithRowPair(srcBR1, srcBC1, cBlocked1, P1, Q1)) return null;
+    if (!buildBlockWithRowPair(srcBR2, srcBC2, cBlocked2, P2, Q2)) return null;
+
+    // 验证两个区块均形成
+    const candsBlk = computeCandidates(puzzle);
+    for (const [srcBR, srcBC_, cBlk] of [
+      [srcBR1, srcBC1, cBlocked1], [srcBR2, srcBC2, cBlocked2]
+    ] as [number, number, number][]) {
+      for (let dr = 0; dr < 3; dr++) for (let dc = 0; dc < 3; dc++) {
+        const r = srcBR + dr, c = srcBC_ + dc;
+        if (c !== cBlk && puzzle[r][c] === 0 && candsBlk[r][c].has(A)) return null;
+      }
+    }
+
+    // 封锁行 TR 其余格（≠ TC, ≠ cBlocked1, ≠ cBlocked2）的 A
+    const blockedCols = new Set([TC, cBlocked1, cBlocked2]);
+    const otherRowCols = [0,1,2,3,4,5,6,7,8].filter(c => !blockedCols.has(c));
+    for (const col of otherRowCols) {
+      const cands2 = computeCandidates(puzzle);
+      if (!cands2[TR][col].has(A)) continue;
+      const opts = shuffleArray([0,1,2,3,4,5,6,7,8].filter(r => r !== TR));
+      let placed = false;
+      for (const r of opts) {
+        if (puzzle[r][col] !== 0 || !getValidDigitsAt(puzzle, r, col).has(A)) continue;
+        puzzle[r][col] = A; placed = true; break;
+      }
+      if (!placed) return null;
+    }
+
+    const candsF = computeAdvancedCandidates(puzzle);
+    if (!candsF[TR][TC].has(A)) return null;
+    for (let c = 0; c < 9; c++)
+      if (c !== TC && puzzle[TR][c] === 0 && candsF[TR][c].has(A)) return null;
+
+    if (!isExactlyOneDeducibleCell(puzzle, TR, TC)) return null;
+
+    this.addTrainingInterference(puzzle, TR, TC, A, 1, 2);
+    return { puzzle, targetRow: TR, targetCol: TC, answer: A };
+  }
+
   private generateD6Puzzle(): { puzzle: number[][]; targetRow: number; targetCol: number; answer: number } {
     for (let i = 0; i < 200; i++) {
-      const r = this.buildD6PuzzleOnce();
+      const r = Math.random() < 0.5 ? this.buildD6PuzzleOnce() : this.buildD6RowPairOnce();
       if (r) return r;
     }
     throw new Error('D6 puzzle generation failed after 200 attempts');
