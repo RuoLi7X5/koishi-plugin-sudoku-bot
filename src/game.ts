@@ -6,6 +6,7 @@ import { UserService } from "./user";
 import { MOCK_MESSAGES } from "./mockMessages";
 import { HintManager } from "./hint";
 import { solve, formatCompactSteps, checkPuzzleIntuitiveSolvable } from "./solver";
+import { TrainingPool, PoolRecord } from "./training-pool";
 
 // ══════════════════════════════════════════════════════
 // 唯余训练：候选数工具函数（模块级，不依赖 this）
@@ -336,6 +337,8 @@ type TrainingHintEntry = {
   answer: number;
   puzzle: number[][];
   difficulty: number;
+  /** 预渲染的推理路径文本（D3+ 从 SQLite 池取出时已生成） */
+  tracePath?: string;
   expireAt: number;        // Unix 时间戳（ms），24小时后过期
 };
 
@@ -423,6 +426,9 @@ export class SudokuGame {
   // 唯余训练题目答案缓存（key = channelId → trainingId → TrainingHintEntry）
   private trainingHintCache: Map<string, Map<string, TrainingHintEntry>> = new Map();
 
+  // D3+ 训练题目池（SQLite 持久化，跨会话共享）
+  private trainingPool!: TrainingPool;
+
   // 难度名称映射
   private static readonly DIFFICULTY_NAMES = [
     "", "简单", "较易", "中等", "中等+", "困难", "困难+", "极难"
@@ -442,6 +448,16 @@ export class SudokuGame {
     this.userService = new UserService(ctx);
     this.currentDifficulty = config.difficulty;
     this.currentTimeout = config.timeout;
+    this.trainingPool = new TrainingPool(ctx);
+  }
+
+  /** 初始化训练题目池（插件启动时调用，异步检查并补充各难度题库） */
+  async initTrainingPool(): Promise<void> {
+    try {
+      await this.trainingPool.init();
+    } catch (err: any) {
+      this.ctx.logger('sudoku').warn('[题目池] 初始化失败：', err?.message ?? err);
+    }
   }
 
   // ==================== 公开方法 ====================
@@ -511,7 +527,7 @@ export class SudokuGame {
       `  ${c.commandHint} 2-7 - 查询训练题目「第2轮第7题」的解题路径（24小时内有效）`,
       "",
       "🎯 唯余训练",
-      `  ${c.commandTrainingStart} [难度1-6] - 开始唯余训练，不填难度默认1`,
+      `  ${c.commandTrainingStart} [难度1-8] - 开始唯余训练，不填难度默认1`,
       `  ${c.commandTrainingStop} - 结束本轮训练并查看统计报告`,
       "  训练说明：每题盘面只能推出一个数字，难度越高技巧越复杂",
       "  题目右下角显示编号（如 2-7），可用答案指令查询推理路径",
@@ -538,13 +554,15 @@ export class SudokuGame {
       "",
       "━━━━━━━━━━━━━━━━━━━━━━━━",
       "",
-      "🎯 唯余训练（1-6级）  每题盘面恰好只有1格可推出",
+      "🎯 唯余训练（1-8级）  每题盘面恰好只有1格可推出",
       "  1·基础唯余    行/列/宫直接排除，目标格9缺1",
       "  2·干扰唯余    同训练1，加入干扰数字遮蔽视野",
       "  3·区块唯余    1个区块排除推出目标格（混合显/隐性）",
-      "  4·双区块      2个区块排除推出目标格（混合显/隐性）",
-      "  5·数对→区块   数对占位→形成区块→推出目标格",
-      "  6·多数对      2个数对→双区块→推出目标格",
+      "  4·双区块      2~4个区块排除推出目标格",
+      "  5·数对→区块   显性数对/三数组 + 区块 → 唯余",
+      "  6·复合链      多数对/三数组 + 多区块 → 多步推理链",
+      "  7·联合排除    多方向联合排除产生数组 → 多步推理 → 唯余",
+      "  8·极难链      深度多路径交汇，7步以上推理链",
     ].join("\n");
     await session.send(message);
   }
@@ -872,10 +890,17 @@ export class SudokuGame {
     }
 
     const targetCell = `${String.fromCharCode(65 + entry.targetRow)}${entry.targetCol + 1}`;
-    const explanation = generateTrainingHintExplanation(
-      entry.puzzle, entry.targetRow, entry.targetCol, entry.answer,
-    );
-    await session.send(`目标格：${targetCell}\n解答：${explanation}`);
+
+    // D3+ 优先使用预渲染的推理路径；D1-D2 使用旧的解析生成器
+    let explanation: string;
+    if (entry.tracePath) {
+      explanation = entry.tracePath;
+    } else {
+      explanation = generateTrainingHintExplanation(
+        entry.puzzle, entry.targetRow, entry.targetCol, entry.answer,
+      );
+    }
+    await session.send(`目标格：${targetCell}\n推理路径：\n${explanation}`);
   }
 
   async showRank(session: Session, type: string = "积分", scope?: string) {
@@ -1857,7 +1882,7 @@ export class SudokuGame {
       return;
     }
 
-    const d = Math.min(Math.max(Math.floor(difficulty), 1), 6);
+    const d = Math.min(Math.max(Math.floor(difficulty), 1), 8);
 
     // 自增本频道轮次计数器
     const round = (this.trainingRoundCounter.get(key) ?? 0) + 1;
@@ -3720,8 +3745,8 @@ export class SudokuGame {
 
   /**
    * 后台持续填充训练题目池（fire-and-forget）。
-   * 使用 setImmediate 确保填充从下一事件循环迭代开始，不阻塞当前消息收发。
-   * 每次填充一道（生成盘面 + Canvas 渲染），完成后递归补充直到池满。
+   * D1-D2：实时生成（原有逻辑）
+   * D3+：从 SQLite 题目池中取题，取完一道立即触发 SQLite 池的后台补充
    */
   private fillTrainingPool(ts: TrainingSession): void {
     if (ts.poolFilling) return;
@@ -3732,28 +3757,53 @@ export class SudokuGame {
 
     setImmediate(async () => {
       try {
-        let consecutive_failures = 0;
+        let consecutiveFailures = 0;
         while (
           ts.questionPool.length < this.TRAINING_POOL_SIZE &&
           this.trainings.has(ts.channelId) &&
-          consecutive_failures < 3
+          consecutiveFailures < 3
         ) {
           const idx = ts.poolNextQueuedIndex++;
           const trainingId = `${ts.round}-${idx}`;
           const label = `${trainingId}  唯余训练·难度${ts.difficulty}`;
           try {
-            const { puzzle, targetRow, targetCol, answer } =
-              this.generateTrainingPuzzleByDifficulty(ts.difficulty);
-            const imgBuf = await this.renderer.render(puzzle, label, undefined, undefined);
-            if (!this.trainings.has(ts.channelId)) break;
-            this.storeTrainingHint(ts.channelId, trainingId, {
-              targetRow, targetCol, answer, puzzle, difficulty: ts.difficulty,
-            });
-            ts.questionPool.push({ puzzle, answer, renderedImage: imgBuf, label, questionIndex: idx });
-            consecutive_failures = 0;
-          } catch {
-            consecutive_failures++;
-            this.ctx.logger("sudoku").warn(`训练池填充第${idx}题失败（连续失败 ${consecutive_failures} 次）`);
+            if (ts.difficulty >= 3) {
+              // D3+：从 SQLite 题目池取题
+              const record = await this.trainingPool.drawOne(ts.difficulty);
+              if (!record) {
+                // 题库暂时为空，等待后台补充
+                this.ctx.logger('sudoku').warn(`[题目池] D${ts.difficulty} 题库暂时为空，等待补充…`);
+                await new Promise(resolve => setTimeout(resolve, 500));
+                consecutiveFailures++;
+                continue;
+              }
+              const parsed = TrainingPool.parseRecord(record);
+              const imgBuf = await this.renderer.render(parsed.puzzle, label, undefined, undefined);
+              if (!this.trainings.has(ts.channelId)) break;
+              this.storeTrainingHint(ts.channelId, trainingId, {
+                targetRow: parsed.targetRow, targetCol: parsed.targetCol,
+                answer: parsed.answer, puzzle: parsed.puzzle,
+                difficulty: ts.difficulty, tracePath: parsed.tracePath,
+              });
+              ts.questionPool.push({
+                puzzle: parsed.puzzle, answer: parsed.answer,
+                renderedImage: imgBuf, label, questionIndex: idx,
+              });
+            } else {
+              // D1-D2：实时生成（原有逻辑）
+              const { puzzle, targetRow, targetCol, answer } =
+                this.generateTrainingPuzzleByDifficulty(ts.difficulty);
+              const imgBuf = await this.renderer.render(puzzle, label, undefined, undefined);
+              if (!this.trainings.has(ts.channelId)) break;
+              this.storeTrainingHint(ts.channelId, trainingId, {
+                targetRow, targetCol, answer, puzzle, difficulty: ts.difficulty,
+              });
+              ts.questionPool.push({ puzzle, answer, renderedImage: imgBuf, label, questionIndex: idx });
+            }
+            consecutiveFailures = 0;
+          } catch (err: any) {
+            consecutiveFailures++;
+            this.ctx.logger('sudoku').warn(`训练池填充第${idx}题失败（${consecutiveFailures}次）: ${err?.message ?? err}`);
           }
         }
       } finally {
@@ -3817,11 +3867,30 @@ export class SudokuGame {
         cq.answer = poolEntry.answer;
         if (!this.trainings.has(ts.channelId)) return;
         await this.sendImage(session, poolEntry.renderedImage);
+      } else if (ts.difficulty >= 3) {
+        // D3+：从 SQLite 池取题作为实时兜底
+        const record = await this.trainingPool.drawOne(ts.difficulty);
+        if (record) {
+          const parsed = TrainingPool.parseRecord(record);
+          cq.answer = parsed.answer;
+          this.storeTrainingHint(ts.channelId, trainingId, {
+            targetRow: parsed.targetRow, targetCol: parsed.targetCol,
+            answer: parsed.answer, puzzle: parsed.puzzle,
+            difficulty: ts.difficulty, tracePath: parsed.tracePath,
+          });
+          const imgBuf = await this.renderer.render(parsed.puzzle, label, undefined, undefined);
+          if (!this.trainings.has(ts.channelId)) return;
+          await this.sendImage(session, imgBuf);
+        } else {
+          // SQLite 池为空时提示等待
+          await session.send(`⏳ 难度${ts.difficulty}题库补充中，请稍等片刻后重试…`);
+          return;
+        }
       } else {
+        // D1-D2：实时生成
         const { puzzle, targetRow, targetCol, answer } =
           this.generateTrainingPuzzleByDifficulty(ts.difficulty);
         cq.answer = answer;
-        // 生成成功后立即缓存答案（渲染失败也能保留正确答案供查询）
         this.storeTrainingHint(ts.channelId, trainingId, {
           targetRow, targetCol, answer, puzzle, difficulty: ts.difficulty,
         });
@@ -3834,8 +3903,13 @@ export class SudokuGame {
       logger.warn("唯余训练图片渲染/发送失败：", err);
       if (cq.answer === 0) {
         try {
-          const { answer } = this.generateTrainingPuzzleByDifficulty(ts.difficulty);
-          cq.answer = answer;
+          if (ts.difficulty >= 3) {
+            const record = await this.trainingPool.drawOne(ts.difficulty);
+            cq.answer = record ? TrainingPool.parseRecord(record).answer : Math.floor(Math.random() * 9) + 1;
+          } else {
+            const { answer } = this.generateTrainingPuzzleByDifficulty(ts.difficulty);
+            cq.answer = answer;
+          }
         } catch {
           cq.answer = Math.floor(Math.random() * 9) + 1;
         }

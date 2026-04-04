@@ -1,6 +1,7 @@
 import { Context, Schema } from "koishi";
 import { SudokuGame } from "./game";
 import { ImageRenderer } from "./renderer";
+import { extendPoolModel } from "./training-pool";
 
 export const name = "sudoku-bot";
 
@@ -33,7 +34,7 @@ export interface Config {
   baseScore: number;
   penalty: number;
   streakBonus: number;
-  difficulty: 1 | 2 | 3 | 4 | 5 | 6 | 7;
+  difficulty: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
 }
 
 export const Config: Schema<Config> = Schema.intersect([
@@ -83,15 +84,15 @@ export const Config: Schema<Config> = Schema.intersect([
     inactivityTimeout: Schema.number().default(20).min(0).max(60).description("无人参与自动结束时长（分钟），0 = 禁用，默认 20 分钟"),
     rounds: Schema.number().default(8).min(1).max(20).description("每轮题目数量"),
     difficulty: Schema.union([
-      Schema.union([1, 2, 3, 4, 5, 6, 7] as const),
+      Schema.union([1, 2, 3, 4, 5, 6, 7, 8] as const),
       // 兼容旧版字符串配置，自动映射为数字
       Schema.transform(Schema.string(), (val) => {
-        const legacyMap: Record<string, 1 | 2 | 3 | 4 | 5 | 6 | 7> = {
+        const legacyMap: Record<string, 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8> = {
           easy: 1, medium: 2, hard: 4, expert: 6,
         };
-        return (legacyMap[val] ?? 2) as 1 | 2 | 3 | 4 | 5 | 6 | 7;
+        return (legacyMap[val] ?? 2) as 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
       }),
-    ] as const).default(2).description("默认难度级别（1-7，2为默认）"),
+    ] as const).default(2).description("默认难度级别（1-8，2为默认）"),
   }).description("游戏配置"),
   
   Schema.object({
@@ -115,6 +116,9 @@ export function apply(ctx: Context, config: Config) {
   if (!config.commandDiffInfo) {
     (config as any).commandDiffInfo = "难度说明";
   }
+
+  // 扩展训练题目池数据库模型（D3+ 持久化题目池）
+  extendPoolModel(ctx);
 
   // 扩展数据库模型（字段对象用 as any 绕过 Koishi 的 MapField 泛型约束，
   // 新增字段 activeTitle 未在 Tables 接口中声明，运行时会被 minato 正确处理）
@@ -151,6 +155,11 @@ export function apply(ctx: Context, config: Config) {
   // 初始化组件
   const renderer = new ImageRenderer(ctx);
   const game = new SudokuGame(ctx, config, renderer);
+
+  // 异步初始化训练题目池（不阻塞插件启动）
+  game.initTrainingPool().catch(err =>
+    ctx.logger('sudoku').warn('[题目池] 初始化异常：', err?.message ?? err),
+  );
 
   // 注册命令，处理 session 可能为 undefined 的情况
   // 开始游戏命令，支持可选的难度参数
@@ -259,7 +268,7 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.command(`${config.commandTrainingStart} [level:number]`).action(({ session }, level) => {
     if (!session) return "无法获取会话信息";
-    const difficulty = (typeof level === 'number' && level >= 1 && level <= 6) ? level : 1;
+    const difficulty = (typeof level === 'number' && level >= 1 && level <= 8) ? level : 1;
     return game.startTraining(session, difficulty);
   });
 

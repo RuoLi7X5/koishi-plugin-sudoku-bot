@@ -22,5 +22,17 @@ declare module "koishi" {
       consecutiveMvp: number;
       guilds: any;
     };
+    training_puzzle_pool: {
+      id: number;
+      difficulty: number;
+      puzzle: string;
+      targetRow: number;
+      targetCol: number;
+      answer: number;
+      tracePath: string;
+      traceJson: string;
+      isUsed: number;
+      createdAt: number;
+    };
   }
 }
